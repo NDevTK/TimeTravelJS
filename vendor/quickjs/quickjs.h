@@ -955,6 +955,8 @@ void JS_TTSetStepFilename(JSContext *ctx, const char *filename);
 JSValue JS_TTGlobalLexicals(JSContext *ctx);
 /* Clear the runtime's stack-frame chain (fresh session over a rewound heap). */
 void JS_TTResetExecState(JSContext *ctx);
+/* Rebind a live frame local/argument/closure capture. TRUE if found. */
+JS_BOOL JS_TTSetLocal(JSContext *ctx, int level, JSAtom name, JSValueConst value);
 /* select which debug info is stripped from the compiled code */
 #define JS_STRIP_SOURCE (1 << 0) /* strip source code */
 #define JS_STRIP_DEBUG  (1 << 1) /* strip all debug info including source code */

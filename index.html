@@ -79,7 +79,8 @@
         <div class="panel-body console-list" id="console-body"></div>
         <div class="console-input-row">
           <span class="console-chevron">❯</span>
-          <input id="console-input" class="console-input" placeholder="evaluate at this point in time… (runs in a disposable transaction — the timeline is immutable)" />
+          <input id="console-input" class="console-input" placeholder="Enter: evaluate here (disposable) · Shift+Enter: apply as edit and fork the timeline" />
+          <button class="btn fork-btn" id="fork-btn" title="Fork the timeline at this step: discard the future, apply the edit on the left (if any) to the live frame, and let execution continue — recording a new future (Shift+Enter)">⑂ fork</button>
         </div>
       </section>
 

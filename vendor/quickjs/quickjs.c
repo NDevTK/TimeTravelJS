@@ -61588,3 +61588,62 @@ void JS_TTResetExecState(JSContext *ctx)
     JSRuntime *rt = ctx->rt;
     rt->current_stack_frame = NULL;
 }
+
+/* Write a frame local (argument, local variable, or closure capture) at the
+   given bytecode-frame level. Returns TRUE if the binding was found. Used by
+   the debugger's edit-and-continue: rebinding a name must reach the live
+   frame slot, not a copy. */
+JS_BOOL JS_TTSetLocal(JSContext *ctx, int level, JSAtom name, JSValueConst value)
+{
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *sf;
+    JSFunctionBytecode *b;
+    JSObject *p;
+    int i;
+
+    sf = rt->current_stack_frame;
+    while (sf && (tt_frame_bytecode(sf) == NULL))
+        sf = sf->prev_frame;
+    while (sf && level > 0) {
+        sf = sf->prev_frame;
+        while (sf && (tt_frame_bytecode(sf) == NULL))
+            sf = sf->prev_frame;
+        level--;
+    }
+    if (!sf)
+        return FALSE;
+    b = tt_frame_bytecode(sf);
+    p = JS_VALUE_GET_OBJ(sf->cur_func);
+
+    if (b->vardefs) {
+        if (sf->arg_buf) {
+            for (i = 0; i < b->arg_count && i < sf->arg_count; i++) {
+                if (b->vardefs[i].var_name == name) {
+                    JS_FreeValue(ctx, sf->arg_buf[i]);
+                    sf->arg_buf[i] = JS_DupValue(ctx, value);
+                    return TRUE;
+                }
+            }
+        }
+        if (sf->var_buf) {
+            for (i = 0; i < b->var_count; i++) {
+                if (b->vardefs[b->arg_count + i].var_name == name) {
+                    JS_FreeValue(ctx, sf->var_buf[i]);
+                    sf->var_buf[i] = JS_DupValue(ctx, value);
+                    return TRUE;
+                }
+            }
+        }
+    }
+    if (p->u.func.var_refs) {
+        for (i = 0; i < b->closure_var_count; i++) {
+            JSVarRef *var_ref = p->u.func.var_refs[i];
+            if (b->closure_var[i].var_name == name && var_ref && var_ref->pvalue) {
+                JS_FreeValue(ctx, *var_ref->pvalue);
+                *var_ref->pvalue = JS_DupValue(ctx, value);
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}

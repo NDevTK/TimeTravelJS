@@ -15,7 +15,7 @@
 // asyncify pattern that is load-bearing is the one the recorder exercises
 // thousands of times.
 
-import { QuickJSVM, STEP_CONTINUE, STEP_ABORT, STEP_INSPECT_ABORT, STEP_EVAL_ABORT } from "./vm.js"
+import { QuickJSVM, STEP_CONTINUE, STEP_ABORT, STEP_INSPECT_ABORT, STEP_EVAL_ABORT, STEP_EVAL_CONTINUE } from "./vm.js"
 import { DeltaStore } from "./deltastore.js"
 
 const now = typeof performance !== "undefined" ? () => performance.now() : () => Date.now()
@@ -135,40 +135,15 @@ export class TimeTravelEngine {
     this._resetSession()
     const s = this.session
     if (opts.maxSteps) s.maxSteps = opts.maxSteps
+    if (opts.verifyBarrier) s.verifyBarrier = true
 
     const { ptr, len } = this.vm.writeString(source)
     s.programPtr = ptr
     this._mode = "record"
-    let lastYield = now()
+    this._lastYield = now()
     this._deadline = now() + 2500
+    this._onProgress = onProgress
 
-    const pump = async (r, entryTag) => {
-      while (r.suspended) {
-        s.trace.push({
-          l: this._lastLine,
-          c: this._lastCol,
-          d: this._lastDepth,
-          entry: entryTag,
-          sp: this.vm.exports.__stack_pointer.value,
-        })
-        s.store.capture(this.mem())
-        if (s.trace.length >= s.maxSteps || s.store.poolBytes > s.byteBudget) {
-          s.truncated = true
-          this._abortActivation()
-          return false
-        }
-        if (now() - lastYield > 12) {
-          if (onProgress) onProgress(this.progress())
-          await new Promise((res) => setTimeout(res, 0))
-          lastYield = now()
-        }
-        this._deadline = now() + 2500
-        r = this.vm.resume(STEP_CONTINUE)
-      }
-      return true
-    }
-
-    // wrap onStep to also capture position metadata
     const origOnStep = this._onStep.bind(this)
     this._onStep = (line, col, depth) => {
       this._lastLine = line
@@ -176,40 +151,142 @@ export class TimeTravelEngine {
       this._lastDepth = depth
       return origOnStep(line, col, depth)
     }
-
     try {
-      // base image before anything runs would be ideal, but position 0 is
-      // simply the first step's suspension — the base delta.
-      let ok = await pump(this.vm.drive("tt_eval", ptr, len), { name: "tt_eval", args: [ptr, len] })
-      // promise jobs + virtual timers, all steppable, until quiescent
-      let rounds = 0
-      while (ok && !s.truncated && rounds++ < 10000) {
-        if (this.vm.exports.tt_pending_jobs()) {
-          ok = await pump(this.vm.drive("tt_run_jobs"), { name: "tt_run_jobs", args: [] })
-          continue
-        }
-        if (this.vm.exports.tt_timer_count() > 0) {
-          s.trace.push({ l: 0, c: 0, d: 0, entry: null, timer: true })
-          s.store.capture(this.mem(), 1)
-          ok = await pump(this.vm.drive("tt_fire_timer"), { name: "tt_fire_timer", args: [] })
-          continue
-        }
-        break
-      }
-      // final state: program finished, VM idle
-      if (ok) {
-        s.trace.push({ l: 0, c: 0, d: 0, entry: null, end: true })
-        s.store.capture(this.mem(), 2)
-      }
+      const ok = await this._pumpSteps(this.vm.drive("tt_eval", ptr, len), { name: "tt_eval", args: [ptr, len] })
+      await this._drainPhases(ok)
     } finally {
       this._mode = "idle"
       this._deadline = Infinity
       this._onStep = origOnStep
+      this._onProgress = null
     }
     s.finished = true
     s.pos = s.trace.length - 1
     if (onProgress) onProgress(this.progress())
     return this.summary()
+  }
+
+  /**
+   * Fork the timeline: discard everything after `pos`, apply an optional
+   * edit at that moment, and let execution CONTINUE from there, recording a
+   * new future. Uses only proven suspension patterns: one rewind of the
+   * restored activation, then the ordinary record cycle going forward.
+   */
+  async forkFrom(pos, editSrc = null, onProgress = null) {
+    const s = this.session
+    if (!s || !s.finished) throw new Error("no finished recording")
+    pos = Math.max(0, Math.min(pos, s.trace.length - 1))
+    const entry = s.trace[pos]
+    if (!entry.entry) throw new Error("cannot fork at an idle position")
+
+    this.positionTo(pos)
+    // truncate history: the live table is already AT pos
+    s.store.truncateTo(pos)
+    s.trace.length = pos + 1
+    s.consoleEntries = s.consoleEntries.filter((e) => e.visibleAt <= pos)
+    for (const key of [...s.cachedInspect.keys()]) if (key > pos) s.cachedInspect.delete(key)
+    s.error = null
+    s.result = null
+    s.truncated = false
+    s.finished = false
+    s.forkedAt = pos
+
+    this._mode = "record"
+    this._lastYield = now()
+    this._deadline = now() + 2500
+    this._onProgress = onProgress
+    this.vm.clearDirtyMap()
+    const origOnStep = this._onStep.bind(this)
+    this._onStep = (line, col, depth) => {
+      this._lastLine = line
+      this._lastCol = col
+      this._lastDepth = depth
+      return origOnStep(line, col, depth)
+    }
+    try {
+      this.vm.adoptSuspension(entry.entry)
+      this.vm.exports.__stack_pointer.value = entry.sp
+      let r
+      if (editSrc != null) {
+        this.vm.stagedArg = new TextEncoder().encode(String(editSrc))
+        r = this.vm.resume(STEP_EVAL_CONTINUE)
+      } else {
+        r = this.vm.resume(STEP_CONTINUE)
+      }
+      const ok = await this._pumpSteps(r, entry.entry)
+      await this._drainPhases(ok)
+    } finally {
+      this._mode = "idle"
+      this._deadline = Infinity
+      this._onStep = origOnStep
+      this._onProgress = null
+      this.vm.stagedArg = null
+    }
+    s.finished = true
+    s.pos = s.trace.length - 1
+    if (onProgress) onProgress(this.progress())
+    return this.summary()
+  }
+
+  /** Drive one activation, capturing a COW delta per suspension. */
+  async _pumpSteps(r, entryTag) {
+    const s = this.session
+    while (r.suspended) {
+      s.trace.push({
+        l: this._lastLine,
+        c: this._lastCol,
+        d: this._lastDepth,
+        entry: entryTag,
+        sp: this.vm.exports.__stack_pointer.value,
+      })
+      if (s.trace.length === 1) {
+        // base image: full scan (excluding the barrier's own map region)
+        this.vm.clearDirtyMap()
+        s.store.capture(this.mem(), 0, [this.vm.mapExclusion()])
+      } else {
+        s.store.captureFrom(this.mem(), this.vm.readAndClearDirtyPages())
+      }
+      if (s.verifyBarrier) {
+        const bad = s.store.audit(this.mem(), [this.vm.mapExclusion()])
+        if (bad.length) s.warnings.push(`barrier missed pages at step ${s.trace.length - 1}: ${bad.slice(0, 8).join(",")}`)
+      }
+      if (s.trace.length >= s.maxSteps || s.store.poolBytes > s.byteBudget) {
+        s.truncated = true
+        this._abortActivation()
+        return false
+      }
+      if (now() - this._lastYield > 12) {
+        if (this._onProgress) this._onProgress(this.progress())
+        await new Promise((res) => setTimeout(res, 0))
+        this._lastYield = now()
+      }
+      this._deadline = now() + 2500
+      r = this.vm.resume(STEP_CONTINUE)
+    }
+    return true
+  }
+
+  /** After the main activation: promise jobs + virtual timers, then the end state. */
+  async _drainPhases(ok) {
+    const s = this.session
+    let rounds = 0
+    while (ok && !s.truncated && rounds++ < 10000) {
+      if (this.vm.exports.tt_pending_jobs()) {
+        ok = await this._pumpSteps(this.vm.drive("tt_run_jobs"), { name: "tt_run_jobs", args: [] })
+        continue
+      }
+      if (this.vm.exports.tt_timer_count() > 0) {
+        s.trace.push({ l: 0, c: 0, d: 0, entry: null, timer: true })
+        s.store.captureFrom(this.mem(), this.vm.readAndClearDirtyPages(), 1)
+        ok = await this._pumpSteps(this.vm.drive("tt_fire_timer"), { name: "tt_fire_timer", args: [] })
+        continue
+      }
+      break
+    }
+    if (ok) {
+      s.trace.push({ l: 0, c: 0, d: 0, entry: null, end: true })
+      s.store.captureFrom(this.mem(), this.vm.readAndClearDirtyPages(), 2)
+    }
   }
 
   /** Abort the current suspended activation: unwind to idle, mark memory dirty. */
@@ -260,8 +337,9 @@ export class TimeTravelEngine {
     this._transact = { inspect: null }
     this._deadline = now() + 3000
     try {
+      this.positionTo(s.pos)
+      this.vm.clearDirtyMap()
       if (entry.entry) {
-        this.positionTo(s.pos) // ensure heal happened
         this.vm.adoptSuspension(entry.entry)
         this._mode = "transact"
         this.vm.exports.__stack_pointer.value = entry.sp
@@ -271,21 +349,28 @@ export class TimeTravelEngine {
         this.vm.abandonSuspension()
       } else {
         // idle positions (end-of-program, pre-timer): plain synchronous call
-        this.positionTo(s.pos)
         this.vm.exports.tt_inspect_idle()
       }
       if (this._transact.inspect) parsed = JSON.parse(this._transact.inspect)
+      this._healTransaction()
     } catch (e) {
       this.session.warnings.push(`inspection failed at ${s.pos}: ${e}`)
       this.vm.normalize()
+      s.memDirty = true
     } finally {
       this._mode = "idle"
       this._transact = null
       this._deadline = Infinity
-      s.memDirty = true
     }
     s.cachedInspect.set(s.pos, parsed)
     return parsed
+  }
+
+  /** Repair transaction writes using the barrier's dirty list — O(touched). */
+  _healTransaction() {
+    const pages = this.vm.readAndClearDirtyPages()
+    this.session.store.heal(this.mem(), pages)
+    this.session.memDirty = false
   }
 
   /**
@@ -301,8 +386,9 @@ export class TimeTravelEngine {
     this.vm.stagedArg = new TextEncoder().encode(String(src))
     this._deadline = now() + 3000
     try {
+      this.positionTo(s.pos)
+      this.vm.clearDirtyMap()
       if (entry.entry) {
-        this.positionTo(s.pos)
         this.vm.adoptSuspension(entry.entry)
         this._mode = "transact"
         this.vm.exports.__stack_pointer.value = entry.sp
@@ -310,10 +396,10 @@ export class TimeTravelEngine {
         if (r.suspended) this._abortActivation()
         this.vm.abandonSuspension()
       } else {
-        this.positionTo(s.pos)
         this.vm.exports.tt_eval_idle()
       }
       const raw = this._transact.evalResult
+      this._healTransaction()
       if (raw) {
         const env = JSON.parse(raw)
         if (env && env.error) return { error: env.error }
@@ -322,13 +408,13 @@ export class TimeTravelEngine {
       return { error: { t: "str", v: "evaluation produced no result" } }
     } catch (e) {
       this.vm.normalize()
+      s.memDirty = true
       return { error: { t: "str", v: String(e) } }
     } finally {
       this._mode = "idle"
       this._transact = null
       this._deadline = Infinity
       this.vm.stagedArg = null
-      s.memDirty = true
     }
   }
 
@@ -352,6 +438,7 @@ export class TimeTravelEngine {
       error: s.error,
       result: s.result,
       cow: s.store.stats(),
+      forkedAt: s.forkedAt ?? null,
       dirtyCounts: s.store.dirtyCounts(),
       pageHeat: [...s.store.pageHeat.entries()],
       memBytes: this.vm.memory.buffer.byteLength,

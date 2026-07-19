@@ -218,6 +218,71 @@ test("second run resets cleanly", async () => {
   assert.equal(globalVal(engine.inspect(), "marker"), undefined, "previous session's globals are gone")
 })
 
+test("write barrier: audited capture misses nothing", async () => {
+  // verifyBarrier compares the barrier-driven deltas against a full memory
+  // scan after EVERY step — typed arrays, string allocation, growth included.
+  const summary = await engine.run(`
+const buf = new Uint8Array(2048);
+const strs = [];
+for (let i = 0; i < 40; i++) {
+  buf[(i * 37) % 2048] = i;
+  strs.push("s" + i);
+}
+console.log(strs.length, buf[37]);
+`, { verifyBarrier: true })
+  assert.equal(summary.error, null)
+  assert.deepEqual(summary.warnings, [], "no page escaped the write barrier")
+  assert.ok(summary.cow.savings > 0.99)
+})
+
+const FORK_PROG = `
+let acc = 0;
+for (let i = 0; i < 50; i++) {
+  acc += i;
+}
+console.log("total", acc);
+`
+// position paused just before the 5th \`acc += i\` (i = 4, acc = 0+1+2+3 = 6)
+const fifthIteration = (t) => {
+  let hits = 0
+  for (let i = 0; i < t.length; i++) if (t[i].l === 4 && t[i].d === 0 && ++hits === 5) return i
+  return -1
+}
+
+test("timeline fork without an edit re-records an identical future", async () => {
+  await engine.run(FORK_PROG)
+  const stepsBefore = engine.trace.length
+  const pos = fifthIteration(engine.trace)
+  assert.ok(pos > 0)
+  const summary = await engine.forkFrom(pos)
+  assert.equal(summary.forkedAt, pos)
+  assert.equal(summary.error, null)
+  // determinism: virtual clock + seeded random ⇒ step-for-step identical
+  assert.equal(engine.trace.length, stepsBefore)
+  engine.positionTo(engine.trace.length - 1)
+  assert.equal(globalVal(engine.inspect(), "acc").v, 1225)
+})
+
+test("timeline fork: edit-and-continue changes the future, prefix stays exact", async () => {
+  await engine.run(FORK_PROG)
+  const pos = fifthIteration(engine.trace)
+  assert.ok(pos > 0)
+  const summary = await engine.forkFrom(pos, "acc = 999")
+  assert.equal(summary.forkedAt, pos)
+  assert.equal(summary.error, null)
+  // resumed run: 999, then += 4..49 ⇒ 999 + 1219 = 2218
+  engine.positionTo(engine.trace.length - 1)
+  assert.equal(globalVal(engine.inspect(), "acc").v, 2218)
+  const total = engine.consoleEntries.at(-1)
+  assert.equal(total.parts[0].v, "total")
+  assert.equal(total.parts[1].v, 2218, "console output re-recorded on the new timeline")
+  // the shared prefix is untouched: the edit lands BETWEEN pos and pos+1
+  engine.positionTo(pos)
+  assert.equal(globalVal(engine.inspect(), "acc").v, 6)
+  engine.positionTo(2)
+  assert.equal(globalVal(engine.inspect(), "acc").v, 0)
+})
+
 test("navigation is orders of magnitude cheaper than execution", async () => {
   await engine.run(`
 const data = [];

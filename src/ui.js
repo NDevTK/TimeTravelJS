@@ -422,28 +422,13 @@ export class DebuggerUI {
         {},
         (p) => this.setStatus("busy", `recording… ${p.steps} steps · ${p.checkpoints} snapshots`),
       )
-      this.summary = summary
-      for (const w of summary.warnings) {
-        this.evalEntries.push({ visibleAt: 0, level: "sys", text: `note: ${w}` })
-      }
-      if (summary.truncated) {
-        this.evalEntries.push({
-          visibleAt: 0,
-          level: "sys",
-          text: `recording stopped after ${summary.steps} steps (budget) — timeline is still fully navigable`,
-        })
-      }
       const cow = summary.cow
-      this.setStatus(
-        summary.error ? "err" : "ok",
+      this._afterRecord(
+        summary,
         summary.error
           ? `crashed after ${summary.steps} steps — travel back to investigate`
           : `${summary.steps} steps · one snapshot each · COW saved ${(cow.savings * 100).toFixed(1)}%`,
       )
-      this.els.slider.max = String(this.maxPos)
-      this.els.posMax.textContent = String(this.maxPos)
-      this.engine.positionTo(this.maxPos)
-      this.syncPosition()
     } catch (err) {
       this.setStatus("err", err.timeTravelUserError ? "program error" : "engine error")
       this.evalEntries.push({ visibleAt: 0, level: "error", text: String(err.message || err) })
@@ -456,6 +441,68 @@ export class DebuggerUI {
     }
   }
 
+  /**
+   * Fork the timeline at the current position: the future is discarded, the
+   * (optional) edit runs against the LIVE paused frame, and execution
+   * continues from that exact machine state, recording a new future.
+   */
+  async fork(editSrc) {
+    if (this.recording || !this.summary) return
+    this.stopPlay()
+    this.recording = true
+    const pos = this.engine.pos
+    const warnsBefore = this.summary.warnings.length
+    this.els.runBtn.disabled = true
+    this.setStatus("busy", `⑂ forking at step ${pos}…`)
+    try {
+      const summary = await this.engine.forkFrom(pos, editSrc || null, (p) =>
+        this.setStatus("busy", `⑂ recording new future… ${p.steps} steps`),
+      )
+      // UI eval entries that pointed into the discarded future are gone with it
+      this.evalEntries = this.evalEntries.filter((entry) => entry.visibleAt <= pos)
+      this.evalEntries.push({
+        visibleAt: pos,
+        level: "sys",
+        text: editSrc ? `⑂ forked here — edit applied: ${editSrc}` : "⑂ forked here — future re-recorded",
+      })
+      this._afterRecord(
+        summary,
+        summary.error
+          ? `forked timeline crashed after ${summary.steps} steps`
+          : `⑂ forked at step ${pos} — ${summary.steps} steps on the new timeline`,
+        warnsBefore,
+      )
+    } catch (err) {
+      this.setStatus("err", "fork failed")
+      this.evalEntries.push({ visibleAt: 0, level: "error", text: String(err.message || err) })
+      this.renderConsole()
+      console.error(err)
+    } finally {
+      this.recording = false
+      this.els.runBtn.disabled = false
+    }
+  }
+
+  /** shared post-recording refresh: notes, status, slider bounds, jump to end */
+  _afterRecord(summary, statusText, newWarningsFrom = 0) {
+    this.summary = summary
+    for (const w of summary.warnings.slice(newWarningsFrom)) {
+      this.evalEntries.push({ visibleAt: 0, level: "sys", text: `note: ${w}` })
+    }
+    if (summary.truncated) {
+      this.evalEntries.push({
+        visibleAt: 0,
+        level: "sys",
+        text: `recording stopped after ${summary.steps} steps (budget) — timeline is still fully navigable`,
+      })
+    }
+    this.setStatus(summary.error ? "err" : "ok", statusText)
+    this.els.slider.max = String(this.maxPos)
+    this.els.posMax.textContent = String(this.maxPos)
+    this.engine.positionTo(this.maxPos)
+    this.syncPosition()
+  }
+
   setStatus(kind, text) {
     this.els.status.className = `status-pill ${kind}`
     this.els.status.textContent = text
@@ -463,8 +510,19 @@ export class DebuggerUI {
 
   // ------------------------------------------------------------------ console
   _wireConsole() {
+    const doFork = () => {
+      if (!this.summary || this.recording) return
+      const src = this.els.consoleInput.value.trim()
+      this.els.consoleInput.value = ""
+      this.fork(src)
+    }
     this.els.consoleInput.addEventListener("keydown", (e) => {
       if (e.key !== "Enter") return
+      if (e.shiftKey) {
+        e.preventDefault()
+        doFork()
+        return
+      }
       const src = this.els.consoleInput.value.trim()
       if (!src || !this.summary || this.recording) return
       this.els.consoleInput.value = ""
@@ -475,6 +533,7 @@ export class DebuggerUI {
       else this.evalEntries.push({ visibleAt: pos, level: "result", node: inlinePreview(res.value, 2) })
       this.renderConsole()
     })
+    $("#fork-btn").addEventListener("click", doFork)
   }
 
   renderConsole() {
@@ -656,6 +715,20 @@ export class DebuggerUI {
       for (let i = 0; i < t.length; i++) {
         if (t[i].entry && this.breakpoints.has(t[i].l)) ctx.fillRect(x(i) - 1, H - 3, 2, 3)
       }
+    }
+    // fork point — where this timeline diverged from the recording before it
+    if (this.summary.forkedAt != null) {
+      const fx = x(Math.min(this.summary.forkedAt, N))
+      ctx.strokeStyle = "rgba(240, 164, 93, 0.85)"
+      ctx.setLineDash([3, 3])
+      ctx.beginPath()
+      ctx.moveTo(fx, 0)
+      ctx.lineTo(fx, H)
+      ctx.stroke()
+      ctx.setLineDash([])
+      ctx.fillStyle = "#f0a45d"
+      ctx.font = "11px system-ui, sans-serif"
+      ctx.fillText("⑂", fx + 4, 11)
     }
     // needle
     const px = x(Math.min(this.engine.pos, N))

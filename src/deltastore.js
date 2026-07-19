@@ -56,39 +56,115 @@ export class DeltaStore {
     return page
   }
 
+  _capturePage(u32, p, changes) {
+    const base = p * WORDS
+    const prev = p < this.liveTable.length ? this.liveTable[p] : null
+    if (prev) {
+      let equal = true
+      for (let i = 0; i < WORDS; i++) {
+        if (prev[i] !== u32[base + i]) {
+          equal = false
+          break
+        }
+      }
+      if (equal) return
+    } else {
+      // no table entry: pages start zero (wasm growth guarantee)
+      let zero = true
+      for (let i = 0; i < WORDS; i++) {
+        if (u32[base + i] !== 0) {
+          zero = false
+          break
+        }
+      }
+      if (zero) return
+    }
+    const page = this._intern(u32, base)
+    changes.push([p, prev ?? null, page])
+    this.liveTable[p] = page
+    this.pageHeat.set(p, (this.pageHeat.get(p) ?? 0) + 1)
+  }
+
+  _inExcluded(p, excludeRanges) {
+    if (!excludeRanges) return false
+    for (const [lo, hi] of excludeRanges) if (p >= lo && p < hi) return true
+    return false
+  }
+
   /**
    * Capture the differences between `mem` (Uint8Array over the whole linear
-   * memory) and the live table as the next delta. Returns the new position.
+   * memory) and the live table as the next delta. Full scan; used for the
+   * base image. `excludeRanges` = [[pageLo, pageHi), …] left out of history.
    */
-  capture(mem, tag = 0) {
+  capture(mem, tag = 0, excludeRanges = null) {
     const len = mem.byteLength
     const pageCount = Math.ceil(len / PAGE_SIZE)
     const u32 = new Uint32Array(mem.buffer, 0, (len >> 2))
     const changes = []
-    const table = this.liveTable
     for (let p = 0; p < pageCount; p++) {
-      const base = p * WORDS
-      const prev = p < table.length ? table[p] : null
-      if (prev) {
-        let equal = true
-        for (let i = 0; i < WORDS; i++) {
-          if (prev[i] !== u32[base + i]) {
-            equal = false
-            break
-          }
-        }
-        if (equal) continue
-      }
-      const page = this._intern(u32, base)
-      changes.push([p, prev ?? null, page])
-      table[p] = page
-      this.pageHeat.set(p, (this.pageHeat.get(p) ?? 0) + 1)
+      if (this._inExcluded(p, excludeRanges)) continue
+      this._capturePage(u32, p, changes)
     }
     const delta = { changes, oldLen: this.liveLen, newLen: len, tag }
     this.liveLen = len
     this.deltas.push(delta)
     this.logicalBytes += len
     return this.deltas.length - 1
+  }
+
+  /**
+   * Capture using the write barrier's dirty page list — O(pages touched).
+   * Marked-but-unchanged pages are dropped (content compare keeps the store
+   * exact and maximally shared).
+   */
+  captureFrom(mem, pages, tag = 0) {
+    const len = mem.byteLength
+    const u32 = new Uint32Array(mem.buffer, 0, (len >> 2))
+    const changes = []
+    const pageCount = Math.ceil(len / PAGE_SIZE)
+    for (const p of pages) {
+      if (p >= pageCount) continue
+      this._capturePage(u32, p, changes)
+    }
+    const delta = { changes, oldLen: this.liveLen, newLen: len, tag }
+    this.liveLen = len
+    this.deltas.push(delta)
+    this.logicalBytes += len
+    return this.deltas.length - 1
+  }
+
+  /**
+   * Full verification that `mem` matches the live table (missing entries
+   * expected zero). Returns mismatched page indices. Test/audit use.
+   */
+  audit(mem, excludeRanges = null) {
+    const len = Math.min(mem.byteLength, Math.max(this.liveLen, mem.byteLength))
+    const pageCount = Math.ceil(len / PAGE_SIZE)
+    const u32 = new Uint32Array(mem.buffer, 0, (len >> 2))
+    const bad = []
+    for (let p = 0; p < pageCount; p++) {
+      if (this._inExcluded(p, excludeRanges)) continue
+      const base = p * WORDS
+      const page = p < this.liveTable.length ? this.liveTable[p] : null
+      let ok = true
+      if (page) {
+        for (let i = 0; i < WORDS; i++) {
+          if (page[i] !== u32[base + i]) {
+            ok = false
+            break
+          }
+        }
+      } else {
+        for (let i = 0; i < WORDS; i++) {
+          if (u32[base + i] !== 0) {
+            ok = false
+            break
+          }
+        }
+      }
+      if (!ok) bad.push(p)
+    }
+    return bad
   }
 
   _writePage(mem, p, page) {
@@ -127,30 +203,93 @@ export class DeltaStore {
 
   /**
    * Write the live table's state back into a memory whose contents drifted
-   * (after a transactional inspection ran on it). Compare-and-write per
-   * page: untouched pages cost only the comparison.
+   * (a transaction ran on it). With `pages` (from the write barrier) only
+   * those are repaired — O(pages touched). Without, compare-and-write all.
    */
-  heal(mem) {
+  heal(mem, pages = null) {
     const u32 = new Uint32Array(mem.buffer, 0, mem.byteLength >> 2)
     let written = 0
-    for (let p = 0; p < this.liveTable.length; p++) {
-      const page = this.liveTable[p]
-      if (!page) continue
+    const healPage = (p) => {
+      const page = p < this.liveTable.length ? this.liveTable[p] : null
       const base = p * WORDS
-      let equal = true
-      for (let i = 0; i < WORDS; i++) {
-        if (page[i] !== u32[base + i]) {
-          equal = false
-          break
+      if (page) {
+        let equal = true
+        for (let i = 0; i < WORDS; i++) {
+          if (page[i] !== u32[base + i]) {
+            equal = false
+            break
+          }
+        }
+        if (!equal) {
+          this._writePage(mem, p, page)
+          written++
+        }
+      } else if ((p + 1) * PAGE_SIZE <= this.liveLen) {
+        // untracked page inside the live range: expected zero
+        let zero = true
+        for (let i = 0; i < WORDS; i++) {
+          if (u32[base + i] !== 0) {
+            zero = false
+            break
+          }
+        }
+        if (!zero) {
+          mem.fill(0, p * PAGE_SIZE, (p + 1) * PAGE_SIZE)
+          written++
         }
       }
-      if (!equal) {
-        this._writePage(mem, p, page)
-        written++
-      }
+    }
+    if (pages) {
+      const maxPage = Math.ceil(mem.byteLength / PAGE_SIZE)
+      for (const p of pages) if (p < maxPage) healPage(p)
+    } else {
+      const maxPage = Math.ceil(mem.byteLength / PAGE_SIZE)
+      for (let p = 0; p < maxPage; p++) healPage(p)
     }
     if (mem.byteLength > this.liveLen) mem.fill(0, this.liveLen)
     return written
+  }
+
+  /**
+   * Drop all history after position `pos` (timeline fork). The live table
+   * must already BE at `pos`. Stats are recomputed over what remains.
+   */
+  truncateTo(pos) {
+    if (pos >= this.deltas.length - 1) return
+    this.deltas.length = pos + 1
+    const seen = new Set()
+    let bytes = 0
+    let logical = 0
+    const heat = new Map()
+    for (const d of this.deltas) {
+      logical += d.newLen
+      for (const [p, oldPage, newPage] of d.changes) {
+        heat.set(p, (heat.get(p) ?? 0) + 1)
+        for (const page of [oldPage, newPage]) {
+          if (page && !seen.has(page)) {
+            seen.add(page)
+            bytes += PAGE_SIZE
+          }
+        }
+      }
+    }
+    // rebuild the dedup pool from surviving pages so future interning still shares
+    this.pool = new Map()
+    for (const page of seen) {
+      let h = 0x811c9dc5
+      for (let i = 0; i < WORDS; i++) {
+        h ^= page[i]
+        h = Math.imul(h, 0x01000193)
+      }
+      h >>>= 0
+      let bucket = this.pool.get(h)
+      if (!bucket) this.pool.set(h, (bucket = []))
+      bucket.push(page)
+    }
+    this.poolPages = seen.size
+    this.poolBytes = bytes
+    this.logicalBytes = logical
+    this.pageHeat = heat
   }
 
   clear() {

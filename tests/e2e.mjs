@@ -116,6 +116,37 @@ await page.press("#console-input", "Enter")
 const consoleAfterEval = await page.textContent("#console-body")
 assert.match(consoleAfterEval, /:7/, "eval result visible")
 
+// --- fork: apply an edit at the paused frame and re-record the future
+const forkPos = await page.evaluate(() => window.__timetravel.engine.pos)
+await page.fill("#console-input", "swaps = 100")
+await page.press("#console-input", "Shift+Enter")
+await page.waitForFunction(
+  () => !window.__timetravel.ui.recording && window.__timetravel.ui.summary?.forkedAt != null,
+  null,
+  { timeout: 120000 },
+)
+const fork = await page.evaluate(() => {
+  const { engine, ui } = window.__timetravel
+  return { forkedAt: ui.summary.forkedAt, steps: ui.summary.steps, error: ui.summary.error }
+})
+console.log("forked at", fork.forkedAt, "→", fork.steps, "steps on the new timeline")
+assert.equal(fork.forkedAt, forkPos, "fork anchored at the paused step")
+assert.equal(fork.error, null)
+assert.ok(fork.steps > fork.forkedAt + 3, "a new future was recorded")
+const consoleAfterFork = await page.textContent("#console-body")
+assert.match(consoleAfterFork, /forked here/, "fork note visible in the console")
+// paused BEFORE the final swaps++ with swaps = 100 ⇒ the re-recorded future logs 101
+assert.match(consoleAfterFork, /swaps: 101/, "the edit changed the recorded future")
+assert.match(await page.textContent("#status-pill"), /forked/)
+// the shared prefix is still navigable after the fork
+const preForkNums = await page.evaluate(() => {
+  const { engine, ui } = window.__timetravel
+  engine.positionTo(Math.floor(ui.summary.forkedAt / 2))
+  ui.syncPosition()
+  return engine.inspect().globals.find(([k]) => k === "numbers")?.[1]?.n
+})
+assert.equal(preForkNums, 7, "pre-fork history intact")
+
 // --- crash sample: error surfaces, timeline navigable, stack panel shows frames
 await page.selectOption("#sample-select", "crash")
 await page.waitForFunction(

@@ -40,6 +40,7 @@ enum {
     TT_CMD_EVAL = 3,          /* evaluate, then ask for the next command  */
     TT_CMD_INSPECT_ABORT = 4, /* inspect, then abort this activation      */
     TT_CMD_EVAL_ABORT = 5,    /* evaluate, then abort this activation     */
+    TT_CMD_EVAL_CONTINUE = 6, /* evaluate, then resume execution (fork)   */
 };
 
 /* fixed asyncify state area — lives in the data segment, so its address is
@@ -49,6 +50,18 @@ static unsigned char g_asyncify_area[8 + TT_ASYNCIFY_STACK];
 
 EXPORT("tt_asyncify_area") unsigned char *tt_asyncify_area(void) { return g_asyncify_area; }
 EXPORT("tt_asyncify_area_size") int tt_asyncify_area_size(void) { return (int)sizeof(g_asyncify_area); }
+
+/* Dirty-page byte map for the write barrier: the build post-processes the
+   wasm so every store also sets g_tt_dirty[(addr >> 10)] = 1 (uninstrumented
+   itself). One byte per 1 KB page, sized for the 512 MB memory maximum.
+   Zero-initialized BSS — costs nothing in the binary. The host reads and
+   clears it; barrier writes bypass instrumentation, so the map region never
+   marks itself and stays out of the recorded history. */
+#define TT_DIRTY_PAGES (512 * 1024)
+static unsigned char g_tt_dirty[TT_DIRTY_PAGES] __attribute__((aligned(1024)));
+
+EXPORT("tt_dirty_map") unsigned char *tt_dirty_map(void) { return g_tt_dirty; }
+EXPORT("tt_dirty_map_size") int tt_dirty_map_size(void) { return TT_DIRTY_PAGES; }
 
 /* state ------------------------------------------------------------------ */
 static JSRuntime *g_rt;
@@ -127,7 +140,7 @@ static void send_inspection(JSContext *ctx)
 static const char EVAL_WRAPPER_SRC[] =
     "(function (__ttL, __ttSrc) { with (__ttL) { return eval(__ttSrc); } })";
 
-static void eval_at_pause(JSContext *ctx)
+static void eval_at_pause_mode(JSContext *ctx, int write_back)
 {
     int len = tt_host_arg(g_arg_buf, (int)sizeof(g_arg_buf) - 1);
     JSValue v, env, args[2];
@@ -150,6 +163,25 @@ static void eval_at_pause(JSContext *ctx)
             callArgs[0] = JS_TTLocals(ctx, 0);
             callArgs[1] = JS_NewStringLen(ctx, g_arg_buf, len);
             v = JS_Call(ctx, wrapper, JS_UNDEFINED, 2, (JSValueConst *)callArgs);
+            if (write_back && !JS_IsException(v)) {
+                /* rebindings made by the edit live on the scope object —
+                   push them into the real frame slots */
+                JSPropertyEnum *tab;
+                uint32_t n, i;
+                if (!JS_GetOwnPropertyNames(ctx, &tab, &n, callArgs[0],
+                                            JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
+                    for (i = 0; i < n; i++) {
+                        JSValue pv = JS_GetProperty(ctx, callArgs[0], tab[i].atom);
+                        if (!JS_IsException(pv)) {
+                            JS_TTSetLocal(ctx, 0, tab[i].atom, pv);
+                            JS_FreeValue(ctx, pv);
+                        } else {
+                            JS_FreeValue(ctx, JS_GetException(ctx));
+                        }
+                    }
+                    JS_FreePropertyEnum(ctx, tab, n);
+                }
+            }
             JS_FreeValue(ctx, callArgs[0]);
             JS_FreeValue(ctx, callArgs[1]);
             JS_FreeValue(ctx, wrapper);
@@ -178,6 +210,11 @@ static void eval_at_pause(JSContext *ctx)
         tt_host_out(2, "null", 4);
     }
     JS_FreeValue(ctx, env);
+}
+
+static void eval_at_pause(JSContext *ctx)
+{
+    eval_at_pause_mode(ctx, 0);
 }
 
 /* The step handler: one host round-trip per command; tt_host_step may
@@ -223,6 +260,15 @@ static int tt_step_handler(JSContext *ctx, int line, int col, int depth, void *o
             JS_TTEnableStep(g_rt, 1);
             g_in_hook = 0;
             return 1;
+        case TT_CMD_EVAL_CONTINUE:
+            /* timeline fork: apply the edit (with local write-back), then
+               let execution continue — the next hook suspends normally */
+            g_in_hook = 1;
+            JS_TTEnableStep(g_rt, 0);
+            eval_at_pause_mode(ctx, 1);
+            JS_TTEnableStep(g_rt, 1);
+            g_in_hook = 0;
+            return 0;
         default:
             return 0;
         }

@@ -1,19 +1,27 @@
-// Build the patched QuickJS + wrapper to WebAssembly with an Asyncify pass.
+// Build the patched QuickJS + wrapper to WebAssembly.
 //
-//   node native/build.mjs            → dist/quickjs-tt.wasm
+//   node native/build.mjs [--debug]      → dist/quickjs-tt.wasm
 //
-// Toolchain: clang (wasm32-wasi target) + wasi-libc + compiler-rt, then
-// Binaryen's Asyncify pass (via the binaryen npm package) marking the single
-// suspendable import env.tt_host_step.
+// Pipeline:
+//   1. clang (wasm32-wasi) compiles QuickJS + tt-wrap.c
+//   2. Binaryen runs the Asyncify pass (suspendable import env.tt_host_step),
+//      optimizes, and exports the shadow __stack_pointer global
+//   3. native/barrier.mjs instruments every store with the dirty-page write
+//      barrier (marks g_tt_dirty[(addr)>>10]) — after Asyncify, so the spill
+//      stores are tracked too
+//
+// --debug keeps the name section for readable wasm stack traces.
 import { execFileSync } from "node:child_process"
 import { readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
+import { instrumentWriteBarrier } from "./barrier.mjs"
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const qjs = join(root, "vendor/quickjs")
 const out = join(root, "dist")
 mkdirSync(out, { recursive: true })
+const debug = process.argv.includes("--debug")
 
 const CLANG = process.env.CLANG ?? "clang"
 const rawWasm = join(out, "quickjs-tt.raw.wasm")
@@ -30,7 +38,7 @@ const args = [
   "-isystem", "/usr/include/wasm32-wasi",
   "-isystem", "/usr/lib/llvm-18/lib/clang/18/include",
   "-O2",
-  "-g",
+  debug ? "-g" : "-g0",
   "-DCONFIG_VERSION=\"2026-06-04\"",
   "-D__wasi__",
   "-mexec-model=reactor",
@@ -38,7 +46,7 @@ const args = [
   "-Wl,--export=malloc",
   "-Wl,--export=free",
   "-Wl,-z,stack-size=1048576",
-  // start small: per-step COW capture compares live memory, so footprint is speed
+  // start small: the base snapshot and audits scale with footprint
   "-Wl,--initial-memory=6291456",
   "-Wl,--max-memory=536870912",
   "-Wl,--export-table",
@@ -52,10 +60,23 @@ console.log("· compiling QuickJS + wrapper → wasm32-wasi")
 execFileSync(CLANG, args, { stdio: "inherit" })
 console.log(`  ${(statSync(rawWasm).size / 1048576).toFixed(2)} MB raw`)
 
-console.log("· running Binaryen Asyncify pass (suspendable import: env.tt_host_step)")
+// --- discover the dirty map address (link-time layout, stable across passes)
+const rawBytes = readFileSync(rawWasm)
+const rawModule = await WebAssembly.compile(rawBytes)
+const stubImports = {}
+for (const imp of WebAssembly.Module.imports(rawModule)) {
+  stubImports[imp.module] ??= {}
+  stubImports[imp.module][imp.name] = imp.kind === "function" ? () => 0 : undefined
+}
+const rawInstance = await WebAssembly.instantiate(rawModule, stubImports)
+const mapAddr = rawInstance.exports.tt_dirty_map()
+const mapSize = rawInstance.exports.tt_dirty_map_size()
+console.log(`· dirty map at ${mapAddr} (${mapSize / 1024} KB)`)
+
+console.log("· Binaryen: Asyncify pass + optimize")
 const binaryen = (await import("binaryen")).default
-binaryen.setDebugInfo(true) // keep the name section for readable stack traces
-const module_ = binaryen.readBinary(readFileSync(rawWasm))
+binaryen.setDebugInfo(debug)
+const module_ = binaryen.readBinary(rawBytes)
 binaryen.setOptimizeLevel(2)
 binaryen.setShrinkLevel(0)
 binaryen.setPassArgument("asyncify-imports", "env.tt_host_step")
@@ -66,7 +87,12 @@ module_.optimize()
 // behind. Export it so the engine can save/restore it per suspension.
 module_.addGlobalExport("__stack_pointer", "__stack_pointer")
 if (!module_.validate()) throw new Error("binaryen validation failed")
-const bytes = module_.emitBinary()
+const asyncified = module_.emitBinary()
 module_.dispose()
-writeFileSync(finalWasm, bytes)
-console.log(`  ${(bytes.length / 1048576).toFixed(2)} MB asyncified → ${finalWasm}`)
+console.log(`  ${(asyncified.length / 1048576).toFixed(2)} MB asyncified`)
+
+console.log("· write-barrier pass (every store marks its 1 KB page)")
+const final = instrumentWriteBarrier(asyncified, mapAddr)
+if (!(await WebAssembly.validate(final))) throw new Error("barrier output failed validation")
+writeFileSync(finalWasm, final)
+console.log(`  ${(final.length / 1048576).toFixed(2)} MB → ${finalWasm}${debug ? " (debug names kept)" : ""}`)
