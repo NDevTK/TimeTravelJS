@@ -1,140 +1,142 @@
 # ⏳ TimeTravelJS
 
-**Time-travel debugging for JavaScript, in your browser, powered by QuickJS on WebAssembly with copy-on-write memory snapshots.**
+**True suspend/resume time-travel debugging for JavaScript, in your browser.**
 
-Write a program, hit **Record**, then scrub anywhere in its execution history: step *backward* statement by statement, reverse-continue to a breakpoint, inspect every local variable at any moment, and watch the console un-print itself as you rewind. No server, no build step — a static page.
+A patched QuickJS engine, compiled to WebAssembly, **suspends itself at every
+source line** — its entire machine state (heap, stack, program counter, spilled
+C stack, virtual clock) becomes bytes in linear memory. Each step is captured
+as a **copy-on-write page delta**. Time travel is then just memory: stepping
+backward applies undo pages, stepping forward applies redo pages. The program
+executes **exactly once** — navigation never re-runs a single instruction, so
+there is no replay, no re-execution, and nothing to diverge.
 
 ```
-npm start          # serve locally → http://127.0.0.1:8642/
-npm test           # unit tests (transform, COW store, engine vs real QuickJS)
+npm start          # serve → http://127.0.0.1:8642/  (static site, no build)
+npm test           # unit tests (delta store + engine against the real wasm VM)
 npm run test:e2e   # Playwright end-to-end test in headless Chromium
+npm run build      # rebuild dist/quickjs-tt.wasm (clang + wasi-libc + binaryen)
 ```
+
+## What you get
+
+- **Bidirectional stepping** — into / over / out, forwards and backwards, with
+  breakpoints and reverse-continue. Every jump lands in microseconds.
+- **Real frames** — the variables panel reads arguments, locals, closure
+  captures and TDZ slots straight out of the interpreter's stack frames via a
+  C-level introspection API. Click any call-stack frame to see its locals.
+- **Everything is steppable** — `async`/`await`, promise jobs, generators,
+  getters, constructors, class methods, callbacks inside `Array.map`: user
+  code is **never transformed**; the VM itself pauses, wherever it is.
+- **Time-sliced console** — output appears and disappears as you scrub;
+  logging captured values as they were at the moment of the log.
+- **Console evaluation at any moment** — expressions run *inside* the paused
+  interpreter with the innermost frame's locals in scope, inside a disposable
+  transaction. The timeline is immutable by construction.
+- **Virtual time** — `Date.now()` ticks once per step, `setTimeout` runs on a
+  virtual clock after the main script, `Math.random()` is seeded; recordings
+  are reproducible run to run.
+- **A live COW panel** — for the default sample, full per-step snapshots
+  would cost ~1 GB; the page-sharing store keeps **under 1 MB** (99.9%
+  saved), with per-step dirty-page charts and a heap write heat map.
 
 ## How it works
 
-Three ideas compose into a time machine:
+### 1. The VM pauses itself (no source transformation)
 
-### 1. Every statement is a resumable suspension point
+`vendor/quickjs/` contains QuickJS 2026-06-04 with a debugger patch
+(reviewable as `native/quickjs-changes.patch`):
 
-User code is instrumented (parsed with [acorn](https://github.com/acornjs/acorn), regenerated with [astring](https://github.com/davidbonnet/astring)) so that each function becomes a **pair**:
+- a **step hook in the bytecode dispatch loop** that fires whenever execution
+  reaches a new source line — or re-enters one via a backward jump (loop
+  iterations) — with a per-frame pc→line range cache so the check is cheap;
+- **frame introspection**: `JS_TTBacktrace()`, `JS_TTLocals(level)` (reading
+  `vardefs`, argument/variable buffers and closure `var_refs`), and
+  `JS_TTGlobalLexicals()` for script-level `let`/`const`;
+- **deterministic time**: `Date.now()`/`new Date()` read a virtual clock that
+  advances one unit per step and lives in the data segment — inside every
+  snapshot; `Math.random()` gets a fixed seed;
+- a source-filename filter so only user code (`program.js`) produces steps.
 
-- a hidden *generator* carrying the real body, which `yield`s a step marker
-  `[0, line, col, endLine, endCol, depth]` before every statement, and
-- a plain *façade* function that runs the generator to completion atomically
-  when something uninstrumented (a native like `Array.prototype.map`, or code
-  we chose not to transform) calls it.
+### 2. Suspension makes the whole machine a byte array
 
-Call sites inside instrumented code go through `yield* __tt_call(...)`, which
-delegates into the callee's hidden generator — so stepping recurses through
-user function calls, and the whole program becomes one big generator that the
-host pokes one step at a time. The key property: **while suspended at a
-`yield`, every local, closure, and stack frame lives in the QuickJS heap** —
-not on the C stack.
+The build runs Binaryen's **Asyncify** pass over the wasm: when the step
+hook's host import decides to pause, the entire wasm call stack unwinds into
+a **fixed buffer inside the data segment**. While suspended, the complete
+execution state — QuickJS heap, shadow stack, interpreter frames, the
+asyncify spill — is linear memory, plus exactly one wasm global (the shadow
+stack pointer), which the engine records per step. Restoring those bytes and
+rewinding resumes the machine *mid-execution*, at any point in history.
 
-### 2. The whole VM is one snapshottable byte array
+The driver (`src/vm.js`) is ~200 lines and owns the whole protocol: one
+suspendable import, entry re-invocation for rewinds, deterministic WASI
+shims. No Emscripten, no handles, no FFI layer.
 
-QuickJS is compiled to WebAssembly ([quickjs-emscripten](https://github.com/justjake/quickjs-emscripten)),
-so the entire VM — heap, globals, suspended generator frames, the PRNG state,
-the virtual clock — lives inside one linear memory. Because the program only
-ever pauses while suspended (VM idle, wasm stack unwound), restoring that
-memory byte-for-byte restores *the entire program state*, mid-execution.
+### 3. Copy-on-write history, one snapshot per step
 
-### 3. Snapshots are copy-on-write
+`src/deltastore.js` treats memory as 1 KB pages. Each step stores only the
+pages that changed (old ref + new ref), and pages are **deduplicated by
+content** — a loop that flips a refcount back and forth reuses the same page
+object. WebAssembly has no MMU page traps, so writes are detected by
+comparison (documented honestly: software COW; an instrumented write-barrier
+build is the planned upgrade). Stepping backward/forward applies before/after
+images — O(pages actually touched).
 
-Snapshotting 16 MB per checkpoint would be absurd, so the store
-(`src/snapshots.js`) treats memory as 4 KB pages and keeps **immutable page
-tables that share every unchanged page with the previous snapshot** — only
-dirty pages are copied. WebAssembly has no hardware page-protection traps, so
-writes are detected by comparison (software COW). Checkpoints typically retain
-a few percent of their naive cost; the *copy-on-write memory* panel in the UI
-shows the live numbers and a page-write heat map.
+### 4. Inspection is a disposable transaction
 
-**Navigation** = restore the nearest checkpoint at-or-before the target step
-(again writing only differing pages), then replay forward by poking the
-generator. Replay is deterministic because time is virtualized (`Date.now`,
-`new Date()`, `performance.now` follow a step-driven virtual clock stored in
-the heap), `Math.random` is a seeded PRNG stored in the heap, and timers are
-virtual (`setTimeout` queues into the heap; callbacks run steppably after the
-main script on the virtual clock). Reverse-step is just "restore + replay
-N−1" — and with checkpoints every few dozen steps, it feels instant.
+To inspect position P: restore P's pages, restore its stack pointer, rewind
+the VM into the suspension, and let the wrapper's command loop run the
+inspector — `JS_TTLocals` walks *live* frames — or evaluate a console
+expression with the frame's locals in scope. Then the activation is aborted.
+Whatever the transaction touched is healed from the page store on the next
+navigation. Recorded history is immutable no matter what an evaluation does.
 
 ```
-record:   ▶──▶──▶──▶──▶──▶──▶──▶──▶──▶──▶──▶──▶──▶──▶──▶──▶──▶
-               □ checkpoint      □ checkpoint      □ checkpoint
-                                        (pages shared unless dirty)
-step back to t=13:
-               restore □ (t=10) ──▶──▶──▶ replay 3 steps → t=13
+record:    ▶──▶──▶──▶──▶──▶──▶──▶──▶──▶     (executes ONCE, suspending each step)
+           □  □  □  □  □  □  □  □  □  □     one COW delta per step
+navigate:  ⟵ apply undo pages · apply redo pages ⟶      (no execution at all)
+inspect:   restore P → rewind → read live frames → abort  (disposable)
 ```
-
-## What the debugger gives you
-
-- **Bidirectional stepping** — into / over / out, forwards *and* backwards.
-- **Breakpoints with reverse-continue** — run backwards to the last time a
-  line executed. Finding *"when did this variable go wrong?"* becomes trivial.
-- **Timeline scrubber** — with a call-depth silhouette, checkpoint ticks
-  (brightness = dirty pages), console events, timer firings, and error zones.
-- **Variables panel** — every binding lexically visible at the paused
-  statement (params, locals, closures, TDZ shown as ‹not yet declared›),
-  captured by generated scope thunks, serialized getter-safely inside the VM.
-- **Call stack** with call-site lines.
-- **Time-sliced console** — output appears/disappears as you scrub; logging
-  records values *as they were at the moment of the log*.
-- **Debug console** — evaluate expressions against the live VM at the paused
-  moment (locals are in scope). Mutations are allowed but discarded on the
-  next navigation, keeping the recorded timeline truthful.
-- **COW memory panel** — snapshot count, unique pages, naive-vs-actual bytes,
-  per-checkpoint dirty pages, and a heap page-write heat map.
 
 ## Repository layout
 
 ```
-index.html, styles.css      the site (buildless, static)
-src/instrument.js           acorn-based generator transform
-src/vmruntime.js            support runtime evaluated inside QuickJS
-src/engine.js               record / checkpoint / restore+replay driver
-src/snapshots.js            page-level copy-on-write snapshot store
-src/ui.js, src/main.js      debugger UI
-src/samples.js              sample programs
-vendor/                     vendored ESM deps (quickjs-emscripten, acorn, astring)
-tests/                      node --test suites + Playwright e2e
-tools/serve.mjs             zero-dependency static server
+index.html, styles.css       the site (static, no build step)
+dist/quickjs-tt.wasm         the VM (committed artifact, ~4.4 MB)
+vendor/quickjs/              QuickJS 2026-06-04 + debugger patches (MIT)
+native/tt-wrap.c             wasm embedder: exports, command loop, setup runtime
+native/build.mjs             clang → wasm32-wasi, Binaryen asyncify pass
+native/quickjs-changes.patch the complete QuickJS diff, for review
+src/vm.js                    loader + asyncify driver + WASI shims
+src/deltastore.js            per-step COW page store (content-deduplicated)
+src/engine.js                recorder, delta navigation, transactional inspection
+src/ui.js, main.js, samples.js   debugger UI
+tests/                       node --test suites + Playwright e2e
+tools/serve.mjs              zero-dependency static server
 ```
 
-The site runs entirely from static files; `vendor/` contains the exact ESM
-builds it uses (QuickJS wasm is embedded base64 in the singlefile variant), so
-`git clone` + any static file server is a working deployment. GitHub Pages
-serves it as-is via the included workflow.
+Deployment is `git clone` + any static file server (a GitHub Pages workflow
+is included). Rebuilding the wasm needs clang with the wasm32-wasi target,
+wasi-libc, and `npm i` (binaryen); the artifact is committed so neither the
+site nor the tests require a C toolchain.
 
 ## Honest limitations
 
-Graceful degradation is the rule: anything the instrumenter doesn't transform
-still *runs correctly*, it just executes atomically (no stepping inside).
-
-- Callbacks invoked *by natives* (`map`, `forEach`, …) run atomically.
-- `async`/`await`, user generators, getters/setters, class constructors,
-  methods using `super`/private fields, `with`, and computed-key methods run
-  uninstrumented. Promise `.then` callbacks execute between steps after the
-  main script (microtask pumping is deterministic during replay).
-- `setInterval` is not supported; `setTimeout` chains are.
-- Top-level `var`/`function` live in the wrapper scope, not on `globalThis`
-  (they still show in the variables panel).
-- One statement = one step: intra-expression pauses only happen at calls.
-- Programs are capped (default 20 000 steps) to keep recordings snappy; the
-  truncated timeline remains fully navigable.
-- Deep instrumented recursion is bounded by the VM stack (generator delegation
-  resumes through each frame).
-
-## Why "COW", exactly?
-
-Classic time-travel debuggers fork the process and let the OS's copy-on-write
-page tables make checkpoints cheap. A browser tab has no `fork()`, no `mmap`,
-no dirty bits — but it *does* have the VM's entire universe as one byte array.
-TimeTravelJS reproduces the same economics in userland: immutable shared pages,
-copies only on detected writes, restores that touch only differing pages. Same
-idea, different substrate.
+- Write detection is by page comparison (wasm has no dirty bits), so
+  recording costs O(heap) per step — around 100–300 steps/s at the default
+  6 MB heap. Recordings are capped (default 20 000 steps, 256 MB retained);
+  the recorded prefix of a truncated run is fully navigable.
+- Step granularity is the source line (QuickJS's pc2line), plus one step per
+  loop iteration via backward-jump detection.
+- `eval`'d / `new Function` code steps only if its filename matches the user
+  program (it doesn't), and `setInterval` is not provided (`setTimeout`
+  chains are).
+- Promise jobs and timer callbacks run steppably *after* the main script on
+  the virtual clock — ordering is faithful to a single-threaded event loop,
+  timing is virtual by design.
+- One recording session lives in the VM at a time; pressing Record resets the
+  context (the wasm instance is reused).
 
 ## License
 
-MIT for this project's code. Vendored dependencies keep their own licenses —
-see `vendor/LICENSES.md` (QuickJS and quickjs-emscripten are MIT; acorn and
-astring are MIT).
+MIT for TimeTravelJS code. QuickJS is MIT (Fabrice Bellard & Charlie
+Gordon) — see `vendor/LICENSES.md` and `vendor/quickjs/LICENSE`.

@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>TimeTravelJS — time-travel debugging on QuickJS with copy-on-write snapshots</title>
-  <meta name="description" content="A time-travel JavaScript debugger in your browser: QuickJS compiled to WebAssembly, with copy-on-write memory snapshots for instant rewind." />
+  <title>TimeTravelJS — true suspend/resume time travel for JavaScript</title>
+  <meta name="description" content="A time-travel JavaScript debugger in your browser: a patched QuickJS VM on WebAssembly that suspends at every statement, snapshots itself with copy-on-write pages, and navigates history without re-executing anything." />
   <link rel="stylesheet" href="./styles.css" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%8F%B3%3C/text%3E%3C/svg%3E" />
 </head>
@@ -13,7 +13,7 @@
     <div class="brand">
       <span class="brand-mark">⏳</span>
       <span class="brand-name">TimeTravel<span class="brand-accent">JS</span></span>
-      <span class="brand-sub">QuickJS · WebAssembly · copy-on-write snapshots</span>
+      <span class="brand-sub">patched QuickJS · Asyncify suspend/resume · per-step COW snapshots</span>
     </div>
     <div class="top-actions">
       <label class="sample-label" for="sample-select">Sample</label>
@@ -42,7 +42,7 @@
     </div>
     <div class="transport-pos">
       <span id="pos-label" class="pos-label">step <b id="pos-cur">0</b> / <span id="pos-max">0</span></span>
-      <span id="diverged-badge" class="badge badge-warn" hidden>⚠ nondeterminism detected</span>
+      <span id="immutable-hint" class="badge badge-warn" hidden></span>
     </div>
     <input type="range" id="timeline-slider" class="timeline-slider" min="0" max="0" value="0" step="1" />
     <canvas id="timeline-canvas" class="timeline-canvas" height="46"></canvas>
@@ -75,19 +75,19 @@
       </section>
 
       <section class="panel panel-console" id="panel-console">
-        <div class="panel-title"><span>console</span><span class="panel-hint">shows output up to the current step</span></div>
+        <div class="panel-title"><span>console</span><span class="panel-hint">output up to the current moment</span></div>
         <div class="panel-body console-list" id="console-body"></div>
         <div class="console-input-row">
           <span class="console-chevron">❯</span>
-          <input id="console-input" class="console-input" placeholder="evaluate at this point in time… (state edits are discarded on navigation)" />
+          <input id="console-input" class="console-input" placeholder="evaluate at this point in time… (runs in a disposable transaction — the timeline is immutable)" />
         </div>
       </section>
 
       <section class="panel" id="panel-memory">
-        <div class="panel-title"><span>copy-on-write memory</span><span class="panel-hint">how the rewind works</span></div>
+        <div class="panel-title"><span>copy-on-write memory</span><span class="panel-hint">one resumable snapshot per step</span></div>
         <div class="panel-body" id="memory-body">
           <div class="mem-stats" id="mem-stats"></div>
-          <div class="mem-viz-label">dirty pages per checkpoint</div>
+          <div class="mem-viz-label">dirty pages per step</div>
           <canvas id="cp-canvas" class="mem-canvas" height="42"></canvas>
           <div class="mem-viz-label">page write heat (whole VM heap)</div>
           <canvas id="heat-canvas" class="mem-canvas" height="26"></canvas>
@@ -99,7 +99,7 @@
   <footer class="footer">
     <span><b>keys</b> — Ctrl+Enter: record · ←/→: step back/into · Alt+←/→: step over · Ctrl+←/→: run to breakpoint</span>
     <span class="footer-right">
-      state travels through <em>page-level copy-on-write snapshots</em> of the QuickJS WebAssembly heap ·
+      every step is a suspended machine state — <em>page-level copy-on-write snapshots</em> of a patched QuickJS VM ·
       <a href="https://github.com/NDevTK/TimeTravelJS" target="_blank" rel="noreferrer">source</a>
     </span>
   </footer>

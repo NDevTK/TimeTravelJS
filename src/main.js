@@ -5,7 +5,10 @@ const statusEl = document.querySelector("#status-pill")
 
 async function boot() {
   try {
-    const engine = await TimeTravelEngine.create()
+    const resp = await fetch("./dist/quickjs-tt.wasm")
+    if (!resp.ok) throw new Error(`failed to fetch VM wasm: HTTP ${resp.status}`)
+    const wasmBytes = await resp.arrayBuffer()
+    const engine = await TimeTravelEngine.create(wasmBytes)
     const ui = new DebuggerUI(engine)
     ui.setStatus("ok", "VM ready")
     // record the default sample right away so the page opens alive
@@ -15,7 +18,7 @@ async function boot() {
     console.error(err)
     if (statusEl) {
       statusEl.className = "status-pill err"
-      statusEl.textContent = "failed to load WebAssembly VM — see devtools console"
+      statusEl.textContent = "failed to load the VM — see devtools console"
     }
   }
 }

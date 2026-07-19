@@ -1,15 +1,17 @@
 {
   "name": "timetraveljs",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Time-travel debugging for JavaScript in the browser: QuickJS on WebAssembly with copy-on-write memory snapshots. The site itself is buildless — dependencies are vendored under vendor/.",
+  "description": "True suspend/resume time-travel debugging for JavaScript: a patched QuickJS VM on WebAssembly that suspends at every statement and snapshots itself with copy-on-write pages. Buildless static site; the wasm artifact is committed.",
   "type": "module",
   "scripts": {
     "start": "node tools/serve.mjs",
+    "build": "node native/build.mjs",
     "test": "node --test \"tests/*.test.mjs\"",
     "test:e2e": "node tests/e2e.mjs"
   },
   "devDependencies": {
+    "binaryen": "^131.0.0",
     "playwright-core": "^1.49.0"
   }
 }

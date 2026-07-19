@@ -1,0 +1,532 @@
+--- a/quickjs-2026-06-04/quickjs.c	2026-07-19 17:30:42.300298081 +0000
++++ b/vendor/quickjs/quickjs.c	2026-07-19 17:25:23.296305377 +0000
+@@ -68,7 +68,7 @@
+ 
+ /* define to include Atomics.* operations which depend on the OS
+    threads */
+-#if !defined(__EMSCRIPTEN__)
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ #define CONFIG_ATOMICS
+ #endif
+ 
+@@ -360,6 +360,15 @@
+     JSInterruptHandler *interrupt_handler;
+     void *interrupt_opaque;
+ 
++    /* TimeTravelJS: statement-level step hook. Called whenever execution
++       reaches a new source line (or re-enters one via a backward jump).
++       Returning nonzero aborts execution like an interrupt. */
++    JSTTStepHandler *tt_step_handler;
++    void *tt_step_opaque;
++    int tt_step_enabled;
++    /* only fire in functions compiled from this file (0 = fire everywhere) */
++    JSAtom tt_step_filename;
++
+     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
+     void *host_promise_rejection_tracker_opaque;
+ 
+@@ -409,7 +418,7 @@
+     JSValue cur_func; /* current function, JS_UNDEFINED if the frame is detached */
+     JSValue *arg_buf; /* arguments */
+     JSValue *var_buf; /* variables */
+-    struct JSVarRef **var_refs; /* references to arguments or local variables */ 
++    struct JSVarRef **var_refs; /* references to arguments or local variables */
+     const uint8_t *cur_pc; /* only used in bytecode functions : PC of the
+                         instruction after the call */
+     int arg_count;
+@@ -417,6 +426,14 @@
+     /* only used in generators. Current stack pointer value. NULL if
+        the function is running. */
+     JSValue *cur_sp;
++    /* TimeTravelJS: line-change detection cache for the step hook.
++       tt_pc_lo..tt_pc_hi is the bytecode range of tt_last_line; while the pc
++       moves forward inside it no hook fires. A backward jump (loop
++       iteration) fires even on the same line. */
++    int tt_last_line;
++    uint32_t tt_pc_lo;
++    uint32_t tt_pc_hi;
++    uint32_t tt_prev_off;
+ } JSStackFrame;
+ 
+ typedef enum {
+@@ -2134,6 +2151,10 @@
+ }
+ 
+ /* default memory allocation functions with memory limitation */
++#if defined(__wasi__)
++#include <malloc.h> /* wasi-libc declares malloc_usable_size here */
++#endif
++
+ static size_t js_def_malloc_usable_size(const void *ptr)
+ {
+ #if defined(__APPLE__)
+@@ -2142,7 +2163,7 @@
+     return _msize((void *)ptr);
+ #elif defined(__EMSCRIPTEN__)
+     return 0;
+-#elif defined(__linux__) || defined(__GLIBC__)
++#elif defined(__linux__) || defined(__GLIBC__) || defined(__wasi__)
+     return malloc_usable_size((void *)ptr);
+ #else
+     /* change this to `return 0;` if compilation fails */
+@@ -7499,6 +7520,138 @@
+     return 0;
+ }
+ 
++/* TimeTravelJS ----------------------------------------------------------- */
++
++/* Deterministic virtual clock. Lives in the data segment (linear memory),
++   so wasm heap snapshots capture and restore it automatically. */
++static int tt_vtime_enabled;
++static double tt_vtime;
++
++/* Like find_line_num, but also reports the bytecode range [*ppc_lo, *ppc_hi)
++   over which the resolved line holds, so the dispatch loop can skip hook
++   checks while execution stays on the same line. */
++static int tt_find_line(JSFunctionBytecode *b, uint32_t pc_value,
++                        int *pcol_num, uint32_t *ppc_lo, uint32_t *ppc_hi)
++{
++    const uint8_t *p_end, *p;
++    int new_line_num, line_num, v, ret, new_col_num, col_num;
++    uint32_t val, pc, prev_pc;
++    unsigned int op;
++
++    *ppc_lo = 0;
++    *ppc_hi = UINT32_MAX;
++    if (!b->has_debug || !b->debug.pc2line_buf)
++        goto fail;
++
++    p = b->debug.pc2line_buf;
++    p_end = p + b->debug.pc2line_len;
++
++    ret = get_leb128(&val, p, p_end);
++    if (ret < 0)
++        goto fail;
++    p += ret;
++    line_num = val + 1;
++
++    ret = get_leb128(&val, p, p_end);
++    if (ret < 0)
++        goto fail;
++    p += ret;
++    col_num = val + 1;
++
++    pc = 0;
++    prev_pc = 0;
++    while (p < p_end) {
++        op = *p++;
++        if (op == 0) {
++            ret = get_leb128(&val, p, p_end);
++            if (ret < 0)
++                goto fail;
++            pc += val;
++            p += ret;
++            ret = get_sleb128(&v, p, p_end);
++            if (ret < 0)
++                goto fail;
++            p += ret;
++            new_line_num = line_num + v;
++        } else {
++            op -= PC2LINE_OP_FIRST;
++            pc += (op / PC2LINE_RANGE);
++            new_line_num = line_num + (op % PC2LINE_RANGE) + PC2LINE_BASE;
++        }
++        ret = get_sleb128(&v, p, p_end);
++        if (ret < 0)
++            goto fail;
++        p += ret;
++        new_col_num = col_num + v;
++
++        if (pc_value < pc) {
++            *ppc_lo = prev_pc;
++            *ppc_hi = pc;
++            goto done;
++        }
++        prev_pc = pc;
++        line_num = new_line_num;
++        col_num = new_col_num;
++    }
++    *ppc_lo = prev_pc;
++ done:
++    *pcol_num = col_num;
++    return line_num;
++ fail:
++    *pcol_num = 0;
++    return 0;
++}
++
++/* Called from the dispatch loop whenever stepping is enabled. Fires the host
++   step handler on line changes and backward jumps (loop iterations).
++   Returns nonzero to abort execution like an interrupt. */
++static no_inline int js_tt_step_check(JSContext *ctx, JSStackFrame *sf,
++                                      JSFunctionBytecode *b, const uint8_t *pc)
++{
++    JSRuntime *rt = ctx->rt;
++    uint32_t off = (uint32_t)(pc - b->byte_code_buf);
++    int col, line, depth;
++    JSStackFrame *f;
++
++    if (!rt->tt_step_handler || !b->has_debug)
++        return 0;
++    if (rt->tt_step_filename != JS_ATOM_NULL &&
++        b->debug.filename != rt->tt_step_filename)
++        return 0;
++    if (off >= sf->tt_pc_lo && off < sf->tt_pc_hi && sf->tt_pc_hi != 0) {
++        if (off >= sf->tt_prev_off) {
++            /* forward progress on the same line */
++            sf->tt_prev_off = off;
++            return 0;
++        }
++        /* backward jump within the same line: new loop iteration */
++        line = sf->tt_last_line;
++        tt_find_line(b, off, &col, &sf->tt_pc_lo, &sf->tt_pc_hi);
++    } else {
++        line = tt_find_line(b, off, &col, &sf->tt_pc_lo, &sf->tt_pc_hi);
++        if (line <= 0)
++            return 0;
++        if (line == sf->tt_last_line && off >= sf->tt_prev_off) {
++            /* forward move into a different range of the same line
++               (e.g. multi-range statements): not a new step */
++            sf->tt_prev_off = off;
++            return 0;
++        }
++    }
++    sf->tt_prev_off = off;
++    sf->tt_last_line = line;
++    sf->cur_pc = pc; /* keep backtraces honest while paused here */
++
++    depth = 0;
++    for (f = rt->current_stack_frame; f; f = f->prev_frame)
++        depth++;
++    if (tt_vtime_enabled)
++        tt_vtime += 1;
++    return rt->tt_step_handler(ctx, line, col, depth - 1, rt->tt_step_opaque);
++}
++
++/* ------------------------------------------------------------------------- */
++
+ /* return a string property without executing arbitrary JS code (used
+    when dumping the stack trace or in debug print). */
+ static const char *get_prop_string(JSContext *ctx, JSValueConst obj, JSAtom prop)
+@@ -17784,8 +17937,19 @@
+     JSVarRef **var_refs;
+     size_t alloca_size;
+ 
++/* TimeTravelJS: check the step hook before dispatching the next opcode.
++   `pc` points at the upcoming instruction here (before the opcode fetch). */
++#define TT_STEP_CHECK() do {                                     \
++        if (unlikely(rt->tt_step_enabled)) {                     \
++            if (unlikely(js_tt_step_check(ctx, sf, b, pc))) {    \
++                JS_ThrowInterrupted(ctx);                        \
++                goto exception;                                  \
++            }                                                    \
++        }                                                        \
++    } while (0)
++
+ #if !DIRECT_DISPATCH
+-#define SWITCH(pc)      switch (opcode = *pc++)
++#define SWITCH(pc)      TT_STEP_CHECK(); switch (opcode = *pc++)
+ #define CASE(op)        case op
+ #define DEFAULT         default
+ #define BREAK           break
+@@ -17800,7 +17964,7 @@
+ #include "quickjs-opcode.h"
+         [ OP_COUNT ... 255 ] = &&case_default
+     };
+-#define SWITCH(pc)      goto *dispatch_table[opcode = *pc++];
++#define SWITCH(pc)      TT_STEP_CHECK(); goto *dispatch_table[opcode = *pc++];
+ #ifdef OPCODE_ASM_LABEL
+ #define CASE(op)        case_ ## op: asm volatile("label_" #op ":\n.globl label_" #op); dummy_case_ ## op
+ #else
+@@ -17864,6 +18028,10 @@
+         return JS_ThrowStackOverflow(caller_ctx);
+ 
+     sf->js_mode = b->js_mode;
++    sf->tt_last_line = 0;
++    sf->tt_pc_lo = 0;
++    sf->tt_pc_hi = 0;
++    sf->tt_prev_off = 0;
+     arg_buf = argv;
+     sf->arg_count = argc;
+     sf->cur_func = (JSValue)func_obj;
+@@ -47146,6 +47314,12 @@
+ static void js_random_init(JSContext *ctx)
+ {
+     struct timeval tv;
++    if (tt_vtime_enabled) {
++        /* TimeTravelJS: fixed seed — Math.random() is a deterministic
++           sequence and its state lives in the heap, so snapshots replay it */
++        ctx->random_state = 0x9E3779B97F4A7C15ULL;
++        return;
++    }
+     gettimeofday(&tv, NULL);
+     ctx->random_state = ((int64_t)tv.tv_sec * 1000000) + tv.tv_usec;
+     /* the state must be non zero */
+@@ -55169,6 +55343,10 @@
+ /* OS dependent: return the UTC time in ms since 1970. */
+ static int64_t date_now(void) {
+     struct timeval tv;
++    if (tt_vtime_enabled) {
++        /* TimeTravelJS: virtual clock — one unit per executed step */
++        return (int64_t)tt_vtime;
++    }
+     gettimeofday(&tv, NULL);
+     return (int64_t)tv.tv_sec * 1000 + (tv.tv_usec / 1000);
+ }
+@@ -61195,3 +61373,218 @@
+     JS_FreeValue(ctx, obj);
+     return 0;
+ }
++
++/* TimeTravelJS debugger API ---------------------------------------------- */
++
++void JS_TTSetStepHandler(JSRuntime *rt, JSTTStepHandler *handler, void *opaque)
++{
++    rt->tt_step_handler = handler;
++    rt->tt_step_opaque = opaque;
++}
++
++void JS_TTEnableStep(JSRuntime *rt, JS_BOOL enable)
++{
++    rt->tt_step_enabled = enable;
++}
++
++JS_BOOL JS_TTStepEnabled(JSRuntime *rt)
++{
++    return rt->tt_step_enabled;
++}
++
++void JS_TTSetVirtualTime(double ms, JS_BOOL enabled)
++{
++    tt_vtime = ms;
++    tt_vtime_enabled = enabled;
++}
++
++double JS_TTGetVirtualTime(void)
++{
++    return tt_vtime;
++}
++
++static JSFunctionBytecode *tt_frame_bytecode(JSStackFrame *sf)
++{
++    JSObject *p;
++    if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
++        return NULL;
++    p = JS_VALUE_GET_OBJ(sf->cur_func);
++    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
++        return NULL;
++    return p->u.func.function_bytecode;
++}
++
++JSValue JS_TTBacktrace(JSContext *ctx)
++{
++    JSRuntime *rt = ctx->rt;
++    JSStackFrame *sf;
++    JSValue arr, entry;
++    uint32_t idx = 0;
++    int line, col;
++
++    arr = JS_NewArray(ctx);
++    if (JS_IsException(arr))
++        return arr;
++    for (sf = rt->current_stack_frame; sf; sf = sf->prev_frame) {
++        JSFunctionBytecode *b = tt_frame_bytecode(sf);
++        entry = JS_NewObject(ctx);
++        if (JS_IsException(entry))
++            break;
++        if (b) {
++            line = 0;
++            col = 0;
++            if (sf->cur_pc)
++                line = find_line_num(ctx, b, sf->cur_pc - b->byte_code_buf, &col);
++            JS_DefinePropertyValueStr(ctx, entry, "name",
++                                      b->func_name == JS_ATOM_NULL
++                                          ? JS_NewString(ctx, "")
++                                          : JS_AtomToString(ctx, b->func_name),
++                                      JS_PROP_C_W_E);
++            JS_DefinePropertyValueStr(ctx, entry, "line", JS_NewInt32(ctx, line), JS_PROP_C_W_E);
++            JS_DefinePropertyValueStr(ctx, entry, "col", JS_NewInt32(ctx, col), JS_PROP_C_W_E);
++        } else {
++            JS_DefinePropertyValueStr(ctx, entry, "name", JS_NewString(ctx, "(native)"), JS_PROP_C_W_E);
++            JS_DefinePropertyValueStr(ctx, entry, "line", JS_NewInt32(ctx, 0), JS_PROP_C_W_E);
++            JS_DefinePropertyValueStr(ctx, entry, "col", JS_NewInt32(ctx, 0), JS_PROP_C_W_E);
++        }
++        JS_DefinePropertyValueUint32(ctx, arr, idx++, entry, JS_PROP_C_W_E);
++    }
++    return arr;
++}
++
++/* add name -> value unless the name is internal or exists already */
++static void tt_add_local(JSContext *ctx, JSValueConst obj, JSValueConst tdz_arr,
++                         uint32_t *tdz_count, JSAtom name_atom, JSValueConst val)
++{
++    const char *name;
++    if (name_atom == JS_ATOM_NULL)
++        return;
++    name = JS_AtomToCString(ctx, name_atom);
++    if (!name)
++        return;
++    if (name[0] == '\0' || name[0] == '<' || name[0] == '#') {
++        JS_FreeCString(ctx, name);
++        return;
++    }
++    if (JS_VALUE_GET_TAG(val) == JS_TAG_UNINITIALIZED) {
++        JS_DefinePropertyValueUint32(ctx, (JSValue)tdz_arr, (*tdz_count)++,
++                                     JS_NewString(ctx, name), JS_PROP_C_W_E);
++    } else {
++        int present = JS_HasProperty(ctx, obj, name_atom);
++        if (present <= 0) {
++            JS_DefinePropertyValueStr(ctx, (JSValue)obj, name,
++                                      JS_DupValue(ctx, val), JS_PROP_C_W_E);
++        }
++    }
++    JS_FreeCString(ctx, name);
++}
++
++JSValue JS_TTLocals(JSContext *ctx, int level)
++{
++    JSRuntime *rt = ctx->rt;
++    JSStackFrame *sf;
++    JSFunctionBytecode *b;
++    JSObject *p;
++    JSValue obj, tdz;
++    uint32_t tdz_count = 0;
++    int i;
++
++    /* find the requested bytecode frame */
++    sf = rt->current_stack_frame;
++    while (sf && (tt_frame_bytecode(sf) == NULL))
++        sf = sf->prev_frame;
++    while (sf && level > 0) {
++        sf = sf->prev_frame;
++        while (sf && (tt_frame_bytecode(sf) == NULL))
++            sf = sf->prev_frame;
++        level--;
++    }
++    if (!sf)
++        return JS_NewObject(ctx);
++    b = tt_frame_bytecode(sf);
++    p = JS_VALUE_GET_OBJ(sf->cur_func);
++
++    obj = JS_NewObject(ctx);
++    if (JS_IsException(obj))
++        return obj;
++    tdz = JS_NewArray(ctx);
++
++    /* arguments and local variables (names from the debug vardefs) */
++    if (b->vardefs) {
++        int arg_named = b->arg_count;
++        if (sf->arg_buf) {
++            for (i = 0; i < arg_named && i < sf->arg_count; i++)
++                tt_add_local(ctx, obj, tdz, &tdz_count,
++                             b->vardefs[i].var_name, sf->arg_buf[i]);
++        }
++        if (sf->var_buf) {
++            for (i = 0; i < b->var_count; i++)
++                tt_add_local(ctx, obj, tdz, &tdz_count,
++                             b->vardefs[b->arg_count + i].var_name, sf->var_buf[i]);
++        }
++    }
++    /* captured (closure) variables */
++    if (p->u.func.var_refs) {
++        for (i = 0; i < b->closure_var_count; i++) {
++            JSVarRef *var_ref = p->u.func.var_refs[i];
++            if (var_ref && var_ref->pvalue)
++                tt_add_local(ctx, obj, tdz, &tdz_count,
++                             b->closure_var[i].var_name, *var_ref->pvalue);
++        }
++    }
++    JS_DefinePropertyValueStr(ctx, obj, "<uninitialized>", tdz, JS_PROP_C_W_E);
++    return obj;
++}
++
++/* Restrict step hooks to functions compiled from `filename` (NULL = all). */
++void JS_TTSetStepFilename(JSContext *ctx, const char *filename)
++{
++    JSRuntime *rt = ctx->rt;
++    if (rt->tt_step_filename != JS_ATOM_NULL)
++        JS_FreeAtomRT(rt, rt->tt_step_filename);
++    rt->tt_step_filename = filename ? JS_NewAtom(ctx, filename) : JS_ATOM_NULL;
++}
++
++/* Script-level let/const/class bindings live in ctx->global_var_obj, not on
++   globalThis. Returns a plain object copy: { name -> value }, TDZ bindings
++   listed under "<uninitialized>". */
++JSValue JS_TTGlobalLexicals(JSContext *ctx)
++{
++    JSValue obj, tdz;
++    JSPropertyEnum *tab;
++    uint32_t len, i, tdz_count = 0;
++    JSObject *p;
++
++    obj = JS_NewObject(ctx);
++    if (JS_IsException(obj))
++        return obj;
++    tdz = JS_NewArray(ctx);
++    if (JS_VALUE_GET_TAG(ctx->global_var_obj) != JS_TAG_OBJECT)
++        goto done;
++    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
++    if (JS_GetOwnPropertyNamesInternal(ctx, &tab, &len, p, JS_GPN_STRING_MASK))
++        goto done;
++    for (i = 0; i < len; i++) {
++        JSValue v = JS_GetPropertyInternal(ctx, ctx->global_var_obj,
++                                           tab[i].atom, ctx->global_var_obj, 0);
++        if (JS_IsException(v)) {
++            JS_FreeValue(ctx, JS_GetException(ctx));
++            continue;
++        }
++        tt_add_local(ctx, obj, tdz, &tdz_count, tab[i].atom, v);
++        JS_FreeValue(ctx, v);
++    }
++    JS_FreePropertyEnum(ctx, tab, len);
++ done:
++    JS_DefinePropertyValueStr(ctx, obj, "<uninitialized>", tdz, JS_PROP_C_W_E);
++    return obj;
++}
++
++/* Reset runtime-level execution state after the host rewound the heap to a
++   mid-execution snapshot and is starting a fresh session: any stack-frame
++   chain recorded in that heap dangles into the (reused) shadow stack. */
++void JS_TTResetExecState(JSContext *ctx)
++{
++    JSRuntime *rt = ctx->rt;
++    rt->current_stack_frame = NULL;
++}
+--- a/quickjs-2026-06-04/quickjs.h	2026-07-19 17:30:42.305676543 +0000
++++ b/vendor/quickjs/quickjs.h	2026-07-19 17:25:23.332847961 +0000
+@@ -926,6 +926,35 @@
+ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
+ /* if can_block is TRUE, Atomics.wait() can be used */
+ void JS_SetCanBlock(JSRuntime *rt, JS_BOOL can_block);
++
++/* TimeTravelJS debugger API ---------------------------------------------- */
++/* Statement-level step hook: called when execution reaches a new source line
++   or re-enters one through a backward jump (loop iteration). May be invoked
++   re-entrantly for nested evals only if re-enabled inside the handler.
++   Return 0 to continue, nonzero to abort execution (uncatchable interrupt). */
++typedef int JSTTStepHandler(JSContext *ctx, int line, int col, int depth,
++                            void *opaque);
++void JS_TTSetStepHandler(JSRuntime *rt, JSTTStepHandler *handler, void *opaque);
++void JS_TTEnableStep(JSRuntime *rt, JS_BOOL enable);
++JS_BOOL JS_TTStepEnabled(JSRuntime *rt);
++/* Deterministic virtual clock backing Date.now()/new Date(); advances one
++   unit per reported step. Enabling it also fixes the Math.random() seed for
++   contexts created afterwards. Stored in linear memory (snapshot-visible). */
++void JS_TTSetVirtualTime(double ms, JS_BOOL enabled);
++double JS_TTGetVirtualTime(void);
++/* Introspection at a paused step (called from inside the step handler):
++   backtrace: Array of { name, line, col } — innermost first.
++   locals:    Object for the frame `level` calls below the innermost
++              JS frame: { name -> value }, with TDZ bindings listed in the
++              string array under the "<uninitialized>" key. */
++JSValue JS_TTBacktrace(JSContext *ctx);
++JSValue JS_TTLocals(JSContext *ctx, int level);
++/* Restrict step hooks to functions compiled from `filename` (NULL = all). */
++void JS_TTSetStepFilename(JSContext *ctx, const char *filename);
++/* Script-level let/const/class bindings (global lexical environment). */
++JSValue JS_TTGlobalLexicals(JSContext *ctx);
++/* Clear the runtime's stack-frame chain (fresh session over a rewound heap). */
++void JS_TTResetExecState(JSContext *ctx);
+ /* select which debug info is stripped from the compiled code */
+ #define JS_STRIP_SOURCE (1 << 0) /* strip source code */
+ #define JS_STRIP_DEBUG  (1 << 1) /* strip all debug info including source code */

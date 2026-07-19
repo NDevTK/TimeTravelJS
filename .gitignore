@@ -1,3 +1,5 @@
 node_modules/
+dist/quickjs-tt.raw.wasm
 *.tmp.mjs
+*.wat
 .DS_Store

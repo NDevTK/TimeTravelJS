@@ -108,7 +108,8 @@ console.log("final balance:", acct.balance);
   {
     id: "timers",
     name: "Virtual timers & deterministic time",
-    code: `// setTimeout runs on a virtual clock after the main script — fully replayable.
+    code: `// setTimeout runs on a virtual clock after the main script — every callback
+// step is its own resumable snapshot, like everything else.
 console.log("t =", Date.now(), "(virtual epoch)");
 
 let sequence = [];

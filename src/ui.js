@@ -159,7 +159,6 @@ export class DebuggerUI {
       canvas: $("#timeline-canvas"),
       posCur: $("#pos-cur"),
       posMax: $("#pos-max"),
-      diverged: $("#diverged-badge"),
       gutter: $("#gutter"),
       code: $("#code-input"),
       scroller: $("#editor-scroller"),
@@ -246,11 +245,11 @@ export class DebuggerUI {
     hlLayer.textContent = ""
     for (const ln of gutter.querySelectorAll(".ln.cur")) ln.classList.remove("cur")
     const entry = this.currentEntry()
-    if (!entry || entry.k === 5) return
-    const isErr = entry.k === 2
-    const line = entry.k === 0 ? entry.l : entry.k === 1 ? entry.l : this._lastLineBefore()
+    if (!entry) return
+    const isErr = !!(entry.end && this.summary && this.summary.error)
+    const line = entry.l || this._lastLineBefore()
     if (!line) return
-    const endLine = entry.k === 0 ? entry.el : line
+    const endLine = line
     const LH = 21
     const PAD = 10
     const band = el("div", "hl-band" + (isErr ? " hl-err" : ""))
@@ -268,8 +267,8 @@ export class DebuggerUI {
 
   _lastLineBefore() {
     const t = this.engine.trace
-    for (let i = Math.min(this.engine.pos, t.length) - 1; i >= 0; i--) {
-      if (t[i].k === 0) return t[i].l
+    for (let i = Math.min(this.engine.pos, t.length - 1); i >= 0; i--) {
+      if (t[i].l) return t[i].l
     }
     return 0
   }
@@ -283,7 +282,7 @@ export class DebuggerUI {
       this.syncPosition()
     }
     $("#btn-start").addEventListener("click", nav(() => this.engine.positionTo(0)))
-    $("#btn-end").addEventListener("click", nav(() => this.engine.positionTo(this.engine.trace.length)))
+    $("#btn-end").addEventListener("click", nav(() => this.engine.positionTo(this.maxPos)))
     $("#btn-fwd").addEventListener("click", nav(() => this.stepInto(1)))
     $("#btn-back").addEventListener("click", nav(() => this.stepInto(-1)))
     $("#btn-over").addEventListener("click", nav(() => this.stepOver(1)))
@@ -335,7 +334,7 @@ export class DebuggerUI {
     if (!this.summary || this.recording) return
     const rect = this.els.canvas.getBoundingClientRect()
     const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width))
-    const target = Math.round(frac * this.engine.trace.length)
+    const target = Math.round(frac * this.maxPos)
     if (always || target !== this.engine.pos) {
       this.stopPlay()
       this.engine.positionTo(target)
@@ -344,26 +343,26 @@ export class DebuggerUI {
   }
 
   currentEntry() {
-    const t = this.engine.trace
-    const p = this.engine.pos
-    return p >= 1 ? t[p - 1] : null
+    return this.engine.trace[this.engine.pos] ?? null
   }
   currentDepth() {
     const e = this.currentEntry()
-    return e && e.k === 0 ? e.d : 0
+    return e ? e.d : 0
+  }
+
+  get maxPos() {
+    return Math.max(0, this.engine.trace.length - 1)
   }
 
   /** next position (searching dir) whose entry passes `pred`; falls to bounds */
   _seek(dir, pred) {
     const t = this.engine.trace
     let p = this.engine.pos + dir
-    while (p >= 0 && p <= t.length) {
-      if (p === 0 || p === t.length) break
-      const entry = t[p - 1]
-      if (entry.k !== 5 && pred(entry)) break
+    while (p > 0 && p < t.length - 1) {
+      if (pred(t[p])) break
       p += dir
     }
-    return Math.max(0, Math.min(p, t.length))
+    return Math.max(0, Math.min(p, this.maxPos))
   }
 
   stepInto(dir) {
@@ -371,29 +370,29 @@ export class DebuggerUI {
   }
   stepOver(dir) {
     const d = this.currentDepth()
-    this.engine.positionTo(this._seek(dir, (entry) => entry.k !== 0 || entry.d <= d))
+    this.engine.positionTo(this._seek(dir, (entry) => !entry.entry || entry.d <= d))
   }
   stepOut(dir) {
     const d = this.currentDepth()
     if (d === 0) return this.stepInto(dir)
-    this.engine.positionTo(this._seek(dir, (entry) => entry.k !== 0 || entry.d < d))
+    this.engine.positionTo(this._seek(dir, (entry) => !entry.entry || entry.d < d))
   }
   continueTo(dir) {
     if (this.breakpoints.size === 0) {
-      this.engine.positionTo(dir > 0 ? this.engine.trace.length : 0)
+      this.engine.positionTo(dir > 0 ? this.maxPos : 0)
       return
     }
-    this.engine.positionTo(this._seek(dir, (entry) => entry.k === 0 && this.breakpoints.has(entry.l)))
+    this.engine.positionTo(this._seek(dir, (entry) => entry.entry && this.breakpoints.has(entry.l)))
   }
 
   togglePlay() {
     if (this.playTimer) return this.stopPlay()
     if (!this.summary || this.recording) return
-    if (this.engine.pos >= this.engine.trace.length) this.engine.positionTo(0)
+    if (this.engine.pos >= this.maxPos) this.engine.positionTo(0)
     this.els.playBtn.classList.add("playing")
     this.els.playBtn.textContent = "⏸ pause"
     this.playTimer = setInterval(() => {
-      if (this.engine.pos >= this.engine.trace.length) return this.stopPlay()
+      if (this.engine.pos >= this.maxPos) return this.stopPlay()
       this.stepInto(1)
       this.syncPosition(true)
     }, 90)
@@ -417,7 +416,6 @@ export class DebuggerUI {
     this.els.code.readOnly = true
     this.els.runBtn.disabled = true
     this.setStatus("busy", "recording…")
-    this.els.diverged.hidden = true
     try {
       const summary = await this.engine.run(
         this.els.code.value,
@@ -440,11 +438,11 @@ export class DebuggerUI {
         summary.error ? "err" : "ok",
         summary.error
           ? `crashed after ${summary.steps} steps — travel back to investigate`
-          : `${summary.steps} steps · ${cow.snapshots} snapshots · COW saved ${(cow.savings * 100).toFixed(0)}%`,
+          : `${summary.steps} steps · one snapshot each · COW saved ${(cow.savings * 100).toFixed(1)}%`,
       )
-      this.els.slider.max = String(summary.steps)
-      this.els.posMax.textContent = String(summary.steps)
-      this.engine.positionTo(summary.steps)
+      this.els.slider.max = String(this.maxPos)
+      this.els.posMax.textContent = String(this.maxPos)
+      this.engine.positionTo(this.maxPos)
       this.syncPosition()
     } catch (err) {
       this.setStatus("err", err.timeTravelUserError ? "program error" : "engine error")
@@ -491,12 +489,12 @@ export class DebuggerUI {
       if (entry.visibleAt <= pos) rows.push({ at: entry.visibleAt, level: entry.level, text: entry.text, node: entry.node })
     }
     rows.sort((a, b) => a.at - b.at)
-    if (this.summary && this.summary.error && pos >= this.engine.trace.length) {
+    if (this.summary && this.summary.error && pos >= this.engine.trace.length - 1) {
       const info = this.summary.error
       rows.push({
         at: pos,
         level: "error",
-        text: typeof info === "object" && info ? `${info.name ?? "Error"}: ${info.message ?? String(info)}` : String(info),
+        text: info && info.t === "error" ? `Uncaught ${info.name}: ${info.msg}` : `Uncaught error: ${JSON.stringify(info)}`,
       })
     }
     if (!rows.length) {
@@ -505,8 +503,7 @@ export class DebuggerUI {
     }
     for (const r of rows) {
       const row = el("div", `console-row level-${r.level}`)
-      const tag = span("step-tag", `@${r.at}`)
-      row.append(tag)
+      row.append(span("step-tag", `@${r.at} `))
       if (r.parts) {
         r.parts.forEach((p, i) => {
           if (i) row.append(document.createTextNode(" "))
@@ -524,10 +521,10 @@ export class DebuggerUI {
 
   // ------------------------------------------------------------------ panels
   syncPosition(lightweight = false) {
+    this.selectedFrame = 0
     const pos = this.engine.pos
     this.els.slider.value = String(pos)
     this.els.posCur.textContent = String(pos)
-    this.els.diverged.hidden = !this.engine.diverged
     this.highlightCurrent()
     this.renderTimeline()
     this.renderConsole()
@@ -548,34 +545,38 @@ export class DebuggerUI {
       stackBody.append(el("div", "empty-note", "—"))
       return
     }
-    const ins = this.engine.inspect()
+    const ins = this.engine.inspect() // {stack, frames, globals} — innermost first
     const entry = this.currentEntry()
-    varsHint.textContent = entry && entry.k === 0 ? `line ${entry.l}` : ""
+    const frameIdx = Math.min(this.selectedFrame ?? 0, Math.max(0, (ins.frames?.length ?? 1) - 1))
+    varsHint.textContent = entry && entry.l ? `line ${entry.l}` : entry?.end ? "program finished" : ""
 
     const tree = el("div", "vtree")
-    if (ins.locals && ins.locals.length) {
-      tree.append(el("div", "vgroup-title", "in scope"))
-      for (const [k, v] of ins.locals) tree.append(treeRow(k, v, "vkey vkey-local", v && (v.t === "arr" || v.t === "obj") && this._smallEnough(v)))
+    const locals = ins.frames?.[frameIdx] ?? []
+    if (locals.length) {
+      const fname = ins.stack?.[frameIdx]?.name
+      tree.append(el("div", "vgroup-title", frameIdx === 0 ? "in scope" : `frame: ${fname || "(anonymous)"}`))
+      for (const [k, v] of locals) tree.append(treeRow(k, v, "vkey vkey-local", v && (v.t === "arr" || v.t === "obj") && this._smallEnough(v)))
     }
     if (ins.globals && ins.globals.length) {
-      tree.append(el("div", "vgroup-title", "globals (user-defined)"))
+      tree.append(el("div", "vgroup-title", "top level & globals"))
       for (const [k, v] of ins.globals) tree.append(treeRow(k, v, "vkey"))
     }
     if (!tree.childElementCount) tree.append(el("div", "empty-note", this.engine.pos === 0 ? "before first statement — step forward" : "no visible variables here"))
     varsBody.append(tree)
 
-    const frames = [...(ins.stack || [])]
-    const rows = []
-    const curLine = entry && entry.k === 0 ? entry.l : null
-    for (let i = frames.length - 1; i >= 0; i--) {
-      rows.push({ fn: frames[i].n, loc: i === frames.length - 1 ? curLine : null, callsite: frames[i].l })
-    }
-    rows.push({ fn: "(top level)", loc: frames.length === 0 ? curLine : null, callsite: null })
-    rows.forEach((r, i) => {
-      const row = el("div", "stack-row" + (i === 0 ? " stack-top" : ""))
+    // call stack: innermost first; rows click-select the frame to inspect
+    const stack = ins.stack ?? []
+    const rows = stack.map((f, i) => ({ fn: f.name || "(anonymous)", line: f.line, idx: i }))
+    if (!rows.length) rows.push({ fn: entry?.end ? "(finished)" : "(top level)", line: entry?.l ?? 0, idx: 0 })
+    rows.forEach((r) => {
+      const row = el("div", "stack-row" + (r.idx === frameIdx ? " stack-top" : ""))
+      row.style.cursor = "pointer"
       row.append(el("span", "stack-fn", r.fn))
-      const where = r.loc ? `line ${r.loc}` : r.callsite ? `called from line ${r.callsite}` : ""
-      row.append(el("span", "stack-loc", where))
+      row.append(el("span", "stack-loc", r.line ? `line ${r.line}` : ""))
+      row.addEventListener("click", () => {
+        this.selectedFrame = r.idx
+        this.renderInspection()
+      })
       stackBody.append(row)
     })
   }
@@ -599,71 +600,65 @@ export class DebuggerUI {
     ctx.clearRect(0, 0, W, H)
     if (!this.summary) return
     const t = this.engine.trace
-    const N = Math.max(1, t.length)
+    const N = Math.max(1, t.length - 1)
     const x = (p) => (p / N) * W
 
     // depth area chart
     let maxD = 1
-    for (const entry of t) if (entry.k === 0 && entry.d > maxD) maxD = entry.d
+    for (const entry of t) if (entry.d > maxD) maxD = entry.d
     ctx.beginPath()
     ctx.moveTo(0, H)
     for (let i = 0; i < t.length; i++) {
-      const d = t[i].k === 0 ? t[i].d : 0
-      ctx.lineTo(x(i + 1), H - 6 - (d / maxD) * (H - 18))
+      ctx.lineTo(x(i), H - 6 - ((t[i].d || 0) / maxD) * (H - 18))
     }
     ctx.lineTo(W, H)
     ctx.closePath()
     ctx.fillStyle = "rgba(139, 124, 246, 0.22)"
     ctx.fill()
 
-    // error zone
-    const last = t[t.length - 1]
-    if (last && last.k === 2) {
-      ctx.fillStyle = "rgba(248, 113, 113, 0.15)"
-      ctx.fillRect(x(N - 1), 0, W - x(N - 1) + 2, H)
+    // error zone at the end of a crashed program
+    if (this.summary.error) {
+      ctx.fillStyle = "rgba(248, 113, 113, 0.18)"
+      ctx.fillRect(x(Math.max(0, t.length - 2)), 0, W, H)
     }
-    // phase divider (main program → timers)
-    if (this.summary.switchIdx != null) {
-      ctx.strokeStyle = "rgba(251, 191, 36, 0.5)"
-      ctx.setLineDash([3, 3])
-      ctx.beginPath()
-      ctx.moveTo(x(this.summary.switchIdx + 1), 0)
-      ctx.lineTo(x(this.summary.switchIdx + 1), H)
-      ctx.stroke()
-      ctx.setLineDash([])
-    }
-    // checkpoints
-    for (const cp of this.summary.checkpoints) {
-      const frac = Math.min(1, cp.dirtyPages / 64)
-      ctx.strokeStyle = `rgba(77, 208, 225, ${0.25 + frac * 0.6})`
-      ctx.beginPath()
-      ctx.moveTo(x(cp.step), H - 4)
-      ctx.lineTo(x(cp.step), H - 4 - 8 - frac * 12)
-      ctx.stroke()
+    // per-step COW dirty pages — brightness = how much memory that step touched
+    const dirty = this.summary.dirtyCounts ?? []
+    if (dirty.length > 1) {
+      let maxDirty = 1
+      for (let i = 1; i < dirty.length; i++) if (dirty[i] > maxDirty) maxDirty = dirty[i]
+      for (let i = 1; i < dirty.length; i++) {
+        const frac = Math.min(1, dirty[i] / maxDirty)
+        if (frac <= 0.02) continue
+        ctx.strokeStyle = `rgba(77, 208, 225, ${0.15 + frac * 0.7})`
+        ctx.beginPath()
+        ctx.moveTo(x(i), H - 4)
+        ctx.lineTo(x(i), H - 4 - 3 - frac * 14)
+        ctx.stroke()
+      }
     }
     // console events
     for (const entry of this.engine.consoleEntries) {
       ctx.fillStyle = entry.level === "error" ? "#f87171" : entry.level === "warn" ? "#fbbf24" : "#4ade80"
       ctx.beginPath()
-      ctx.arc(x(entry.visibleAt), 5, 2.2, 0, Math.PI * 2)
+      ctx.arc(x(Math.min(entry.visibleAt, N)), 5, 2.2, 0, Math.PI * 2)
       ctx.fill()
     }
     // timer markers
     for (let i = 0; i < t.length; i++) {
-      if (t[i].k === 1) {
+      if (t[i].timer) {
         ctx.fillStyle = "#fbbf24"
-        ctx.fillRect(x(i + 1) - 1.5, 10, 3, 3)
+        ctx.fillRect(x(i) - 1.5, 10, 3, 3)
       }
     }
     // breakpoint hits
     if (this.breakpoints.size) {
       ctx.fillStyle = "rgba(248, 113, 113, 0.8)"
       for (let i = 0; i < t.length; i++) {
-        if (t[i].k === 0 && this.breakpoints.has(t[i].l)) ctx.fillRect(x(i + 1) - 1, H - 3, 2, 3)
+        if (t[i].entry && this.breakpoints.has(t[i].l)) ctx.fillRect(x(i) - 1, H - 3, 2, 3)
       }
     }
     // needle
-    const px = x(this.engine.pos)
+    const px = x(Math.min(this.engine.pos, N))
     ctx.strokeStyle = "#4dd0e1"
     ctx.shadowColor = "rgba(77, 208, 225, 0.8)"
     ctx.shadowBlur = 6
@@ -693,8 +688,8 @@ export class DebuggerUI {
       memStats.append(row)
     }
     stat("VM heap", fmtBytes(this.summary.memBytes))
-    stat("snapshots", String(cow.snapshots))
-    stat("page size", "4 KB")
+    stat("snapshots (1/step)", String(cow.snapshots))
+    stat("page size", "1 KB")
     stat("unique pages kept", String(cow.uniquePages))
     stat("full copies would cost", fmtBytes(cow.naiveBytes))
     stat("COW actually keeps", fmtBytes(cow.retainedBytes), true)
@@ -708,7 +703,7 @@ export class DebuggerUI {
       el("div", "mem-bar-caption", `sharing unchanged pages between snapshots saves ${(cow.savings * 100).toFixed(1)}% of snapshot memory`),
     )
 
-    // per-checkpoint dirty pages
+    // per-step dirty pages (downsampled into bins)
     {
       const dpr = window.devicePixelRatio || 1
       const W = cpCanvas.clientWidth || 300
@@ -718,17 +713,24 @@ export class DebuggerUI {
       const c = cpCanvas.getContext("2d")
       c.scale(dpr, dpr)
       c.clearRect(0, 0, W, H)
-      const cps = this.summary.checkpoints
-      if (cps.length) {
-        const maxDirty = Math.max(1, ...cps.map((cp) => cp.dirtyPages))
-        const bw = Math.max(2, Math.min(14, (W - 4) / cps.length - 2))
-        let active = 0
-        for (let i = 0; i < cps.length; i++) if (cps[i].step <= this.engine.pos) active = i
-        cps.forEach((cp, i) => {
-          const h = Math.max(2, (cp.dirtyPages / maxDirty) * (H - 8))
-          const bx = 2 + (i * (W - 4)) / cps.length
-          c.fillStyle = i === active ? "#4dd0e1" : "rgba(139, 124, 246, 0.55)"
-          c.fillRect(bx, H - 2 - h, bw, h)
+      const dirty = this.summary.dirtyCounts ?? []
+      if (dirty.length > 1) {
+        const bins = Math.min(dirty.length - 1, Math.floor(W / 3))
+        const per = (dirty.length - 1) / bins
+        const binned = []
+        for (let b = 0; b < bins; b++) {
+          let m = 0
+          for (let i = Math.floor(1 + b * per); i < Math.floor(1 + (b + 1) * per) && i < dirty.length; i++) {
+            if (dirty[i] > m) m = dirty[i]
+          }
+          binned.push(m)
+        }
+        const maxDirty = Math.max(1, ...binned)
+        const activeBin = Math.min(bins - 1, Math.floor((this.engine.pos - 1) / per))
+        binned.forEach((v, b) => {
+          const h = Math.max(1, (v / maxDirty) * (H - 6))
+          c.fillStyle = b === activeBin ? "#4dd0e1" : "rgba(139, 124, 246, 0.55)"
+          c.fillRect(b * (W / bins), H - 2 - h, Math.max(1.5, W / bins - 1), h)
         })
       }
     }
@@ -744,7 +746,7 @@ export class DebuggerUI {
       c.clearRect(0, 0, W, H)
       const heat = this.summary.pageHeat
       if (heat.length) {
-        const pageCount = Math.ceil(this.summary.memBytes / 4096)
+        const pageCount = Math.ceil(this.summary.memBytes / 1024)
         const maxHeat = Math.max(...heat.map(([, n]) => n))
         c.fillStyle = "rgba(255,255,255,0.04)"
         c.fillRect(0, 4, W, H - 8)
