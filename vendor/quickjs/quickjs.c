@@ -21875,11 +21875,14 @@ static int js_async_function_resolve_create(JSContext *ctx,
     return 0;
 }
 
-static void js_async_function_resume(JSContext *ctx, JSAsyncFunctionState *s)
+/* Post-half after the async body ran (async_func_finish already applied):
+   settle the promise on completion, or wire the await continuation. Shared
+   by the C resume path and the TimeTravelJS in-loop (stackless) path. */
+static void js_async_function_post(JSContext *ctx, JSAsyncFunctionState *s,
+                                   JSValue func_ret)
 {
-    JSValue func_ret, ret2;
+    JSValue ret2;
 
-    func_ret = async_func_resume(ctx, s);
     if (s->is_completed) {
         if (JS_IsException(func_ret)) {
             JSValue error;
@@ -21928,6 +21931,11 @@ static void js_async_function_resume(JSContext *ctx, JSAsyncFunctionState *s)
         if (res)
             goto fail;
     }
+}
+
+static void js_async_function_resume(JSContext *ctx, JSAsyncFunctionState *s)
+{
+    js_async_function_post(ctx, s, async_func_resume(ctx, s));
 }
 
 static JSValue js_async_function_resolve_call(JSContext *ctx,
