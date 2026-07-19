@@ -18034,6 +18034,10 @@ static JSValue js_function_call(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv);
 static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv, int magic);
+static JSValue js_string_constructor(JSContext *ctx, JSValueConst new_target,
+                                     int argc, JSValueConst *argv);
+static JSValue js_string_concat(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv);
 static struct JSGeneratorData *js_generator_create_pre(JSContext *ctx,
                                                        JSValueConst func_obj,
                                                        JSValueConst this_obj,
@@ -18305,89 +18309,85 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         argv = sf->tt_orig_argv;                                 \
     } while (0)
 
-/* Coerce the operator's object operands to primitives IN-LOOP before the
-   pristine C slow helper runs (which then only ever sees primitives): a
-   present Symbol.toPrimitive is read exactly once and called per spec
-   (bytecode method -> TT_FRAME_TOPRIM frame with the hint string in an
-   arena block; C method -> inline call; object result -> TypeError, no
-   OrdinaryToPrimitive fallback); otherwise valueOf/toString run in
-   OrdinaryToPrimitive order the same two ways. The frame's post
-   substitutes the primitive into the operand slot and re-dispatches this
-   opcode, so the left operand always finishes before the right is even
-   probed. Mirrors JS_ToPrimitiveFree line by line. eqmode 1 restricts
-   coercion to loose-eq's object-vs-primitive rule; eqmode 2 (strict
-   equality: never coerces) compiles the block away. */
-#define TT_COERCE_OPERANDS(hintv, eqmode)                               \
-    if ((eqmode) != 2) {                                                \
-        int cc_w, cc_step, cc_r;                                        \
+/* Coerce ONE object-valued stack slot toward a primitive IN-LOOP, exactly
+   as JS_ToPrimitiveFree would: a present Symbol.toPrimitive is read once
+   and called per spec (bytecode method -> TT_FRAME_TOPRIM frame with the
+   hint string staged in an arena block; C method -> inline call; object
+   result -> TypeError, no ordinary fallback); otherwise valueOf/toString
+   run in OrdinaryToPrimitive order the same two ways. The frame's post
+   substitutes the primitive into the slot (aux_i carries the slot's
+   sp-relative offset) and re-dispatches the armed instruction (aux_i
+   carries its byte length), which then re-scans: convergence because the
+   object count strictly decreases. Falling out the bottom of the macro
+   means the slot now holds a primitive (C methods ran inline). nosymv 1
+   = the caller is a ToString continuation that must reject a symbol
+   result itself (String() would otherwise re-dispatch into its
+   direct-symbol special case). */
+#define TT_COERCE_SLOT(sl_slot, hintv, deltav, nosymv)                  \
+    {                                                                   \
+        int cc_step, cc_r;                                              \
         JSValue cc_m, cc_v;                                             \
-        for (cc_w = 0; cc_w < 2; cc_w++) {                              \
-            if (JS_VALUE_GET_TAG(sp[-2 + cc_w]) != JS_TAG_OBJECT)       \
-                continue;                                               \
-            if (eqmode) {                                               \
-                uint32_t cc_ot = JS_VALUE_GET_NORM_TAG(sp[-1 - cc_w]);  \
-                if (!(cc_ot == JS_TAG_INT || cc_ot == JS_TAG_FLOAT64 || \
-                      cc_ot == JS_TAG_BOOL || cc_ot == JS_TAG_STRING || \
-                      cc_ot == JS_TAG_STRING_ROPE ||                    \
-                      cc_ot == JS_TAG_SHORT_BIG_INT ||                  \
-                      cc_ot == JS_TAG_BIG_INT || cc_ot == JS_TAG_SYMBOL)) \
-                    continue;                                           \
-            }                                                           \
-            cc_m = JS_GetProperty(ctx, sp[-2 + cc_w], JS_ATOM_Symbol_toPrimitive); \
-            if (JS_IsException(cc_m))                                   \
-                goto exception;                                         \
-            if (!JS_IsUndefined(cc_m) && !JS_IsNull(cc_m)) {            \
-                JSAtom cc_ha = ((hintv) == HINT_STRING) ? JS_ATOM_string : \
-                               ((hintv) == HINT_NUMBER) ? JS_ATOM_number : \
-                               JS_ATOM_default;                         \
-                if (JS_VALUE_GET_TAG(cc_m) == JS_TAG_OBJECT &&          \
-                    JS_VALUE_GET_OBJ(cc_m)->class_id == JS_CLASS_BYTECODE_FUNCTION) { \
-                    JSValue *cc_blk;                                    \
-                    if (unlikely(js_poll_interrupts(ctx))) {            \
-                        JS_FreeValue(ctx, cc_m);                        \
-                        goto exception;                                 \
-                    }                                                   \
-                    cc_blk = tt_arena_alloc_vals(rt, 1);                \
-                    if (unlikely(!cc_blk)) {                            \
-                        JS_FreeValue(ctx, cc_m);                        \
-                        JS_ThrowStackOverflow(caller_ctx);              \
-                        goto exception;                                 \
-                    }                                                   \
-                    cc_blk[0] = JS_AtomToString(ctx, cc_ha);            \
-                    sf->cur_sp = sp;                                    \
-                    pf_func = cc_m;                                     \
-                    pf_this = sp[-2 + cc_w];                            \
-                    pf_new_target = JS_UNDEFINED;                       \
-                    pf_argc = 1;                                        \
-                    pf_argv = cc_blk;                                   \
-                    pf_flags = 0;                                       \
-                    pf_kind = TT_FRAME_TOPRIM;                          \
-                    pf_ctor_this = cc_m;                                \
-                    pf_aux_i = cc_w | (((hintv) | (0xE << 4)) << 1);    \
-                    pf_cargc = 0;                                       \
-                    pf_aux = cc_blk;                                    \
-                    goto push_frame;                                    \
-                }                                                       \
-                {                                                       \
-                    JSValue cc_hs = JS_AtomToString(ctx, cc_ha);        \
-                    cc_v = JS_CallFree(ctx, cc_m, sp[-2 + cc_w], 1,     \
-                                       (JSValueConst *)&cc_hs);         \
-                    JS_FreeValue(ctx, cc_hs);                           \
-                }                                                       \
-                if (JS_IsException(cc_v))                               \
+        cc_m = JS_GetProperty(ctx, *(sl_slot), JS_ATOM_Symbol_toPrimitive); \
+        if (JS_IsException(cc_m))                                       \
+            goto exception;                                             \
+        if (!JS_IsUndefined(cc_m) && !JS_IsNull(cc_m)) {                \
+            JSAtom cc_ha = ((hintv) == HINT_STRING) ? JS_ATOM_string :  \
+                           ((hintv) == HINT_NUMBER) ? JS_ATOM_number :  \
+                           JS_ATOM_default;                             \
+            if (JS_VALUE_GET_TAG(cc_m) == JS_TAG_OBJECT &&              \
+                JS_VALUE_GET_OBJ(cc_m)->class_id == JS_CLASS_BYTECODE_FUNCTION) { \
+                JSValue *cc_blk;                                        \
+                if (unlikely(js_poll_interrupts(ctx))) {                \
+                    JS_FreeValue(ctx, cc_m);                            \
                     goto exception;                                     \
-                if (JS_VALUE_GET_TAG(cc_v) != JS_TAG_OBJECT) {          \
-                    JS_FreeValue(ctx, sp[-2 + cc_w]);                   \
-                    sp[-2 + cc_w] = cc_v;                               \
-                    continue;                                           \
                 }                                                       \
+                cc_blk = tt_arena_alloc_vals(rt, 1);                    \
+                if (unlikely(!cc_blk)) {                                \
+                    JS_FreeValue(ctx, cc_m);                            \
+                    JS_ThrowStackOverflow(caller_ctx);                  \
+                    goto exception;                                     \
+                }                                                       \
+                cc_blk[0] = JS_AtomToString(ctx, cc_ha);                \
+                sf->cur_sp = sp;                                        \
+                pf_func = cc_m;                                         \
+                pf_this = *(sl_slot);                                   \
+                pf_new_target = JS_UNDEFINED;                           \
+                pf_argc = 1;                                            \
+                pf_argv = cc_blk;                                       \
+                pf_flags = 0;                                           \
+                pf_kind = TT_FRAME_TOPRIM;                              \
+                pf_ctor_this = cc_m;                                    \
+                pf_aux_i = (int)((uint32_t)(int)((sl_slot) - sp) << 16) | \
+                           ((nosymv) << 12) |                           \
+                           ((deltav) << 8) | (0xE << 4) | (hintv);      \
+                pf_cargc = 0;                                           \
+                pf_aux = cc_blk;                                        \
+                goto push_frame;                                        \
+            }                                                           \
+            {                                                           \
+                JSValue cc_hs = JS_AtomToString(ctx, cc_ha);            \
+                cc_v = JS_CallFree(ctx, cc_m, *(sl_slot), 1,            \
+                                   (JSValueConst *)&cc_hs);             \
+                JS_FreeValue(ctx, cc_hs);                               \
+            }                                                           \
+            if (JS_IsException(cc_v))                                   \
+                goto exception;                                         \
+            if (JS_VALUE_GET_TAG(cc_v) == JS_TAG_OBJECT) {              \
                 JS_FreeValue(ctx, cc_v);                                \
                 JS_ThrowTypeError(ctx, "toPrimitive");                  \
                 goto exception;                                         \
             }                                                           \
+            if ((nosymv) && JS_VALUE_GET_TAG(cc_v) == JS_TAG_SYMBOL) {  \
+                JS_FreeValue(ctx, cc_v);                                \
+                JS_ThrowTypeError(ctx, "cannot convert symbol to string"); \
+                goto exception;                                         \
+            }                                                           \
+            JS_FreeValue(ctx, *(sl_slot));                              \
+            *(sl_slot) = cc_v;                                          \
+        } else {                                                        \
             cc_step = 0;                                                \
             for (;;) {                                                  \
-                cc_r = tt_toprim_pick(ctx, sp[-2 + cc_w], hintv,        \
+                cc_r = tt_toprim_pick(ctx, *(sl_slot), hintv,           \
                                       cc_step, &cc_m, &cc_step);        \
                 if (cc_r < 0)                                           \
                     goto exception;                                     \
@@ -18402,24 +18402,31 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }                                                   \
                     sf->cur_sp = sp;                                    \
                     pf_func = cc_m;                                     \
-                    pf_this = sp[-2 + cc_w];                            \
+                    pf_this = *(sl_slot);                               \
                     pf_new_target = JS_UNDEFINED;                       \
                     pf_argc = 0;                                        \
                     pf_argv = NULL;                                     \
                     pf_flags = 0;                                       \
                     pf_kind = TT_FRAME_TOPRIM;                          \
                     pf_ctor_this = cc_m;                                \
-                    pf_aux_i = cc_w | (((hintv) | (cc_step << 4)) << 1); \
+                    pf_aux_i = (int)((uint32_t)(int)((sl_slot) - sp) << 16) | \
+                               ((nosymv) << 12) |                       \
+                               ((deltav) << 8) | (cc_step << 4) | (hintv); \
                     pf_cargc = 0;                                       \
                     pf_aux = NULL;                                      \
                     goto push_frame;                                    \
                 }                                                       \
-                cc_v = JS_CallFree(ctx, cc_m, sp[-2 + cc_w], 0, NULL);  \
+                cc_v = JS_CallFree(ctx, cc_m, *(sl_slot), 0, NULL);     \
                 if (JS_IsException(cc_v))                               \
                     goto exception;                                     \
                 if (JS_VALUE_GET_TAG(cc_v) != JS_TAG_OBJECT) {          \
-                    JS_FreeValue(ctx, sp[-2 + cc_w]);                   \
-                    sp[-2 + cc_w] = cc_v;                               \
+                    if ((nosymv) && JS_VALUE_GET_TAG(cc_v) == JS_TAG_SYMBOL) { \
+                        JS_FreeValue(ctx, cc_v);                        \
+                        JS_ThrowTypeError(ctx, "cannot convert symbol to string"); \
+                        goto exception;                                 \
+                    }                                                   \
+                    JS_FreeValue(ctx, *(sl_slot));                      \
+                    *(sl_slot) = cc_v;                                  \
                     break;                                              \
                 }                                                       \
                 JS_FreeValue(ctx, cc_v);                                \
@@ -18429,6 +18436,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto exception;                                     \
                 }                                                       \
             }                                                           \
+        }                                                               \
+    }
+
+/* Both operands of a binary operator, left to right (each armed
+   instruction is 1 byte). eqmode 1 restricts coercion to loose-eq's
+   object-vs-primitive rule; eqmode 2 (strict equality: never coerces)
+   compiles the block away. */
+#define TT_COERCE_OPERANDS(hintv, eqmode)                               \
+    if ((eqmode) != 2) {                                                \
+        int cc_w;                                                       \
+        for (cc_w = 0; cc_w < 2; cc_w++) {                              \
+            if (JS_VALUE_GET_TAG(sp[-2 + cc_w]) != JS_TAG_OBJECT)       \
+                continue;                                               \
+            if (eqmode) {                                               \
+                uint32_t cc_ot = JS_VALUE_GET_NORM_TAG(sp[-1 - cc_w]);  \
+                if (!(cc_ot == JS_TAG_INT || cc_ot == JS_TAG_FLOAT64 || \
+                      cc_ot == JS_TAG_BOOL || cc_ot == JS_TAG_STRING || \
+                      cc_ot == JS_TAG_STRING_ROPE ||                    \
+                      cc_ot == JS_TAG_SHORT_BIG_INT ||                  \
+                      cc_ot == JS_TAG_BIG_INT || cc_ot == JS_TAG_SYMBOL)) \
+                    continue;                                           \
+            }                                                           \
+            TT_COERCE_SLOT(&sp[-2 + cc_w], hintv, 1, 0)                 \
         }                                                               \
     }
 
@@ -18967,6 +18997,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     pf_aux = NULL;
                     goto push_frame;
                 }
+                /* TimeTravelJS: String(obj) observably only ToStrings its
+                   argument — coerce it in-loop (parkable), then run the
+                   pristine builtin on the primitive. */
+                if (call_argc >= 1 &&
+                    JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT &&
+                    JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT) {
+                    JSObject *ccp = JS_VALUE_GET_OBJ(call_argv[-1]);
+                    if (ccp->class_id == JS_CLASS_C_FUNCTION &&
+                        ccp->u.cfunc.cproto == JS_CFUNC_constructor_or_func &&
+                        ccp->u.cfunc.c_function.constructor_or_func == js_string_constructor &&
+                        ccp->u.cfunc.realm == ctx) {
+                        int cs_delta;
+#if SHORT_OPCODES
+                        cs_delta = (opcode >= OP_call0 && opcode <= OP_call3) ? 1 : 3;
+#else
+                        cs_delta = 3;
+#endif
+                        TT_COERCE_SLOT(&call_argv[0], HINT_STRING, cs_delta, 1)
+                    }
+                }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                           JS_UNDEFINED, call_argc, call_argv, 0);
                 if (unlikely(JS_IsException(ret_val)))
@@ -19017,6 +19067,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     pf_cargc = pf_argc;
                     pf_aux = NULL;
                     goto push_frame;
+                }
+                /* TimeTravelJS: new String(obj) — same in-loop ToString of
+                   the argument as the plain call form. */
+                if (call_argc >= 1 &&
+                    JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT &&
+                    JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT) {
+                    JSObject *ccp = JS_VALUE_GET_OBJ(call_argv[-2]);
+                    if (ccp->class_id == JS_CLASS_C_FUNCTION &&
+                        ccp->u.cfunc.cproto == JS_CFUNC_constructor_or_func &&
+                        ccp->u.cfunc.c_function.constructor_or_func == js_string_constructor &&
+                        ccp->u.cfunc.realm == ctx) {
+                        TT_COERCE_SLOT(&call_argv[0], HINT_STRING, 3, 1)
+                    }
                 }
                 ret_val = JS_CallConstructorInternal(ctx, call_argv[-2],
                                                      call_argv[-1],
@@ -19169,6 +19232,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (fs->throw_flag)
                             goto exception;
                         goto restart;
+                    }
+                }
+                /* TimeTravelJS: builtin String.prototype.concat (the
+                   compiler's template-literal engine) observably only
+                   ToStrings `this` and each argument, left to right —
+                   coerce every object operand in-loop (parkable), then
+                   run the pristine builtin on primitives. */
+                if (call_argc < 30000 &&
+                    JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT) {
+                    JSObject *ccp = JS_VALUE_GET_OBJ(call_argv[-1]);
+                    if (ccp->class_id == JS_CLASS_C_FUNCTION &&
+                        ccp->u.cfunc.cproto == JS_CFUNC_generic &&
+                        ccp->u.cfunc.c_function.generic == js_string_concat &&
+                        ccp->u.cfunc.realm == ctx) {
+                        int cs_i;
+                        for (cs_i = -2; cs_i < call_argc; cs_i++) {
+                            if (cs_i == -1 || /* the callee slot */
+                                JS_VALUE_GET_TAG(call_argv[cs_i]) != JS_TAG_OBJECT)
+                                continue;
+                            TT_COERCE_SLOT(&call_argv[cs_i], HINT_STRING, 3, 0)
+                        }
                     }
                 }
                 if (likely(JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
@@ -21993,18 +22077,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             goto restart;
         }
         if (kind == TT_FRAME_TOPRIM) {
-            int twhich = kaux & 1;
-            int thint = (kaux >> 1) & 0xf;
-            int tstep = (kaux >> 5) & 0xf;
-            JSValue *slotp = sp - 2 + twhich;
+            int thint = kaux & 0xf;
+            int tstep = (kaux >> 4) & 0xf;
+            int tdelta = (kaux >> 8) & 0xf;
+            int toffset = kaux >> 16; /* arithmetic: slot offset from sp */
+            JSValue *slotp = sp + toffset;
             if (thint != HINT_STRING)
                 thint = HINT_NUMBER;
             JS_FreeValue(ctx, ctor_this);
             if (JS_VALUE_GET_TAG(ret_val) != JS_TAG_OBJECT) {
-                /* primitive: substitute and re-dispatch the operator */
+                if ((kaux & 0x1000) &&
+                    JS_VALUE_GET_TAG(ret_val) == JS_TAG_SYMBOL) {
+                    /* ToString continuation: a symbol never substitutes
+                       (String() would take its direct-symbol path) */
+                    JS_FreeValue(ctx, ret_val);
+                    JS_ThrowTypeError(ctx, "cannot convert symbol to string");
+                    goto exception;
+                }
+                /* primitive: substitute and re-dispatch the armed instr */
                 JS_FreeValue(ctx, *slotp);
                 *slotp = ret_val;
-                pc = sf->cur_pc - 1; /* all armed operators are 1 byte */
+                pc = sf->cur_pc - tdelta;
                 goto restart;
             }
             JS_FreeValue(ctx, ret_val);
@@ -22030,7 +22123,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pf_flags = 0;
                         pf_kind = TT_FRAME_TOPRIM;
                         pf_ctor_this = m2;
-                        pf_aux_i = twhich | ((thint | (1 << 4)) << 1);
+                        pf_aux_i = (int)((uint32_t)toffset << 16) |
+                                   (kaux & 0x1000) |
+                                   (tdelta << 8) | (1 << 4) | thint;
                         pf_cargc = 0;
                         pf_aux = NULL;
                         goto push_frame;
@@ -22042,7 +22137,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (JS_VALUE_GET_TAG(r2) != JS_TAG_OBJECT) {
                             JS_FreeValue(ctx, *slotp);
                             *slotp = r2;
-                            pc = sf->cur_pc - 1;
+                            pc = sf->cur_pc - tdelta;
                             goto restart;
                         }
                         JS_FreeValue(ctx, r2);
