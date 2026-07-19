@@ -398,7 +398,7 @@ struct JSRuntime {
        tt_defer_slot by JS_Get/SetPropertyValue after ToPropertyKey, so the
        coercion itself can never consume the defer */
     JSValue *tt_defer_pending;
-    int tt_defer_kind;  /* armed intent: 1 = accessor sites */
+    int tt_defer_kind;  /* armed intent: 1 = accessor/put sites, 3 = define sites */
     void *tt_defer_aux; /* proxy-get handoff: arena block [target, key,
                            receiver, handler]; set with the deferred trap */
 
@@ -513,6 +513,9 @@ enum {
     TT_FRAME_AGEN_INIT,     /* async generator creation prologue in-loop      */
     TT_FRAME_APPEND_START,  /* bytecode Symbol.iterator for OP_append (spread)*/
     TT_FRAME_APPEND_NEXT,   /* bytecode next() for one OP_append element      */
+    TT_FRAME_PROXY_SET,     /* bytecode proxy set trap; post = invariant check */
+    TT_FRAME_PROXY_DEFINE,  /* bytecode proxy defineProperty trap (field init) */
+    TT_FRAME_ITER_CLOSE,    /* bytecode .return for OP_iterator_close          */
 };
 
 /* how a TT_FRAME_GEN resume returns its value to the caller (tt_aux_i is
@@ -523,6 +526,7 @@ enum {
     TT_GENSHAPE_ITERNEXT,   /* OP_iterator_next: replace sp[-1] with result obj */
     TT_GENSHAPE_ITERCALL,   /* OP_iterator_call: replace sp[-1], push false */
     TT_GENSHAPE_APPEND,     /* OP_append element: define into array, pump on */
+    TT_GENSHAPE_CLOSE,      /* OP_iterator_close .return: discard, pop iter  */
 };
 
 typedef enum {
@@ -18530,14 +18534,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 /* Both operands of a binary operator, left to right (each armed
    instruction is 1 byte). eqmode 1 restricts coercion to loose-eq's
    object-vs-primitive rule; eqmode 2 (strict equality: never coerces)
-   compiles the block away. */
+   compiles the block away; eqmode 3 (numeric operators) also rejects a
+   symbol lhs before the rhs coercion, matching ToNumeric order. */
 #define TT_COERCE_OPERANDS(hintv, eqmode)                               \
     if ((eqmode) != 2) {                                                \
         int cc_w;                                                       \
         for (cc_w = 0; cc_w < 2; cc_w++) {                              \
+            if ((eqmode) == 3 && cc_w == 1 &&                           \
+                JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_SYMBOL) {            \
+                /* numeric operators: ToNumeric(lhs) throws on a symbol \
+                   BEFORE the rhs coercion is observable */             \
+                JS_ThrowTypeError(ctx, "cannot convert symbol to number"); \
+                goto exception;                                         \
+            }                                                           \
             if (JS_VALUE_GET_TAG(sp[-2 + cc_w]) != JS_TAG_OBJECT)       \
                 continue;                                               \
-            if (eqmode) {                                               \
+            if ((eqmode) == 1) {                                        \
                 uint32_t cc_ot = JS_VALUE_GET_NORM_TAG(sp[-1 - cc_w]);  \
                 if (!(cc_ot == JS_TAG_INT || cc_ot == JS_TAG_FLOAT64 || \
                       cc_ot == JS_TAG_BOOL || cc_ot == JS_TAG_STRING || \
@@ -20211,9 +20223,34 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto exception;
                 JS_FreeValue(ctx, sp[-1]);
                 sp[-1] = fs_iter;
-                fs_next = JS_GetProperty(ctx, fs_iter, JS_ATOM_next);
+                /* the .next read defers through accessors/proxy get traps */
+                rt->tt_defer_kind = 1;
+                rt->tt_defer_slot = &tt_dfn;
+                fs_next = JS_GetPropertyInternal(ctx, fs_iter, JS_ATOM_next, fs_iter, 0);
+                rt->tt_defer_slot = NULL;
                 if (JS_IsException(fs_next))
                     goto exception;
+                if (unlikely(JS_VALUE_GET_TAG(fs_next) == JS_TAG_UNINITIALIZED)) {
+                    sf->cur_sp = sp;
+                    pf_func = tt_dfn;
+                    pf_this = sp[-1];
+                    pf_new_target = JS_UNDEFINED;
+                    pf_argc = 0;
+                    pf_argv = NULL;
+                    pf_flags = 0;
+                    pf_kind = TT_FRAME_GETTER;
+                    pf_ctor_this = tt_dfn;
+                    pf_aux_i = 4; /* push value + catch offset */
+                    if (unlikely(rt->tt_defer_aux != NULL)) {
+                        pf_argv = (JSValue *)rt->tt_defer_aux;
+                        pf_this = pf_argv[3];
+                        pf_argc = 3;
+                        pf_kind = TT_FRAME_PROXY_GET;
+                        pf_aux = rt->tt_defer_aux;
+                        rt->tt_defer_aux = NULL;
+                    }
+                    goto push_frame;
+                }
                 *sp++ = fs_next;
                 *sp++ = JS_NewCatchOffset(ctx, 0);
             }
@@ -20324,9 +20361,93 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, sp[-1]); /* drop the next method */
             sp--;
             if (!JS_IsUndefined(sp[-1])) {
+                /* TimeTravelJS: JS_IteratorClose(:, FALSE) mirrored in-loop
+                   so a bytecode .return (and a generator's finally blocks)
+                   runs parkable on early exits like `break` */
+                JSValue ic_m;
                 sf->cur_pc = pc;
-                if (JS_IteratorClose(ctx, sp[-1], FALSE))
+                ic_m = JS_GetProperty(ctx, sp[-1], JS_ATOM_return);
+                if (JS_IsException(ic_m))
                     goto exception;
+                if (!JS_IsUndefined(ic_m) && !JS_IsNull(ic_m)) {
+                    if (JS_VALUE_GET_TAG(ic_m) == JS_TAG_OBJECT &&
+                        JS_VALUE_GET_OBJ(ic_m)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+                        if (unlikely(js_poll_interrupts(ctx))) {
+                            JS_FreeValue(ctx, ic_m);
+                            goto exception;
+                        }
+                        sf->cur_sp = sp;
+                        pf_func = ic_m;
+                        pf_this = sp[-1];
+                        pf_new_target = JS_UNDEFINED;
+                        pf_argc = 0;
+                        pf_argv = NULL;
+                        pf_flags = 0;
+                        pf_kind = TT_FRAME_ITER_CLOSE;
+                        pf_ctor_this = ic_m;
+                        pf_aux_i = 0;
+                        pf_cargc = 0;
+                        pf_aux = NULL;
+                        goto push_frame;
+                    }
+                    if (JS_VALUE_GET_TAG(ic_m) == JS_TAG_OBJECT &&
+                        JS_VALUE_GET_OBJ(ic_m)->class_id == JS_CLASS_C_FUNCTION &&
+                        JS_VALUE_GET_OBJ(ic_m)->u.cfunc.cproto == JS_CFUNC_iterator_next &&
+                        JS_VALUE_GET_OBJ(ic_m)->u.cfunc.c_function.iterator_next == js_generator_next &&
+                        JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT &&
+                        JS_VALUE_GET_OBJ(sp[-1])->class_id == JS_CLASS_GENERATOR) {
+                        /* generator .return: run the finally blocks in-loop */
+                        struct JSGeneratorData *ic_gs =
+                            JS_GetOpaque(sp[-1], JS_CLASS_GENERATOR);
+                        int ic_magic = JS_VALUE_GET_OBJ(ic_m)->u.cfunc.magic;
+                        BOOL ic_done;
+                        JSValue ic_ret;
+                        JS_FreeValue(ctx, ic_m);
+                        if (unlikely(js_poll_interrupts(ctx)))
+                            goto exception;
+                        if (js_generator_resume_pre(ctx, ic_gs, ic_magic,
+                                                    JS_UNDEFINED, &ic_done, &ic_ret)) {
+                            if (JS_IsException(ic_ret))
+                                goto exception;
+                            JS_FreeValue(ctx, ic_ret);
+                            JS_FreeValue(ctx, sp[-1]);
+                            sp--;
+                            BREAK;
+                        }
+                        {
+                            JSAsyncFunctionState *ic_fs = tt_generator_func_state(ic_gs);
+                            JSStackFrame *ic_gsf = &ic_fs->frame;
+                            sf->cur_sp = sp;
+                            ic_gsf->tt_frame_kind = TT_FRAME_GEN;
+                            ic_gsf->tt_aux = ic_gs;
+                            ic_gsf->tt_aux_i = ic_magic | (TT_GENSHAPE_CLOSE << 8);
+                            ic_gsf->tt_call_argc = 0;
+                            ic_gsf->prev_frame = rt->current_stack_frame;
+                            rt->current_stack_frame = ic_gsf;
+                            sf = ic_gsf;
+                            TT_LOAD_FRAME();
+                            sp = sf->cur_sp;
+                            sf->cur_sp = NULL;
+                            pc = sf->cur_pc;
+                            if (ic_fs->throw_flag)
+                                goto exception;
+                            goto restart;
+                        }
+                    }
+                    {
+                        JSValue ic_r = JS_CallFree(ctx, ic_m, sp[-1], 0, NULL);
+                        if (JS_IsException(ic_r))
+                            goto exception;
+                        if (!JS_IsObject(ic_r)) {
+                            JS_FreeValue(ctx, ic_r);
+                            JS_ThrowTypeErrorNotAnObject(ctx);
+                            goto exception;
+                        }
+                        JS_FreeValue(ctx, ic_r);
+                    }
+                } else {
+                    JS_FreeValue(ctx, ic_m);
+                }
                 JS_FreeValue(ctx, sp[-1]);
             }
             sp--;
@@ -20728,6 +20849,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pf_kind = TT_FRAME_SETTER;
                         pf_ctor_this = tt_dfn;
                         pf_aux_i = 0;
+                        if (unlikely(rt->tt_defer_aux != NULL)) {
+                            /* proxy set trap: value consumed on -2 exit */
+                            pf_argv = (JSValue *)rt->tt_defer_aux;
+                            pf_this = pf_argv[4];
+                            pf_argc = 4;
+                            pf_kind = TT_FRAME_PROXY_SET;
+                            pf_aux = rt->tt_defer_aux;
+                            rt->tt_defer_aux = NULL;
+                            sp[-1] = JS_UNDEFINED;
+                        }
                         goto push_frame;
                     }
                     JS_FreeValue(ctx, obj);
@@ -20797,8 +20928,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 atom = get_u32(pc);
                 pc += 4;
 
+                sf->cur_pc = pc;
+                rt->tt_defer_kind = 3; /* define-site intent only */
+                rt->tt_defer_slot = &tt_dfn;
                 ret = JS_DefinePropertyValue(ctx, sp[-2], atom, sp[-1],
                                              JS_PROP_C_W_E | JS_PROP_THROW);
+                rt->tt_defer_slot = NULL;
+                if (unlikely(ret == -2)) {
+                    /* bytecode proxy defineProperty trap: run it in-loop
+                       (the value was consumed by the -2 exit) */
+                    JSValue *pd_blk = (JSValue *)rt->tt_defer_aux;
+                    rt->tt_defer_aux = NULL;
+                    sp[-1] = JS_UNDEFINED;
+                    sf->cur_sp = sp;
+                    pf_func = tt_dfn;
+                    pf_this = pd_blk[3];
+                    pf_new_target = JS_UNDEFINED;
+                    pf_argc = 3;
+                    pf_argv = pd_blk;
+                    pf_flags = 0;
+                    pf_kind = TT_FRAME_PROXY_DEFINE;
+                    pf_ctor_this = tt_dfn;
+                    pf_aux_i = 0; /* pop 1 */
+                    pf_cargc = 0;
+                    pf_aux = pd_blk;
+                    goto push_frame;
+                }
                 sp--;
                 if (unlikely(ret < 0))
                     goto exception;
@@ -21164,6 +21319,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pf_kind = TT_FRAME_SETTER;
                         pf_ctor_this = tt_dfn;
                         pf_aux_i = 1;
+                        if (unlikely(rt->tt_defer_aux != NULL)) {
+                            /* proxy set trap: value consumed on -2 exit */
+                            pf_argv = (JSValue *)rt->tt_defer_aux;
+                            pf_this = pf_argv[4];
+                            pf_argc = 4;
+                            pf_kind = TT_FRAME_PROXY_SET;
+                            pf_aux = rt->tt_defer_aux;
+                            rt->tt_defer_aux = NULL;
+                            sp[-1] = JS_UNDEFINED;
+                        }
                         goto push_frame;
                     }
                     JS_FreeValue(ctx, sp[-3]);
@@ -21240,8 +21405,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_define_array_el):
             {
                 int ret;
+                sf->cur_pc = pc;
+                rt->tt_defer_kind = 3; /* define-site intent only */
+                rt->tt_defer_slot = &tt_dfn;
                 ret = JS_DefinePropertyValueValue(ctx, sp[-3], JS_DupValue(ctx, sp[-2]), sp[-1],
                                                   JS_PROP_C_W_E | JS_PROP_THROW);
+                rt->tt_defer_slot = NULL;
+                if (unlikely(ret == -2)) {
+                    JSValue *pd_blk = (JSValue *)rt->tt_defer_aux;
+                    rt->tt_defer_aux = NULL;
+                    sp[-1] = JS_UNDEFINED;
+                    sf->cur_sp = sp;
+                    pf_func = tt_dfn;
+                    pf_this = pd_blk[3];
+                    pf_new_target = JS_UNDEFINED;
+                    pf_argc = 3;
+                    pf_argv = pd_blk;
+                    pf_flags = 0;
+                    pf_kind = TT_FRAME_PROXY_DEFINE;
+                    pf_ctor_this = tt_dfn;
+                    pf_aux_i = 0; /* pop 1 */
+                    pf_cargc = 0;
+                    pf_aux = pd_blk;
+                    goto push_frame;
+                }
                 sp -= 1;
                 if (unlikely(ret < 0))
                     goto exception;
@@ -21543,6 +21730,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_pow):
         binary_arith_slow:
             sf->cur_pc = pc;
+            TT_COERCE_OPERANDS(HINT_NUMBER, 3)
             if (js_binary_arith_slow(ctx, sp, opcode))
                 goto exception;
             sp--;
@@ -21559,6 +21747,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[-1] = JS_NewInt32(ctx, JS_VALUE_GET_INT(op1));
                 } else {
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT)
+                        TT_COERCE_SLOT(&sp[-1], HINT_NUMBER, 1, 0)
                     if (js_unary_arith_slow(ctx, sp, opcode))
                         goto exception;
                 }
@@ -21592,6 +21782,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[-1] = __JS_NewFloat64(ctx, d);
                 } else {
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT)
+                        TT_COERCE_SLOT(&sp[-1], HINT_NUMBER, 1, 0)
                     if (js_unary_arith_slow(ctx, sp, opcode))
                         goto exception;
                 }
@@ -21610,6 +21802,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 inc_slow:
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT)
+                        TT_COERCE_SLOT(&sp[-1], HINT_NUMBER, 1, 0)
                     if (js_unary_arith_slow(ctx, sp, opcode))
                         goto exception;
                 }
@@ -21628,6 +21822,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 dec_slow:
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT)
+                        TT_COERCE_SLOT(&sp[-1], HINT_NUMBER, 1, 0)
                     if (js_unary_arith_slow(ctx, sp, opcode))
                         goto exception;
                 }
@@ -21646,6 +21842,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 post_inc_slow:
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT)
+                        TT_COERCE_SLOT(&sp[-1], HINT_NUMBER, 1, 0)
                     if (js_post_inc_slow(ctx, sp, opcode))
                         goto exception;
                 }
@@ -21665,6 +21863,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 post_dec_slow:
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT)
+                        TT_COERCE_SLOT(&sp[-1], HINT_NUMBER, 1, 0)
                     if (js_post_inc_slow(ctx, sp, opcode))
                         goto exception;
                 }
@@ -21731,6 +21931,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp[-1] = JS_NewInt32(ctx, ~JS_VALUE_GET_INT(op1));
                 } else {
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT)
+                        TT_COERCE_SLOT(&sp[-1], HINT_NUMBER, 1, 0)
                     if (js_not_slow(ctx, sp))
                         goto exception;
                 }
@@ -21751,6 +21953,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp--;
                 } else {
                     sf->cur_pc = pc;
+                    TT_COERCE_OPERANDS(HINT_NUMBER, 3)
                     if (js_binary_logic_slow(ctx, sp, opcode))
                         goto exception;
                     sp--;
@@ -21772,6 +21975,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp--;
                 } else {
                     sf->cur_pc = pc;
+                    TT_COERCE_OPERANDS(HINT_NUMBER, 3)
                     if (js_shr_slow(ctx, sp))
                         goto exception;
                     sp--;
@@ -21792,6 +21996,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp--;
                 } else {
                     sf->cur_pc = pc;
+                    TT_COERCE_OPERANDS(HINT_NUMBER, 3)
                     if (js_binary_logic_slow(ctx, sp, opcode))
                         goto exception;
                     sp--;
@@ -21810,6 +22015,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp--;
                 } else {
                     sf->cur_pc = pc;
+                    TT_COERCE_OPERANDS(HINT_NUMBER, 3)
                     if (js_binary_logic_slow(ctx, sp, opcode))
                         goto exception;
                     sp--;
@@ -21828,6 +22034,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp--;
                 } else {
                     sf->cur_pc = pc;
+                    TT_COERCE_OPERANDS(HINT_NUMBER, 3)
                     if (js_binary_logic_slow(ctx, sp, opcode))
                         goto exception;
                     sp--;
@@ -21846,6 +22053,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp--;
                 } else {
                     sf->cur_pc = pc;
+                    TT_COERCE_OPERANDS(HINT_NUMBER, 3)
                     if (js_binary_logic_slow(ctx, sp, opcode))
                         goto exception;
                     sp--;
@@ -22129,6 +22337,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             pf_kind = TT_FRAME_SETTER;
                             pf_ctor_this = tt_dfn;
                             pf_aux_i = 0; /* free both slots, pop 2 */
+                            if (unlikely(rt->tt_defer_aux != NULL)) {
+                                /* proxy set trap: value consumed on -2 exit */
+                                pf_argv = (JSValue *)rt->tt_defer_aux;
+                                pf_this = pf_argv[4];
+                                pf_argc = 4;
+                                pf_kind = TT_FRAME_PROXY_SET;
+                                pf_aux = rt->tt_defer_aux;
+                                rt->tt_defer_aux = NULL;
+                                sp[-2] = JS_UNDEFINED;
+                            }
                             goto push_frame;
                         }
                         JS_FreeValue(ctx, sp[-1]);
@@ -22446,6 +22664,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             ret_val = async_func_finish(ctx, fs, ret_val);
             ret_val = js_generator_resume_post(ctx, gs, ret_val, &gdone);
             if (gshape != TT_GENSHAPE_FOROF && gshape != TT_GENSHAPE_APPEND &&
+                gshape != TT_GENSHAPE_CLOSE &&
                 !JS_IsException(ret_val) && gdone != 2)
                 ret_val = js_create_iterator_result(ctx, ret_val, gdone);
             sf = rt->current_stack_frame;
@@ -22460,6 +22679,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                     (gdone == 2 ? 2 : (gdone ? 1 : 0))))
                     goto exception;
                 sp += 2;
+                goto restart;
+            }
+            if (gshape == TT_GENSHAPE_CLOSE) {
+                if (JS_IsException(ret_val))
+                    goto exception;
+                JS_FreeValue(ctx, ret_val);
+                JS_FreeValue(ctx, sp[-1]);
+                sp--;
                 goto restart;
             }
             if (gshape == TT_GENSHAPE_APPEND) {
@@ -22555,7 +22782,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 kind == TT_FRAME_GETTER || kind == TT_FRAME_SETTER ||
                 kind == TT_FRAME_TOPRIM || kind == TT_FRAME_HASINST ||
                 kind == TT_FRAME_FOROF_START || kind == TT_FRAME_PROXY_GET ||
-                kind == TT_FRAME_APPEND_START)
+                kind == TT_FRAME_APPEND_START || kind == TT_FRAME_ITER_CLOSE)
                 JS_FreeValue(ctx, ctor_this);
             if (kind == TT_FRAME_PROXY_GET) {
                 JSValue *pg_blk = (JSValue *)kaux_p;
@@ -22571,6 +22798,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, ap_eb[0]);
                 JS_FreeValue(ctx, ap_eb[1]);
                 rt->tt_arena_top = (uint8_t *)ap_eb;
+            }
+            if (kind == TT_FRAME_PROXY_SET || kind == TT_FRAME_PROXY_DEFINE) {
+                JSValue *pt_eb = (JSValue *)kaux_p;
+                int pt_i;
+                JS_FreeValue(ctx, ctor_this);
+                for (pt_i = 0; pt_i < 5; pt_i++)
+                    JS_FreeValue(ctx, pt_eb[pt_i]);
+                rt->tt_arena_top = (uint8_t *)pt_eb;
             }
             if (kind == TT_FRAME_APPLY)
                 free_arg_list(ctx, kaux_p, (uint32_t)kaux);
@@ -22595,6 +22830,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, sp[-2]);
                 sp[-2] = ret_val;
                 sp--;
+                break;
+            case 4: /* for_of_start .next: push + catch offset */
+                *sp++ = ret_val;
+                *sp++ = JS_NewCatchOffset(ctx, 0);
                 break;
             default: /* get_array_el2 */
                 sp[-1] = ret_val;
@@ -22638,9 +22877,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             JS_FreeValue(ctx, sp[-1]);
             sp[-1] = ret_val;
-            fs_next = JS_GetProperty(ctx, ret_val, JS_ATOM_next);
+            rt->tt_defer_kind = 1;
+            rt->tt_defer_slot = &tt_dfn;
+            fs_next = JS_GetPropertyInternal(ctx, ret_val, JS_ATOM_next, ret_val, 0);
+            rt->tt_defer_slot = NULL;
             if (JS_IsException(fs_next))
                 goto exception;
+            if (unlikely(JS_VALUE_GET_TAG(fs_next) == JS_TAG_UNINITIALIZED)) {
+                sf->cur_sp = sp;
+                pf_func = tt_dfn;
+                pf_this = sp[-1];
+                pf_new_target = JS_UNDEFINED;
+                pf_argc = 0;
+                pf_argv = NULL;
+                pf_flags = 0;
+                pf_kind = TT_FRAME_GETTER;
+                pf_ctor_this = tt_dfn;
+                pf_aux_i = 4; /* push value + catch offset */
+                if (unlikely(rt->tt_defer_aux != NULL)) {
+                    pf_argv = (JSValue *)rt->tt_defer_aux;
+                    pf_this = pf_argv[3];
+                    pf_argc = 3;
+                    pf_kind = TT_FRAME_PROXY_GET;
+                    pf_aux = rt->tt_defer_aux;
+                    rt->tt_defer_aux = NULL;
+                }
+                goto push_frame;
+            }
             *sp++ = fs_next;
             *sp++ = JS_NewCatchOffset(ctx, 0);
             goto restart;
@@ -22655,6 +22918,155 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             ap_iter = ret_val;
             ap_flag = kaux;
             goto append_phase_b;
+        }
+        if (kind == TT_FRAME_ITER_CLOSE) {
+            JS_FreeValue(ctx, ctor_this);
+            if (!JS_IsObject(ret_val)) {
+                JS_FreeValue(ctx, ret_val);
+                JS_ThrowTypeErrorNotAnObject(ctx);
+                goto exception;
+            }
+            JS_FreeValue(ctx, ret_val);
+            JS_FreeValue(ctx, sp[-1]);
+            sp--;
+            goto restart;
+        }
+        if (kind == TT_FRAME_PROXY_SET) {
+            /* the set trap ran; mirror js_proxy_set's tail (all armed put
+               sites pass JS_PROP_THROW_STRICT), then complete the put
+               site per the SETTER shape in kaux */
+            JSValue *ps_blk = (JSValue *)kaux_p;
+            int ps_ret;
+            JS_FreeValue(ctx, ctor_this);
+            ps_ret = JS_ToBoolFree(ctx, ret_val);
+            if (ps_ret) {
+                JSPropertyDescriptor ps_desc;
+                JSAtom ps_atom;
+                int ps_res;
+                ps_atom = JS_ValueToAtom(ctx, ps_blk[1]);
+                if (unlikely(ps_atom == JS_ATOM_NULL))
+                    goto proxy_set_blk_fail;
+                ps_res = JS_GetOwnPropertyInternal(ctx, &ps_desc,
+                                                   JS_VALUE_GET_OBJ(ps_blk[0]),
+                                                   ps_atom);
+                JS_FreeAtom(ctx, ps_atom);
+                if (ps_res < 0)
+                    goto proxy_set_blk_fail;
+                if (ps_res) {
+                    if ((ps_desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0) {
+                        if (!js_same_value(ctx, ps_desc.value, ps_blk[2]))
+                            goto proxy_set_inconsistent;
+                    } else if ((ps_desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE)) == JS_PROP_GETSET &&
+                               JS_IsUndefined(ps_desc.setter)) {
+                    proxy_set_inconsistent:
+                        js_free_desc(ctx, &ps_desc);
+                        JS_ThrowTypeError(ctx, "proxy: inconsistent set");
+                        goto proxy_set_blk_fail;
+                    }
+                    js_free_desc(ctx, &ps_desc);
+                }
+            } else {
+                if (is_strict_mode(ctx)) {
+                    JS_ThrowTypeError(ctx, "proxy: cannot set property");
+                    goto proxy_set_blk_fail;
+                }
+            }
+            JS_FreeValue(ctx, ps_blk[0]);
+            JS_FreeValue(ctx, ps_blk[1]);
+            JS_FreeValue(ctx, ps_blk[2]);
+            JS_FreeValue(ctx, ps_blk[3]);
+            JS_FreeValue(ctx, ps_blk[4]);
+            rt->tt_arena_top = (uint8_t *)ps_blk;
+            if (kaux == 0) { /* put_field / with_put_var: [.. x value-ish obj-ish] */
+                JS_FreeValue(ctx, sp[-1]);
+                JS_FreeValue(ctx, sp[-2]);
+                sp -= 2;
+            } else { /* put_array_el: [obj key(dead) value(dead)] */
+                JS_FreeValue(ctx, sp[-1]);
+                JS_FreeValue(ctx, sp[-3]);
+                sp -= 3;
+            }
+            goto restart;
+        proxy_set_blk_fail:
+            JS_FreeValue(ctx, ps_blk[0]);
+            JS_FreeValue(ctx, ps_blk[1]);
+            JS_FreeValue(ctx, ps_blk[2]);
+            JS_FreeValue(ctx, ps_blk[3]);
+            JS_FreeValue(ctx, ps_blk[4]);
+            rt->tt_arena_top = (uint8_t *)ps_blk;
+            goto exception;
+        }
+        if (kind == TT_FRAME_PROXY_DEFINE) {
+            /* the defineProperty trap ran; mirror js_proxy_define_own_property's
+               tail for the data-property C_W_E|THROW shape the define
+               opcodes use (getter/setter undefined, so those same-value
+               branches vanish; setting_not_configurable is false) */
+            JSValue *pd_blk = (JSValue *)kaux_p;
+            static const int pd_flags = JS_PROP_C_W_E | JS_PROP_THROW |
+                JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE;
+            int pd_ret;
+            JS_FreeValue(ctx, ctor_this);
+            pd_ret = JS_ToBoolFree(ctx, ret_val);
+            if (!pd_ret) {
+                JS_ThrowTypeError(ctx, "proxy: defineProperty exception");
+                goto proxy_define_blk_fail;
+            }
+            {
+                JSPropertyDescriptor pd_desc;
+                JSAtom pd_atom;
+                int pd_res;
+                JSObject *pd_p = JS_VALUE_GET_OBJ(pd_blk[0]);
+                pd_atom = JS_ValueToAtom(ctx, pd_blk[1]);
+                if (unlikely(pd_atom == JS_ATOM_NULL))
+                    goto proxy_define_blk_fail;
+                pd_res = JS_GetOwnPropertyInternal(ctx, &pd_desc, pd_p, pd_atom);
+                JS_FreeAtom(ctx, pd_atom);
+                if (pd_res < 0)
+                    goto proxy_define_blk_fail;
+                if (!pd_res) {
+                    if (!pd_p->extensible) {
+                        JS_ThrowTypeError(ctx, "proxy: inconsistent defineProperty");
+                        goto proxy_define_blk_fail;
+                    }
+                } else {
+                    if (!check_define_prop_flags(pd_desc.flags, pd_flags))
+                        goto proxy_define_inconsistent;
+                    if (!(pd_desc.flags & JS_PROP_CONFIGURABLE)) {
+                        if ((pd_desc.flags & JS_PROP_TMASK) != JS_PROP_GETSET &&
+                            !(pd_desc.flags & JS_PROP_WRITABLE) &&
+                            !js_same_value(ctx, pd_blk[4], pd_desc.value)) {
+                            goto proxy_define_inconsistent;
+                        }
+                    }
+                    if ((pd_desc.flags & JS_PROP_TMASK) != JS_PROP_GETSET &&
+                        (pd_desc.flags & (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == JS_PROP_WRITABLE &&
+                        (pd_flags & (JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE)) == JS_PROP_HAS_WRITABLE) {
+                    proxy_define_inconsistent:
+                        js_free_desc(ctx, &pd_desc);
+                        JS_ThrowTypeError(ctx, "proxy: inconsistent defineProperty");
+                        goto proxy_define_blk_fail;
+                    }
+                    js_free_desc(ctx, &pd_desc);
+                }
+            }
+            JS_FreeValue(ctx, pd_blk[0]);
+            JS_FreeValue(ctx, pd_blk[1]);
+            JS_FreeValue(ctx, pd_blk[2]);
+            JS_FreeValue(ctx, pd_blk[3]);
+            JS_FreeValue(ctx, pd_blk[4]);
+            rt->tt_arena_top = (uint8_t *)pd_blk;
+            JS_FreeValue(ctx, sp[-1]); /* the dead value slot */
+            sp--;
+            goto restart;
+        proxy_define_blk_fail:
+            JS_FreeValue(ctx, pd_blk[0]);
+            JS_FreeValue(ctx, pd_blk[1]);
+            JS_FreeValue(ctx, pd_blk[2]);
+            JS_FreeValue(ctx, pd_blk[3]);
+            JS_FreeValue(ctx, pd_blk[4]);
+            rt->tt_arena_top = (uint8_t *)pd_blk;
+            goto exception;
         }
         if (kind == TT_FRAME_APPEND_NEXT) {
             int ap_r = tt_append_step(ctx, sp, (JSValue *)kaux_p, ret_val, 2);
@@ -22720,6 +23132,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, sp[-2]);
                 sp[-2] = ret_val;
                 sp--;
+                break;
+            case 4: /* for_of_start .next: push + catch offset */
+                *sp++ = ret_val;
+                *sp++ = JS_NewCatchOffset(ctx, 0);
                 break;
             default: /* get_array_el2 */
                 sp[-1] = ret_val;
@@ -53447,6 +53863,31 @@ static int js_proxy_set(JSContext *ctx, JSValueConst obj, JSAtom atom,
         JS_FreeValue(ctx, method);
         return -1;
     }
+    /* TimeTravelJS: a bytecode set trap at an armed put site defers to an
+       in-loop TT_FRAME_PROXY_SET frame; args plus the handler and the
+       value (for the invariant check) ride in an arena block. The caller
+       chain frees `value` on this -2 exit, so the block holds dups. */
+    if (unlikely(ctx->rt->tt_defer_slot != NULL) &&
+        ctx->rt->tt_defer_kind == 1 &&
+        JS_VALUE_GET_TAG(method) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(method)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+        JSValue *blk = tt_arena_alloc_vals(ctx->rt, 5);
+        if (!blk) {
+            JS_FreeValue(ctx, method);
+            JS_FreeValue(ctx, atom_val);
+            JS_ThrowStackOverflow(ctx);
+            return -1;
+        }
+        blk[0] = JS_DupValue(ctx, s->target);
+        blk[1] = atom_val; /* owned by the block */
+        blk[2] = JS_DupValue(ctx, value);
+        blk[3] = JS_DupValue(ctx, receiver);
+        blk[4] = JS_DupValue(ctx, s->handler);
+        *ctx->rt->tt_defer_slot = method; /* owned: the trap function */
+        ctx->rt->tt_defer_slot = NULL;
+        ctx->rt->tt_defer_aux = blk;
+        return -2;
+    }
     args[0] = s->target;
     args[1] = atom_val;
     args[2] = value;
@@ -53639,8 +54080,13 @@ static int js_proxy_define_own_property(JSContext *ctx, JSValueConst obj,
     JSValueConst args[3];
     JSPropertyDescriptor desc;
     BOOL setting_not_configurable;
+    JSValue *tt_save;
 
+    /* TimeTravelJS: keep an armed defer away from the nested handler read */
+    tt_save = ctx->rt->tt_defer_slot;
+    ctx->rt->tt_defer_slot = NULL;
     s = get_proxy_method(ctx, &method, obj, JS_ATOM_defineProperty);
+    ctx->rt->tt_defer_slot = tt_save;
     if (!s)
         return -1;
     if (JS_IsUndefined(method)) {
@@ -53656,6 +54102,32 @@ static int js_proxy_define_own_property(JSContext *ctx, JSValueConst obj,
         JS_FreeValue(ctx, prop_val);
         JS_FreeValue(ctx, method);
         return -1;
+    }
+    /* TimeTravelJS: a bytecode defineProperty trap at an armed define
+       site (class-field init, computed members) defers to an in-loop
+       TT_FRAME_PROXY_DEFINE frame. Sites only define data properties
+       with C_W_E|THROW, which the frame's post hard-mirrors. */
+    if (unlikely(ctx->rt->tt_defer_slot != NULL) &&
+        ctx->rt->tt_defer_kind == 3 &&
+        JS_VALUE_GET_TAG(method) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(method)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+        JSValue *blk = tt_arena_alloc_vals(ctx->rt, 5);
+        if (!blk) {
+            JS_FreeValue(ctx, method);
+            JS_FreeValue(ctx, prop_val);
+            JS_FreeValue(ctx, desc_val);
+            JS_ThrowStackOverflow(ctx);
+            return -1;
+        }
+        blk[0] = JS_DupValue(ctx, s->target);
+        blk[1] = prop_val;  /* owned by the block */
+        blk[2] = desc_val;  /* owned by the block */
+        blk[3] = JS_DupValue(ctx, s->handler);
+        blk[4] = JS_DupValue(ctx, val); /* for the same-value invariant */
+        *ctx->rt->tt_defer_slot = method;
+        ctx->rt->tt_defer_slot = NULL;
+        ctx->rt->tt_defer_aux = blk;
+        return -2;
     }
     args[0] = s->target;
     args[1] = prop_val;

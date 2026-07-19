@@ -98,19 +98,24 @@ the callback-taking Array builtins are self-hosted in the debug runtime.
 The Asyncify pass is gone from the build entirely.
 
 Every reentry path a program normally exercises is converted: property
-accessors (including under `with` and behind proxy `get` traps),
-`ToPrimitive`/`ToString`/`ToPropertyKey` coercions (`+`, comparisons,
-templates, `String()`, computed keys), `instanceof` via
-`Symbol.hasInstance`, user iterables (`for‑of`, spread, destructuring),
-bound functions and `Function.prototype.call`/`apply` (tail position
-included), async generators from creation through `for await`, and the
-callback-taking builtins. The test suite gates on
+accessors (including under `with` and behind proxy `get`/`set`/
+`defineProperty` traps — class fields initializing onto a proxied `this`
+included), every coercion the operators perform (`+`, `-`, `*`, `/`,
+`%`, `**`, shifts, bitwise ops, comparisons, `++`/`--`, `~`, unary
+`+`/`-`, templates, `String()`, computed keys — with `ToNumeric`'s exact
+error ordering), `instanceof` via `Symbol.hasInstance`, user iterables
+everywhere they appear (`for‑of`, spread, destructuring, and
+`.return()` cleanup on early exits like `break` — generator `finally`
+blocks included), bound functions and `Function.prototype.call`/`apply`
+(tail position included), async generators from creation through
+`for await`, and the callback-taking builtins. The test suite gates on
 `summary.suppressedSteps === 0` for a program spanning that whole
 surface. What still executes under C — counted honestly per recording —
-is a residue of reflective machinery: proxy traps other than
-receiver-level `get`, `IteratorClose` (`.return`) on abrupt completions,
-direct `eval` internals, and class-field initialization observed through
-a proxy.
+is a residue of genuinely reflective machinery: accessor-defined
+`Symbol.toPrimitive` (the trap read itself), iterator `.return` during
+exception unwinding, object-spread over accessors, `++` on
+object-valued locals, direct `eval` internals, and property-descriptor
+reflection utilities.
 
 The driver (`src/vm.js`) is one protocol and ~150 lines: park-by-return
 plus deterministic WASI shims. No Emscripten, no handles, no FFI layer.
@@ -188,12 +193,13 @@ site nor the tests require a C toolchain.
   retained); the recorded prefix of a truncated run is fully navigable.
   Opcode granularity multiplies step counts ~5–15×.
 - Steps inside user code reached through the remaining reflective C
-  machinery — proxy traps other than receiver-level `get`, iterator
-  `.return` during abrupt-completion cleanup, direct `eval` internals,
-  class-field initialization observed via proxy — execute correctly but
-  cannot become snapshots; they are counted per recording as
-  `suppressedSteps` (0 for the entire probe corpus and the engine test
-  suite's full-surface gate program).
+  machinery — accessor-defined `Symbol.toPrimitive`, iterator `.return`
+  during exception unwinding (the non-error path is converted),
+  object-spread over accessor properties, `++`/`--` on object-valued
+  locals, direct `eval` internals, descriptor-reflection helpers —
+  execute correctly but cannot become snapshots; they are counted per
+  recording as `suppressedSteps` (0 for the entire probe corpus and the
+  engine test suite's full-surface gate program).
 - Inlined tail calls keep the caller's frame: proper-tail-call space
   guarantees are traded for park-anywhere (depth is bounded by the 2 MB
   frame arena, ~18 000 frames).
@@ -223,8 +229,9 @@ assertions judge: stepping does not alter semantics. Current samples:
 unsupported proposals; `tco-*` is the deliberate proper-tail-call space
 trade — inlined tail calls keep the caller frame), `language/expressions`
 216 pass / 3 fail (dynamic `import` needs a module host). Suppressed
-steps across those ~570 stepped runs: 284, all inside the reflective
-residue listed above — the ordinary language surface records every step.
+steps across those ~570 stepped runs (each in both sloppy and strict
+variants): 144, all inside the reflective residue listed above — the
+ordinary language surface records every step.
 
 ```
 node tools/test262-stepped.mjs <path-to-test262-clone> test/language/statements 7
