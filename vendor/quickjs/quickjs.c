@@ -511,6 +511,8 @@ enum {
     TT_FRAME_PROXY_GET,     /* bytecode proxy get trap; post = invariant check */
     TT_FRAME_AGEN,          /* async generator body driven in-loop            */
     TT_FRAME_AGEN_INIT,     /* async generator creation prologue in-loop      */
+    TT_FRAME_APPEND_START,  /* bytecode Symbol.iterator for OP_append (spread)*/
+    TT_FRAME_APPEND_NEXT,   /* bytecode next() for one OP_append element      */
 };
 
 /* how a TT_FRAME_GEN resume returns its value to the caller (tt_aux_i is
@@ -520,6 +522,7 @@ enum {
     TT_GENSHAPE_FOROF,      /* OP_for_of_next: raw value/done, extra = offset byte */
     TT_GENSHAPE_ITERNEXT,   /* OP_iterator_next: replace sp[-1] with result obj */
     TT_GENSHAPE_ITERCALL,   /* OP_iterator_call: replace sp[-1], push false */
+    TT_GENSHAPE_APPEND,     /* OP_append element: define into array, pump on */
 };
 
 typedef enum {
@@ -17987,6 +17990,66 @@ static JSValue *tt_arena_alloc_vals(JSRuntime *rt, size_t n)
    Pure property reads — never calls user code. Returns 0 = none callable
    remain, 1 = *pmethod is bytecode (owned), 2 = *pmethod is a C callable
    (owned), -1 = exception. *pstep = the step the method was found at. */
+/* Absorb one iterator result for OP_append's spread frame machine.
+   The stack is [array pos source]; blk = [enumobj, next-method] in the
+   arena. mode 0: val is a raw not-done value; mode 1: done (val freed);
+   mode 2: val IS the iterator-result object — parse .done/.value exactly
+   like JS_IteratorNext's generic tail. Returns 1 = spread finished (blk
+   released), 0 = keep pumping, -1 = exception (iterator closed like the
+   classic helper's exception path, blk released). */
+static int tt_append_step(JSContext *ctx, JSValue *sp, JSValue *blk,
+                          JSValue val, int mode)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValue v;
+
+    if (mode == 2) {
+        int r;
+        if (!JS_IsObject(val)) {
+            JS_FreeValue(ctx, val);
+            JS_ThrowTypeError(ctx, "iterator must return an object");
+            goto fail;
+        }
+        r = JS_ToBoolFree(ctx, JS_GetProperty(ctx, val, JS_ATOM_done));
+        if (r < 0) {
+            JS_FreeValue(ctx, val);
+            goto fail;
+        }
+        if (r) {
+            JS_FreeValue(ctx, val);
+            goto finished;
+        }
+        v = JS_GetProperty(ctx, val, JS_ATOM_value);
+        JS_FreeValue(ctx, val);
+        if (JS_IsException(v))
+            goto fail;
+    } else if (mode == 1) {
+        JS_FreeValue(ctx, val);
+        goto finished;
+    } else {
+        v = val;
+    }
+    {
+        uint32_t pos = (uint32_t)JS_VALUE_GET_INT(sp[-2]);
+        if (JS_DefinePropertyValueUint32(ctx, sp[-3], pos, v,
+                                         JS_PROP_C_W_E) < 0)
+            goto fail;
+        sp[-2] = JS_NewInt32(ctx, pos + 1);
+    }
+    return 0;
+ finished:
+    JS_FreeValue(ctx, blk[0]);
+    JS_FreeValue(ctx, blk[1]);
+    rt->tt_arena_top = (uint8_t *)blk;
+    return 1;
+ fail:
+    JS_IteratorClose(ctx, blk[0], TRUE);
+    JS_FreeValue(ctx, blk[0]);
+    JS_FreeValue(ctx, blk[1]);
+    rt->tt_arena_top = (uint8_t *)blk;
+    return -1;
+}
+
 static int tt_toprim_pick(JSContext *ctx, JSValueConst val, int hint, int step,
                           JSValue *pmethod, int *pstep)
 {
@@ -18288,6 +18351,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int uw_base; /* caller-slot base for unwrap_bound (-1 call, -2 method) */
     int call_argc;
     JSValue *call_argv;
+    JSValue ap_iter;  /* OP_append frame machine: the iterator object */
+    int ap_flag;      /*   is-array-iterator fast-path eligibility    */
+    JSValue *ap_blk;  /*   arena block [enumobj, next-method]         */
 
 /* TimeTravelJS: check the step hook before dispatching the next opcode.
    `pc` points at the upcoming instruction here (before the opcode fetch).
@@ -21170,10 +21236,55 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_append):    /* array pos enumobj -- array pos */
             {
+                /* TimeTravelJS: js_append_enumerate mirrored as a frame
+                   machine so bytecode Symbol.iterator methods, user next()
+                   methods and generator bodies park per element. The
+                   is-array-iterator probe read happens first, exactly like
+                   the classic helper. */
+                JSValue ap_m;
+                JSCFunctionType ap_ft;
                 sf->cur_pc = pc;
-                if (js_append_enumerate(ctx, sp))
+                ap_m = JS_GetProperty(ctx, sp[-1], JS_ATOM_Symbol_iterator);
+                if (JS_IsException(ap_m))
                     goto exception;
-                JS_FreeValue(ctx, *--sp);
+                ap_ft.generic_magic = js_create_array_iterator;
+                ap_flag = JS_IsCFunction(ctx, ap_m, ap_ft.generic,
+                                         JS_ITERATOR_KIND_VALUE);
+                JS_FreeValue(ctx, ap_m);
+                /* JS_GetIterator inline: the second read + the method call */
+                ap_m = JS_GetProperty(ctx, sp[-1], JS_ATOM_Symbol_iterator);
+                if (JS_IsException(ap_m))
+                    goto exception;
+                if (!JS_IsFunction(ctx, ap_m)) {
+                    JS_FreeValue(ctx, ap_m);
+                    JS_ThrowTypeError(ctx, "value is not iterable");
+                    goto exception;
+                }
+                if (JS_VALUE_GET_TAG(ap_m) == JS_TAG_OBJECT &&
+                    JS_VALUE_GET_OBJ(ap_m)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+                    if (unlikely(js_poll_interrupts(ctx))) {
+                        JS_FreeValue(ctx, ap_m);
+                        goto exception;
+                    }
+                    sf->cur_sp = sp;
+                    pf_func = ap_m;
+                    pf_this = sp[-1];
+                    pf_new_target = JS_UNDEFINED;
+                    pf_argc = 0;
+                    pf_argv = NULL;
+                    pf_flags = 0;
+                    pf_kind = TT_FRAME_APPEND_START;
+                    pf_ctor_this = ap_m;
+                    pf_aux_i = ap_flag;
+                    pf_cargc = 0;
+                    pf_aux = NULL;
+                    goto push_frame;
+                }
+                ap_iter = JS_GetIterator2(ctx, sp[-1], ap_m);
+                JS_FreeValue(ctx, ap_m);
+                if (JS_IsException(ap_iter))
+                    goto exception;
+                goto append_phase_b;
             }
             BREAK;
 
@@ -22305,12 +22416,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             int gcargc = sf->tt_call_argc;
             int gshape = (sf->tt_aux_i >> 8) & 0xff;
             int gextra = (sf->tt_aux_i >> 16) & 0xff;
+            JSValue *gablk = NULL;
             BOOL gdone;
+            if (gshape == TT_GENSHAPE_APPEND) {
+                /* the OP_append arena block rides as a tagged pointer */
+                gablk = JS_VALUE_GET_PTR(sf->tt_ctor_this);
+                sf->tt_ctor_this = JS_UNDEFINED;
+            }
             rt->current_stack_frame = sf->prev_frame;
             sf->tt_frame_kind = TT_FRAME_ENTRY; /* future C-path resumes */
             ret_val = async_func_finish(ctx, fs, ret_val);
             ret_val = js_generator_resume_post(ctx, gs, ret_val, &gdone);
-            if (gshape != TT_GENSHAPE_FOROF &&
+            if (gshape != TT_GENSHAPE_FOROF && gshape != TT_GENSHAPE_APPEND &&
                 !JS_IsException(ret_val) && gdone != 2)
                 ret_val = js_create_iterator_result(ctx, ret_val, gdone);
             sf = rt->current_stack_frame;
@@ -22325,6 +22442,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                     (gdone == 2 ? 2 : (gdone ? 1 : 0))))
                     goto exception;
                 sp += 2;
+                goto restart;
+            }
+            if (gshape == TT_GENSHAPE_APPEND) {
+                int ap_r;
+                if (JS_IsException(ret_val)) {
+                    JS_IteratorClose(ctx, gablk[0], TRUE);
+                    JS_FreeValue(ctx, gablk[0]);
+                    JS_FreeValue(ctx, gablk[1]);
+                    rt->tt_arena_top = (uint8_t *)gablk;
+                    goto exception;
+                }
+                ap_r = tt_append_step(ctx, sp, gablk, ret_val,
+                                      gdone == 2 ? 2 : (gdone ? 1 : 0));
+                if (ap_r < 0)
+                    goto exception;
+                if (ap_r == 0) {
+                    ap_blk = gablk;
+                    goto append_pump;
+                }
+                JS_FreeValue(ctx, *--sp);
                 goto restart;
             }
             if (unlikely(JS_IsException(ret_val)))
@@ -22399,7 +22536,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (kind == TT_FRAME_CTOR || kind == TT_FRAME_ITERCALL ||
                 kind == TT_FRAME_GETTER || kind == TT_FRAME_SETTER ||
                 kind == TT_FRAME_TOPRIM || kind == TT_FRAME_HASINST ||
-                kind == TT_FRAME_FOROF_START || kind == TT_FRAME_PROXY_GET)
+                kind == TT_FRAME_FOROF_START || kind == TT_FRAME_PROXY_GET ||
+                kind == TT_FRAME_APPEND_START)
                 JS_FreeValue(ctx, ctor_this);
             if (kind == TT_FRAME_PROXY_GET) {
                 JSValue *pg_blk = (JSValue *)kaux_p;
@@ -22408,6 +22546,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, pg_blk[2]);
                 JS_FreeValue(ctx, pg_blk[3]);
                 rt->tt_arena_top = (uint8_t *)pg_blk;
+            }
+            if (kind == TT_FRAME_APPEND_NEXT) {
+                JSValue *ap_eb = (JSValue *)kaux_p;
+                JS_IteratorClose(ctx, ap_eb[0], TRUE);
+                JS_FreeValue(ctx, ap_eb[0]);
+                JS_FreeValue(ctx, ap_eb[1]);
+                rt->tt_arena_top = (uint8_t *)ap_eb;
             }
             if (kind == TT_FRAME_APPLY)
                 free_arg_list(ctx, kaux_p, (uint32_t)kaux);
@@ -22480,6 +22625,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto exception;
             *sp++ = fs_next;
             *sp++ = JS_NewCatchOffset(ctx, 0);
+            goto restart;
+        }
+        if (kind == TT_FRAME_APPEND_START) {
+            JS_FreeValue(ctx, ctor_this);
+            if (!JS_IsObject(ret_val)) {
+                JS_FreeValue(ctx, ret_val);
+                JS_ThrowTypeErrorNotAnObject(ctx);
+                goto exception;
+            }
+            ap_iter = ret_val;
+            ap_flag = kaux;
+            goto append_phase_b;
+        }
+        if (kind == TT_FRAME_APPEND_NEXT) {
+            int ap_r = tt_append_step(ctx, sp, (JSValue *)kaux_p, ret_val, 2);
+            if (ap_r < 0)
+                goto exception;
+            if (ap_r == 0) {
+                ap_blk = (JSValue *)kaux_p;
+                goto append_pump;
+            }
+            JS_FreeValue(ctx, *--sp);
             goto restart;
         }
         if (kind == TT_FRAME_PROXY_GET) {
@@ -22677,6 +22844,159 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        (parameter defaults etc.) in this loop up to OP_initial_yield; the
        TT_FRAME_GEN_INIT done path builds the generator object. Reached only
        by goto with pf_func/pf_this/pf_argc/pf_argv/gi_base staged. */
+ append_phase_b:
+    /* OP_append continues with the iterator in ap_iter (owned) and the
+       fast-path eligibility in ap_flag; stack still [array pos source]. */
+    {
+        JSValue ap_nm = JS_GetProperty(ctx, ap_iter, JS_ATOM_next);
+        if (JS_IsException(ap_nm)) {
+            JS_FreeValue(ctx, ap_iter);
+            goto exception;
+        }
+        if (ap_flag) {
+            /* classic fast path: builtin array iterator over a fast array */
+            JSCFunctionType ap_ft2;
+            JSValue *ap_arrp;
+            uint32_t ap_count;
+            ap_ft2.iterator_next = js_array_iterator_next;
+            if (JS_IsCFunction(ctx, ap_nm, ap_ft2.generic, 0) &&
+                js_get_fast_array(ctx, sp[-1], &ap_arrp, &ap_count)) {
+                uint32_t ap_len, ap_i2, ap_pos;
+                if (js_get_length32(ctx, &ap_len, sp[-1])) {
+                    JS_FreeValue(ctx, ap_iter);
+                    JS_FreeValue(ctx, ap_nm);
+                    goto exception;
+                }
+                if (ap_len == ap_count) {
+                    ap_pos = (uint32_t)JS_VALUE_GET_INT(sp[-2]);
+                    for (ap_i2 = 0; ap_i2 < ap_count; ap_i2++) {
+                        if (JS_DefinePropertyValueUint32(ctx, sp[-3], ap_pos++,
+                                                         JS_DupValue(ctx, ap_arrp[ap_i2]),
+                                                         JS_PROP_C_W_E) < 0) {
+                            JS_FreeValue(ctx, ap_iter);
+                            JS_FreeValue(ctx, ap_nm);
+                            goto exception;
+                        }
+                    }
+                    sp[-2] = JS_NewInt32(ctx, ap_pos);
+                    JS_FreeValue(ctx, ap_iter);
+                    JS_FreeValue(ctx, ap_nm);
+                    JS_FreeValue(ctx, *--sp);
+                    goto restart;
+                }
+                /* length mismatch: elements may live on the prototype —
+                   general case, like the classic helper */
+            }
+        }
+        ap_blk = tt_arena_alloc_vals(rt, 2);
+        if (unlikely(!ap_blk)) {
+            JS_FreeValue(ctx, ap_iter);
+            JS_FreeValue(ctx, ap_nm);
+            JS_ThrowStackOverflow(caller_ctx);
+            goto exception;
+        }
+        ap_blk[0] = ap_iter;
+        ap_blk[1] = ap_nm;
+        goto append_pump;
+    }
+
+ append_pump:
+    /* dispatch ONE next() per pass: bytecode next methods and generator
+       bodies run as frames (parkable); C iterators loop here inline. */
+    {
+        if (JS_VALUE_GET_TAG(ap_blk[1]) == JS_TAG_OBJECT) {
+            JSObject *ap_np = JS_VALUE_GET_OBJ(ap_blk[1]);
+            if (ap_np->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+                if (unlikely(js_poll_interrupts(ctx)))
+                    goto append_pump_fail;
+                sf->cur_sp = sp;
+                pf_func = ap_blk[1];
+                pf_this = ap_blk[0];
+                pf_new_target = JS_UNDEFINED;
+                pf_argc = 0;
+                pf_argv = NULL;
+                pf_flags = 0;
+                pf_kind = TT_FRAME_APPEND_NEXT;
+                pf_ctor_this = JS_UNDEFINED;
+                pf_aux_i = 0;
+                pf_cargc = 0;
+                pf_aux = ap_blk;
+                goto push_frame;
+            }
+            if (ap_np->class_id == JS_CLASS_C_FUNCTION &&
+                ap_np->u.cfunc.cproto == JS_CFUNC_iterator_next &&
+                ap_np->u.cfunc.c_function.iterator_next == js_generator_next &&
+                JS_VALUE_GET_TAG(ap_blk[0]) == JS_TAG_OBJECT &&
+                JS_VALUE_GET_OBJ(ap_blk[0])->class_id == JS_CLASS_GENERATOR) {
+                struct JSGeneratorData *ap_gs =
+                    JS_GetOpaque(ap_blk[0], JS_CLASS_GENERATOR);
+                BOOL ap_gdone;
+                JSValue ap_gret;
+                if (unlikely(js_poll_interrupts(ctx)))
+                    goto append_pump_fail;
+                if (js_generator_resume_pre(ctx, ap_gs, GEN_MAGIC_NEXT,
+                                            JS_UNDEFINED, &ap_gdone, &ap_gret)) {
+                    int ap_r;
+                    if (JS_IsException(ap_gret))
+                        goto append_pump_fail;
+                    ap_r = tt_append_step(ctx, sp, ap_blk, ap_gret,
+                                          ap_gdone == 2 ? 2 : (ap_gdone ? 1 : 0));
+                    if (ap_r < 0)
+                        goto exception;
+                    if (ap_r == 0)
+                        goto append_pump;
+                    JS_FreeValue(ctx, *--sp);
+                    goto restart;
+                }
+                {
+                    /* run the generator body in-loop; the APPEND shape's
+                       completion defines the element and pumps on. The
+                       arena block rides in tt_ctor_this as a tagged
+                       pointer (never refcounted). */
+                    JSAsyncFunctionState *ap_fs = tt_generator_func_state(ap_gs);
+                    JSStackFrame *ap_gsf = &ap_fs->frame;
+                    sf->cur_sp = sp;
+                    ap_gsf->tt_frame_kind = TT_FRAME_GEN;
+                    ap_gsf->tt_aux = ap_gs;
+                    ap_gsf->tt_aux_i = GEN_MAGIC_NEXT | (TT_GENSHAPE_APPEND << 8);
+                    ap_gsf->tt_call_argc = 0;
+                    ap_gsf->tt_ctor_this = JS_MKPTR(JS_TAG_INT, ap_blk);
+                    ap_gsf->prev_frame = rt->current_stack_frame;
+                    rt->current_stack_frame = ap_gsf;
+                    sf = ap_gsf;
+                    TT_LOAD_FRAME();
+                    sp = sf->cur_sp;
+                    sf->cur_sp = NULL;
+                    pc = sf->cur_pc;
+                    if (ap_fs->throw_flag)
+                        goto exception;
+                    goto restart;
+                }
+            }
+        }
+        {
+            BOOL ap_done;
+            JSValue ap_v = JS_IteratorNext(ctx, ap_blk[0], ap_blk[1],
+                                           0, NULL, &ap_done);
+            int ap_r;
+            if (JS_IsException(ap_v))
+                goto append_pump_fail;
+            ap_r = tt_append_step(ctx, sp, ap_blk, ap_v, ap_done ? 1 : 0);
+            if (ap_r < 0)
+                goto exception;
+            if (ap_r == 0)
+                goto append_pump;
+            JS_FreeValue(ctx, *--sp);
+            goto restart;
+        }
+    append_pump_fail:
+        JS_IteratorClose(ctx, ap_blk[0], TRUE);
+        JS_FreeValue(ctx, ap_blk[0]);
+        JS_FreeValue(ctx, ap_blk[1]);
+        rt->tt_arena_top = (uint8_t *)ap_blk;
+        goto exception;
+    }
+
  agen_init_call:
     {
         struct JSAsyncGeneratorData *ags2 =

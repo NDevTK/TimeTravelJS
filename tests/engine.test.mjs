@@ -371,6 +371,165 @@ console.log(xs.join(","), cmps);
   assert.equal(engine.consoleEntries.at(-1).parts[0].v, "1,2,3,4,5")
 })
 
+test("exact resume: a long loop suspended at iteration k continues at k", async () => {
+  await engine.run(`
+let i = 0, acc = 0;
+while (i < 200) {
+  acc += i;
+  i += 1;
+}
+console.log(i, acc);
+`)
+  const t = engine.trace
+  const stepsBefore = t.length
+  // find the recorded step where i === 137, mid-loop, via real inspection
+  const bodyHits = []
+  for (let p = 0; p < t.length; p++) if (t[p].l === 4 && t[p].d === 0) bodyHits.push(p)
+  assert.ok(bodyHits.length >= 200)
+  const pos = bodyHits[137] // the "acc += i" step of iteration i=137
+  engine.positionTo(pos)
+  let ins = engine.inspect()
+  assert.equal(globalVal(ins, "i").v, 137, "suspended exactly at increment 137")
+  const accAt = globalVal(ins, "acc").v
+  assert.equal(accAt, (136 * 137) / 2, "acc is the partial sum before adding 137")
+  // resume from that exact machine state: the loop continues 137, 138, …
+  const summary = await engine.forkFrom(pos)
+  assert.equal(summary.error, null)
+  assert.equal(engine.trace.length, stepsBefore, "identical future, step for step")
+  engine.positionTo(bodyHits[138])
+  assert.equal(globalVal(engine.inspect(), "i").v, 138, "next iteration is 138 — same increment stream")
+  engine.positionTo(engine.trace.length - 1)
+  ins = engine.inspect()
+  assert.equal(globalVal(ins, "i").v, 200)
+  assert.equal(globalVal(ins, "acc").v, (199 * 200) / 2)
+})
+
+test("exact resume at opcode granularity: mid-expression, same increment", async () => {
+  await engine.run(`let n = 0;\nfor (let i = 0; i < 40; i++) n = n + i;\nconsole.log(n);\n`,
+    { granularity: "opcode" })
+  const stepsBefore = engine.trace.length
+  // pick an arbitrary mid-expression machine state in the middle of the run
+  const pos = Math.floor(stepsBefore * 0.6)
+  engine.positionTo(pos)
+  const nAt = globalVal(engine.inspect(), "n")?.v
+  const summary = await engine.forkFrom(pos)
+  assert.equal(summary.error, null)
+  assert.equal(engine.trace.length, stepsBefore, "opcode-level fork re-records identically")
+  engine.positionTo(pos)
+  assert.equal(globalVal(engine.inspect(), "n")?.v, nAt, "the fork point state is byte-exact")
+  engine.positionTo(engine.trace.length - 1)
+  assert.equal(engine.consoleEntries.at(-1).parts[0].v, 780)
+})
+
+const SHARED_PROG = `
+const counter = { n: 0, log: [] };
+function bump(by) {
+  counter.n += by;
+  counter.log.push("A" + counter.n);
+  return counter.n;
+}
+function read(tag) {
+  const seen = counter.n;
+  counter.log.push(tag + seen);
+  return seen;
+}
+let out = 0;
+for (let r = 1; r <= 4; r++) {
+  bump(r);
+  out = read("B");
+}
+console.log(out, counter.log.join(","));
+`
+
+test("shared state: one function's writes are visible where the other parked", async () => {
+  await engine.run(SHARED_PROG)
+  const t = engine.trace
+  // park INSIDE read() (the `const seen = counter.n` line, depth 1), 3rd round
+  const readHits = []
+  for (let p = 0; p < t.length; p++) if (t[p].l === 9 && t[p].d === 1) readHits.push(p)
+  assert.equal(readHits.length, 4, "read() body recorded once per round")
+  engine.positionTo(readHits[2])
+  const ins = engine.inspect()
+  // at this exact parked step, B sees A's latest mutation of round 3: 1+2+3
+  assert.equal(ins.stack[0].name, "read")
+  const counterN = engine.consoleEval("counter.n")
+  assert.equal(counterN.value?.v, 6, "A's third-round mutation is live inside B's frame")
+})
+
+test("shared state fork: editing the COW-shared object redirects both functions", async () => {
+  await engine.run(SHARED_PROG)
+  const t = engine.trace
+  const readHits = []
+  for (let p = 0; p < t.length; p++) if (t[p].l === 9 && t[p].d === 1) readHits.push(p)
+  const pos = readHits[2] // parked inside read(), round 3, counter.n === 6
+  // fork with an edit to the SHARED object from inside B's frame
+  const summary = await engine.forkFrom(pos, "counter.n = 100")
+  assert.equal(summary.error, null)
+  engine.positionTo(engine.trace.length - 1)
+  // B's round-3 read sees 100 (it re-reads counter.n on the next step);
+  // A's round-4 bump builds on it: 100 + 4 = 104; B reads 104.
+  const final = engine.consoleEntries.at(-1)
+  assert.equal(final.parts[0].v, 104, "both functions' futures flow from the shared edit")
+  assert.equal(final.parts[1].v, "A1,B1,A3,B3,A6,B100,A104,B104",
+    "prefix log untouched (COW), post-fork log reflects the shared-object edit in both functions")
+  // the prefix is untouched: before the fork point, counter.n is still 6
+  engine.positionTo(pos)
+  assert.equal(engine.consoleEval("counter.n").value?.v, 6, "pre-fork pages are the original timeline's")
+})
+
+test("multi-restore: the same parked state forked twice gives identical futures", async () => {
+  await engine.run(SHARED_PROG)
+  const t = engine.trace
+  const pos = Math.floor(t.length / 2)
+  await engine.forkFrom(pos)
+  const firstLen = engine.trace.length
+  engine.positionTo(engine.trace.length - 1)
+  const firstOut = JSON.stringify(engine.consoleEntries.at(-1).parts)
+  const firstEnd = JSON.stringify(engine.inspect().globals)
+  await engine.forkFrom(pos)
+  assert.equal(engine.trace.length, firstLen, "second restore of the same state: same step count")
+  engine.positionTo(engine.trace.length - 1)
+  assert.equal(JSON.stringify(engine.consoleEntries.at(-1).parts), firstOut)
+  assert.equal(JSON.stringify(engine.inspect().globals), firstEnd,
+    "restoring the same bytes twice replays the identical future twice")
+})
+
+test("zero suppression: every step of the full language surface parks", async () => {
+  const summary = await engine.run(`
+const log = [];
+const o = { get g() { return 7; }, set s(v) { log.push("set" + v); } };
+log.push(o.g); o.s = 3;
+const n = { valueOf() { return 40; } }; log.push(n + 2, n < 100, n == 40);
+const t = { toString() { return "T"; } }; log.push(\`x\${t}\`, String(t), "a".concat(t));
+class C { static [Symbol.hasInstance](v) { return v === 1; } }
+log.push(1 instanceof C);
+const it = { [Symbol.iterator]() { let i = 0; return { next() { i++; return { value: i, done: i > 2 }; } }; } };
+for (const v of it) log.push(v);
+log.push([...it].length);
+function* g() { yield 1; yield 2; } log.push([...g()].join(""));
+const b = function (x) { return this.m + x; }.bind({ m: 10 }, 5); log.push(b());
+log.push([3, 1, 2].sort().join(""), [{ toString() { return "j"; } }].join(""));
+log.push(JSON.stringify({ toJSON() { return { a: 1 }; } }));
+log.push(JSON.parse('{"k":2}', (k, v) => typeof v === "number" ? v * 10 : v).k);
+log.push("a1b2".replace(/\\d/g, (m) => m + "!"));
+const p = new Proxy({}, { get(_, k) { return "P" + String(k); } }); log.push(p.q);
+with (o) { log.push(g); }
+let wv = 0;
+new Promise((res) => res(41)).then((v) => { wv = v + 1; });
+async function* ag() { const a = await Promise.resolve(1); yield a; yield a + 1; }
+(async () => { let s = 0; for await (const v of ag()) s += v; globalThis.agSum = s; })();
+setTimeout(() => { globalThis.timer = wv; }, 1);
+console.log(log.join("|"));
+`)
+  assert.equal(summary.error, null)
+  assert.equal(summary.suppressedSteps, 0,
+    "getters, coercions, templates, instanceof, iterators, bound/call/apply, sort/join, JSON, replace, proxies, with, promises, async generators: every step is a resumable snapshot")
+  engine.positionTo(engine.trace.length - 1)
+  const g = engine.inspect().globals
+  assert.equal(g.find(([k]) => k === "agSum")?.[1]?.v, 3, "async generator drove to completion")
+  assert.equal(g.find(([k]) => k === "timer")?.[1]?.v, 42, "timer saw the settled promise value")
+})
+
 test("navigation is orders of magnitude cheaper than execution", async () => {
   await engine.run(`
 const data = [];
