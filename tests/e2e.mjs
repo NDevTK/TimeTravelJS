@@ -147,6 +147,56 @@ const preForkNums = await page.evaluate(() => {
 })
 assert.equal(preForkNums, 7, "pre-fork history intact")
 
+// --- the multiverse: the abandoned future is a clickable sibling timeline
+const strip = await page.evaluate(() => {
+  const chips = [...document.querySelectorAll(".branch-chip")]
+  return { hidden: document.querySelector("#branch-strip").hidden, labels: chips.map((c) => c.textContent) }
+})
+assert.equal(strip.hidden, false, "branch strip appears once a fork exists")
+assert.equal(strip.labels.length, 2, "main + fork")
+await page.click(".branch-chip") // first chip = main
+await page.waitForFunction(() => window.__timetravel.engine.branch === 0)
+// the fork paused before the final swaps++ with swaps=12, so the original
+// future ends with 13 — and the forked one (swaps=100) ended with 101
+const backOnMain = await page.textContent("#console-body")
+assert.match(backOnMain, /swaps: 13/, "the ORIGINAL future is intact and visible again")
+assert.ok(!/swaps: 101/.test(backOnMain), "no bleed-through from the forked timeline")
+console.log("branch strip: fork retained, original timeline restored on click")
+
+// --- what-if: counterfactual fan-out + BFS probe scan, from mid-recording
+await page.evaluate(() => {
+  const { engine, ui } = window.__timetravel
+  engine.positionTo(Math.floor(engine.trace.length / 2))
+  ui.syncPosition()
+})
+await page.fill("#whatif-edits", "swaps = 500\nswaps = -500")
+await page.fill("#whatif-probe", "swaps > 400")
+await page.click("#whatif-run")
+await page.waitForFunction(
+  () => !window.__timetravel.ui.recording && document.querySelectorAll(".whatif-result").length === 2,
+  null,
+  { timeout: 120000 },
+)
+const whatIfState = await page.evaluate(() => ({
+  chips: document.querySelectorAll(".branch-chip").length,
+  results: [...document.querySelectorAll(".whatif-result")].map((r) => r.textContent),
+  branch: window.__timetravel.engine.branch,
+}))
+console.log("what-if:", JSON.stringify(whatIfState.results))
+assert.equal(whatIfState.chips, 4, "two hypothetical timelines joined the strip")
+assert.equal(whatIfState.branch, 0, "view returned to the original timeline")
+assert.match(whatIfState.results[0], /first true @/, "probe scan found the divergence point")
+assert.ok(!/first true/.test(whatIfState.results[1]), "swaps = -500 never satisfies the probe")
+await page.click(".whatif-result") // jump into the first hypothesis at its divergence
+const jumped = await page.evaluate(() => {
+  const { engine } = window.__timetravel
+  const r = engine.consoleEval("swaps")
+  return { branch: engine.branch, swaps: r.value?.v }
+})
+assert.ok(jumped.branch >= 2, "clicked into the hypothetical timeline")
+assert.equal(jumped.swaps, 500, "landed on the first state where the probe is true")
+console.log("what-if: jumped into hypothesis, swaps =", jumped.swaps, "on timeline", jumped.branch)
+
 // --- crash sample: error surfaces, timeline navigable, stack panel shows frames
 await page.selectOption("#sample-select", "crash")
 await page.waitForFunction(
@@ -164,6 +214,11 @@ const crash = await page.evaluate(() => {
 })
 console.log("crash error:", JSON.stringify(crash.error).slice(0, 80), "| stack:", crash.stack.join(" > ") || "(top)")
 assert.ok(crash.error && crash.error.t === "error", "crash recorded")
+assert.equal(
+  await page.evaluate(() => document.querySelector("#branch-strip").hidden),
+  true,
+  "a fresh recording resets the multiverse",
+)
 const statusCrash = await page.textContent("#status-pill")
 assert.match(statusCrash, /crash/i)
 

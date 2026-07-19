@@ -176,11 +176,18 @@ export class DebuggerUI {
       cpCanvas: $("#cp-canvas"),
       heatCanvas: $("#heat-canvas"),
       playBtn: $("#btn-play"),
+      branchStrip: $("#branch-strip"),
+      whatifEdits: $("#whatif-edits"),
+      whatifProbe: $("#whatif-probe"),
+      whatifRun: $("#whatif-run"),
+      whatifResults: $("#whatif-results"),
     }
+    this._evalByBranch = new Map() // branchId -> saved evalEntries of that view
     this._buildSamplePicker()
     this._wireEditor()
     this._wireTransport()
     this._wireConsole()
+    this._wireWhatIf()
     window.addEventListener("resize", () => this.renderTimeline())
   }
 
@@ -419,6 +426,8 @@ export class DebuggerUI {
     this.recording = true
     this.summary = null
     this.evalEntries = []
+    this._evalByBranch = new Map()
+    if (this.els.whatifResults) this.els.whatifResults.textContent = ""
     this.els.code.readOnly = true
     this.els.runBtn.disabled = true
     this.setStatus("busy", "recording…")
@@ -461,6 +470,7 @@ export class DebuggerUI {
     this.stopPlay()
     this.recording = true
     const pos = this.engine.pos
+    const fromBranch = this.engine.branch
     const warnsBefore = this.summary.warnings.length
     this.els.runBtn.disabled = true
     this.setStatus("busy", `⑂ forking at step ${pos}…`)
@@ -468,7 +478,9 @@ export class DebuggerUI {
       const summary = await this.engine.forkFrom(pos, editSrc || null, (p) =>
         this.setStatus("busy", `⑂ recording new future… ${p.steps} steps`),
       )
-      // UI eval entries that pointed into the discarded future are gone with it
+      // the abandoned future is RETAINED as a sibling timeline; its eval
+      // entries stay with it, the new branch inherits only the shared prefix
+      this._evalByBranch.set(fromBranch, this.evalEntries)
       this.evalEntries = this.evalEntries.filter((entry) => entry.visibleAt <= pos)
       this.evalEntries.push({
         visibleAt: pos,
@@ -511,6 +523,113 @@ export class DebuggerUI {
     this.els.posMax.textContent = String(this.maxPos)
     this.engine.positionTo(this.maxPos)
     this.syncPosition()
+    this.renderBranches()
+  }
+
+  // ---------------------------------------------------------- the multiverse
+  renderBranches() {
+    const strip = this.els.branchStrip
+    if (!strip || !this.engine.timelines) return
+    const tl = this.summary ? this.engine.timelines() : []
+    strip.hidden = tl.length <= 1
+    strip.textContent = ""
+    if (tl.length <= 1) return
+    strip.append(el("span", "branch-label", "timelines"))
+    for (const t of tl) {
+      const chip = el("button", "branch-chip" + (t.current ? " current" : "") + (t.error ? " errored" : ""))
+      const name = t.id === 0 ? "main" : `⑂${t.forkedAt}`
+      chip.append(span("branch-name", "· ".repeat(t.depth) + name))
+      if (t.edit) chip.append(span("branch-edit", t.edit.length > 26 ? t.edit.slice(0, 25) + "…" : t.edit))
+      chip.append(span("branch-steps", `${t.steps}${t.error ? " ✖" : ""}`))
+      chip.title =
+        (t.id === 0 ? "the original recording" : t.edit ? `forked at step ${t.forkedAt} with edit: ${t.edit}` : `re-recorded from step ${t.forkedAt}`) +
+        ` — ${t.steps} steps` + (t.error ? " · crashed" : "")
+      chip.addEventListener("click", () => this.switchTimeline(t.id))
+      strip.append(chip)
+    }
+  }
+
+  switchTimeline(id, pos = null) {
+    if (this.recording || !this.summary || !this.engine.switchTo) return
+    if (id === this.engine.branch && pos == null) return
+    this.stopPlay()
+    this._evalByBranch.set(this.engine.branch, this.evalEntries)
+    this.evalEntries = this._evalByBranch.get(id) ?? []
+    this.engine.switchTo(id, pos ?? undefined)
+    this.summary = this.engine.summary()
+    this.els.slider.max = String(this.maxPos)
+    this.els.posMax.textContent = String(this.maxPos)
+    this.syncPosition()
+    this.renderBranches()
+    const t = this.engine.timelines().find((x) => x.id === id)
+    this.setStatus(
+      this.summary.error ? "err" : "ok",
+      `timeline ${id === 0 ? "main" : "⑂" + (t?.forkedAt ?? id)} — ${this.summary.steps} steps`,
+    )
+  }
+
+  _wireWhatIf() {
+    this.els.whatifRun?.addEventListener("click", () => this.runWhatIf())
+  }
+
+  async runWhatIf() {
+    if (this.recording || !this.summary || !this.engine.whatIf) return
+    const edits = (this.els.whatifEdits?.value ?? "").split("\n").map((s) => s.trim()).filter(Boolean)
+    if (!edits.length) {
+      this.setStatus("ok", "what-if: add one edit per line first")
+      return
+    }
+    const probe = (this.els.whatifProbe?.value ?? "").trim() || null
+    // hypotheses need a parked machine: walk back off idle end/timer markers
+    let pos = this.engine.pos
+    const trace = this.engine.trace
+    while (pos > 0 && !trace[pos]?.entry) pos--
+    if (!trace[pos]?.entry) {
+      this.setStatus("err", "no parked step to fork from")
+      return
+    }
+    this.stopPlay()
+    this.recording = true
+    this.els.runBtn.disabled = true
+    this.setStatus("busy", `⑂ exploring ${edits.length} counterfactual timeline${edits.length > 1 ? "s" : ""} from step ${pos}…`)
+    try {
+      const rows = await this.engine.whatIf(pos, edits, { probe, scan: !!probe })
+      this.summary = this.engine.summary() // cow stats now include the new timelines
+      this.renderWhatIfResults(pos, probe, rows)
+      this.renderBranches()
+      this.renderMemory()
+      this.setStatus("ok", `⑂ ${rows.length} timelines explored from step ${pos} — all jumpable`)
+    } catch (err) {
+      this.setStatus("err", "what-if failed")
+      this.evalEntries.push({ visibleAt: 0, level: "error", text: String(err.message || err) })
+      this.renderConsole()
+      console.error(err)
+    } finally {
+      this.recording = false
+      this.els.runBtn.disabled = false
+    }
+  }
+
+  renderWhatIfResults(pos, probe, rows) {
+    const box = this.els.whatifResults
+    if (!box) return
+    box.textContent = ""
+    box.append(el("div", "whatif-head", `at step ${pos}${probe ? ` · probe: ${probe}` : ""}`))
+    for (const r of rows) {
+      const row = el("button", "whatif-result")
+      row.append(span("whatif-edit", r.edit ?? "(replay)"))
+      const out = span("whatif-outcome")
+      if (r.error) out.append(span("v-special", `✖ ${r.error.name ?? "error"}: ${r.error.msg ?? ""}`))
+      else if (r.probe) {
+        out.append(span("v-punct", "→ "))
+        out.append(r.probe.error ? span("v-special", "probe error") : inlinePreview(r.probe.value, 1))
+      } else out.append(span("v-punct", `→ ${r.steps} steps`))
+      if (r.firstTrue != null) out.append(span("whatif-first", ` first true @${r.firstTrue}`))
+      row.append(out)
+      row.title = `jump into this timeline (${r.steps} steps)`
+      row.addEventListener("click", () => this.switchTimeline(r.branch, r.firstTrue ?? undefined))
+      box.append(row)
+    }
   }
 
   setStatus(kind, text) {

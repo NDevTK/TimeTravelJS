@@ -1,18 +1,27 @@
 // TimeTravelJS engine — true suspend/resume time travel on a stackless VM.
 //
-// The program executes exactly once. The interpreter keeps every frame in a
-// linear-memory arena, so no C stack ever spans a step: the VM suspends by
-// RETURNING to the host and the engine captures a copy-on-write page delta
-// of the entire machine. Resuming — now or from any restored snapshot — is
-// a plain call. Navigation applies deltas backward/forward: pure memory
-// writes, no re-execution, no replay, no determinism requirements.
+// The program executes exactly once per timeline. The interpreter keeps
+// every frame in a linear-memory arena, so no C stack ever spans a step:
+// the VM suspends by RETURNING to the host and the engine captures a
+// copy-on-write page delta of the entire machine. Resuming — now or from
+// any restored snapshot — is a plain call. Navigation applies deltas
+// backward/forward: pure memory writes, no re-execution, no replay, no
+// determinism requirements.
+//
+// History is a TREE. Forking does not discard the abandoned future — it
+// stays reachable as a sibling timeline, and because all timelines share
+// one content-deduplicated page pool, a branch costs only the pages it
+// actually diverges on. Navigation between any two moments of any two
+// timelines walks the tree through their common ancestor: undo up, redo
+// down. That turns the debugger from "what happened" into "what would
+// have happened": whatIf() forks a set of candidate edits off the same
+// moment (the breadth-first frontier), and searchAll() BFS-scans a
+// predicate across every state of every timeline, visiting each state
+// exactly once.
 //
 // Inspection is trivial by construction: restore the position's pages and
 // walk the live frames with a plain call — repeatable at will; whatever a
-// transaction perturbs is healed from the page store afterwards. Steps that
-// would fire inside unconverted C-reentry paths (accessors called from C
-// builtins, proxy traps, toPrimitive) cannot become snapshots and are
-// counted as summary.suppressedSteps instead.
+// transaction perturbs is healed from the page store afterwards.
 
 import { QuickJSVM, STEP_CONTINUE, STEP_ABORT } from "./vm.js"
 import { DeltaStore } from "./deltastore.js"
@@ -27,6 +36,28 @@ const OUT_JOBS_DONE = 4
 const OUT_TIMER_DONE = 5
 
 const LEVELS = ["log", "info", "warn", "error"]
+
+/** truthiness of a serialized value envelope (for search predicates) */
+const envTruthy = (v) => {
+  if (!v) return false
+  switch (v.t) {
+    case "undef":
+    case "null":
+    case "nan":
+    case "tdz":
+    case "hole":
+      return false
+    case "bool":
+    case "num":
+      return !!v.v
+    case "str":
+      return v.v.length > 0
+    case "bigint":
+      return v.v !== "0" && v.v !== "0n"
+    default:
+      return true // objects, arrays, functions, dom nodes, dates, …
+  }
+}
 
 export class TimeTravelEngine {
   static async create(wasmBytes) {
@@ -52,34 +83,131 @@ export class TimeTravelEngine {
 
   _resetSession() {
     this.session = {
-      trace: [], // {l, c, d, entry} — entry = which export activation this step suspended in
-      consoleEntries: [], // {visibleAt, level, parts}
+      // the branch tree. branches[0] = the root timeline; a fork appends a
+      // branch whose chain hangs at (parentId, forkPos). Pruned slots are null.
+      branches: [this._newBranch(0, null, -1, null)],
+      view: 0, // which timeline the linear trace/pos API presents
+      at: { branchId: 0, local: 0 }, // where the LIVE memory actually is
+      pos: 0, // global position within the view timeline's composite
+      version: 0, // bumped when the tree changes (invalidates composites)
+      compCache: new Map(), // branchId -> {v, arr} composite trace
+      consoleCache: new Map(), // branchId -> {v, arr} composite console
+      consoleEntries: [], // kept for shape-compat; real storage is per branch
       store: new DeltaStore(),
-      pos: 0,
       finished: false,
-      truncated: false,
-      error: null, // {name, msg} envelope of an uncaught program error
-      result: null, // serialized completion value
       memDirty: false, // live memory drifted from store.liveTable (transaction ran)
       maxSteps: 20000,
       byteBudget: 256 * 1024 * 1024,
       warnings: [],
-      cachedInspect: new Map(), // pos -> parsed inspection
+      cachedInspect: new Map(), // "branch:local" -> parsed inspection
       evalResult: null,
       phase: "main",
+      recBranch: null, // branch currently being recorded onto
+      recPrefixLen: 0, // composite length of the recording branch's prefix
     }
+  }
+
+  _newBranch(id, parentId, forkPos, edit) {
+    return {
+      id,
+      parentId,
+      forkPos, // local position in the PARENT's chain this branch hangs at
+      edit, // the edit source applied at the fork (null = pure replay)
+      trace: [], // {l, c, d, entry} — this branch's OWN steps
+      console: [], // console entries recorded on this branch (global visibleAt)
+      error: null,
+      result: null,
+      truncated: false,
+      forkedAt: null, // global pos of the base state in this branch's composite
+    }
+  }
+
+  // ---- tree geometry ------------------------------------------------------
+  /** root-first segments of a timeline: [{id, upto}] — upto inclusive */
+  _segments(bid) {
+    const s = this.session
+    const segs = []
+    let b = s.branches[bid]
+    let upto = b.trace.length - 1
+    while (b) {
+      segs.push({ id: b.id, upto })
+      if (b.parentId == null) break
+      upto = b.forkPos
+      b = s.branches[b.parentId]
+    }
+    return segs.reverse()
+  }
+
+  _compositeLen(bid) {
+    let n = 0
+    for (const seg of this._segments(bid)) n += seg.upto + 1
+    return n
+  }
+
+  _prefixLen(bid) {
+    return this._compositeLen(bid) - this.session.branches[bid].trace.length
+  }
+
+  /** map a global position in `bid`'s composite to the owning (branch, local) */
+  _mapGlobal(bid, g) {
+    const segs = this._segments(bid)
+    let off = 0
+    for (const seg of segs) {
+      const len = seg.upto + 1
+      if (g < off + len) return { branchId: seg.id, local: g - off }
+      off += len
+    }
+    const last = segs[segs.length - 1]
+    return { branchId: last.id, local: last.upto }
+  }
+
+  _entryAt(g) {
+    const s = this.session
+    const { branchId, local } = this._mapGlobal(s.view, g)
+    return s.branches[branchId].trace[local]
+  }
+
+  _composite(bid) {
+    const s = this.session
+    const cached = s.compCache.get(bid)
+    if (cached && cached.v === s.version && s.finished) return cached.arr
+    const arr = []
+    for (const { id, upto } of this._segments(bid)) {
+      const t = s.branches[id].trace
+      for (let i = 0; i <= upto; i++) arr.push(t[i])
+    }
+    if (s.finished) s.compCache.set(bid, { v: s.version, arr })
+    return arr
+  }
+
+  _consoleComposite(bid) {
+    const s = this.session
+    const cached = s.consoleCache.get(bid)
+    if (cached && cached.v === s.version && s.finished) return cached.arr
+    const arr = []
+    let off = 0
+    for (const { id, upto } of this._segments(bid)) {
+      // console entries carry GLOBAL visibleAt stamped at record time; the
+      // path up to their branch is fixed at fork creation, so the same
+      // coordinate is valid in every descendant composite
+      for (const e of s.branches[id].console) if (e.visibleAt <= off + upto) arr.push(e)
+      off += upto + 1
+    }
+    if (s.finished) s.consoleCache.set(bid, { v: s.version, arr })
+    return arr
   }
 
   // ---- hook plumbing ------------------------------------------------------
   _onOut(kind, text) {
     const s = this.session
     if (kind === OUT_CONSOLE) {
-      if (this._mode !== "record") return // transactional activations don't append console output
+      if (this._mode !== "record" || !s.recBranch) return // transactional activations don't append console output
+      const visibleAt = s.recPrefixLen + s.recBranch.trace.length
       try {
         const msg = JSON.parse(text)
-        s.consoleEntries.push({ visibleAt: s.trace.length, level: LEVELS[msg.level] ?? "log", parts: msg.parts })
+        s.recBranch.console.push({ visibleAt, level: LEVELS[msg.level] ?? "log", parts: msg.parts })
       } catch {
-        s.consoleEntries.push({ visibleAt: s.trace.length, level: "log", parts: [{ t: "str", v: text }] })
+        s.recBranch.console.push({ visibleAt, level: "log", parts: [{ t: "str", v: text }] })
       }
       return
     }
@@ -91,11 +219,11 @@ export class TimeTravelEngine {
       if (this._transact) this._transact.evalResult = text
       return
     }
-    if (kind === OUT_EVAL_DONE && this._mode === "record") {
+    if (kind === OUT_EVAL_DONE && this._mode === "record" && s.recBranch) {
       try {
         const env = JSON.parse(text)
-        if (env && env.error) s.error = env.error
-        else if (env) s.result = env.ok
+        if (env && env.error) s.recBranch.error = env.error
+        else if (env) s.recBranch.result = env.ok
       } catch {
         /* ignore */
       }
@@ -111,10 +239,10 @@ export class TimeTravelEngine {
     const s0 = this.session
     if (s0 && this.vm.suspended) this._abortActivation()
     if (s0 && s0.programPtr) {
-      // Live memory may be parked at any historical position. Return it to
-      // the true end-of-run state (where the program buffer and allocator
-      // are consistent with reality) before freeing and resetting.
-      if (s0.finished && s0.trace.length) this.positionTo(s0.trace.length - 1)
+      // Live memory may be parked at any historical position of any branch.
+      // Return it to a true end-of-run state (where the program buffer and
+      // allocator are consistent with reality) before freeing and resetting.
+      if (s0.finished && this._compositeLen(s0.view) > 0) this.positionTo(this._compositeLen(s0.view) - 1)
       if (s0.memDirty) {
         s0.store.heal(this.mem())
         s0.memDirty = false
@@ -144,6 +272,8 @@ export class TimeTravelEngine {
     const { ptr, len } = this.vm.writeString(source)
     s.programPtr = ptr
     this._mode = "record"
+    s.recBranch = s.branches[0]
+    s.recPrefixLen = 0
     this._lastYield = now()
     this._deadline = now() + 2500
     this._onProgress = onProgress
@@ -157,35 +287,43 @@ export class TimeTravelEngine {
       this._onProgress = null
     }
     s.finished = true
-    s.pos = s.trace.length - 1
+    s.version++
+    const root = s.branches[0]
+    s.at = { branchId: 0, local: root.trace.length - 1 }
+    s.pos = root.trace.length - 1
+    s.recBranch = null
     if (onProgress) onProgress(this.progress())
     return this.summary()
   }
 
   /**
-   * Fork the timeline: discard everything after `pos`, apply an optional
-   * edit at that moment, and let execution CONTINUE from there, recording a
-   * new future. Uses only proven suspension patterns: one rewind of the
-   * restored activation, then the ordinary record cycle going forward.
+   * Fork the timeline at `pos` (a global position in the current view):
+   * apply an optional edit to the live machine at that moment and let
+   * execution CONTINUE from there, recording a NEW timeline. The abandoned
+   * future is retained — it stays navigable as a sibling branch sharing
+   * every pre-fork page. The new branch hangs off whichever ancestor
+   * actually owns the forked step, so forking inside a shared prefix
+   * creates true siblings.
    */
   async forkFrom(pos, editSrc = null, onProgress = null) {
     const s = this.session
     if (!s || !s.finished) throw new Error("no finished recording")
-    pos = Math.max(0, Math.min(pos, s.trace.length - 1))
-    const entry = s.trace[pos]
+    pos = Math.max(0, Math.min(pos, this._compositeLen(s.view) - 1))
+    const { branchId: baseBid, local: baseLocal } = this._mapGlobal(s.view, pos)
+    const entry = s.branches[baseBid].trace[baseLocal]
     if (!entry.entry) throw new Error("cannot fork at an idle position")
 
-    this.positionTo(pos)
-    // truncate history: the live table is already AT pos
-    s.store.truncateTo(pos)
-    s.trace.length = pos + 1
-    s.consoleEntries = s.consoleEntries.filter((e) => e.visibleAt <= pos)
-    for (const key of [...s.cachedInspect.keys()]) if (key > pos) s.cachedInspect.delete(key)
-    s.error = null
-    s.result = null
-    s.truncated = false
+    this.positionTo(pos) // live memory → the base state
+    const id = s.branches.length
+    const chainId = s.store.newChain()
+    if (chainId !== id) throw new Error(`branch/chain id skew: ${id} vs ${chainId}`)
+    const nb = this._newBranch(id, baseBid, baseLocal, editSrc == null ? null : String(editSrc))
+    nb.forkedAt = pos
+    s.branches.push(nb)
+    s.view = id
     s.finished = false
-    s.forkedAt = pos
+    s.recBranch = nb
+    s.recPrefixLen = pos + 1
 
     this._mode = "record"
     this._lastYield = now()
@@ -198,7 +336,7 @@ export class TimeTravelEngine {
       if (editSrc != null) {
         this.vm.stagedArg = new TextEncoder().encode(String(editSrc))
         this.vm.exports.tt_eval_parked(1)
-        // the edit's dirty pages stay marked: they belong to pos+1's delta
+        // the edit's dirty pages stay marked: they belong to the branch's first delta
       }
       this.vm.adoptSuspension()
       const r = this.vm.resume(STEP_CONTINUE)
@@ -211,7 +349,10 @@ export class TimeTravelEngine {
       this.vm.stagedArg = null
     }
     s.finished = true
-    s.pos = s.trace.length - 1
+    s.version++
+    s.at = { branchId: id, local: nb.trace.length - 1 }
+    s.pos = s.recPrefixLen + nb.trace.length - 1
+    s.recBranch = null
     if (onProgress) onProgress(this.progress())
     return this.summary()
   }
@@ -219,29 +360,31 @@ export class TimeTravelEngine {
   /** Drive one activation, capturing a COW delta per suspension. */
   async _pumpSteps(r, entryTag) {
     const s = this.session
+    const b = s.recBranch
     while (r.suspended) {
       // parked by return: no live wasm activation, no stack pointer —
       // the machine is nothing but memory
-      s.trace.push({
+      b.trace.push({
         l: this.vm.exports.tt_park_line(),
         c: this.vm.exports.tt_park_col(),
         d: this.vm.exports.tt_park_depth(),
         entry: entryTag,
         k: "r",
       })
-      if (s.trace.length === 1) {
+      if (b.id === 0 && b.trace.length === 1) {
         // base image: full scan (excluding the barrier's own map region)
         this.vm.clearDirtyMap()
         s.store.capture(this.mem(), 0, [this.vm.mapExclusion()])
       } else {
-        s.store.captureFrom(this.mem(), this.vm.readAndClearDirtyPages())
+        s.store.captureFrom(this.mem(), this.vm.readAndClearDirtyPages(), 0, b.id)
       }
       if (s.verifyBarrier) {
         const bad = s.store.audit(this.mem(), [this.vm.mapExclusion()])
-        if (bad.length) s.warnings.push(`barrier missed pages at step ${s.trace.length - 1}: ${bad.slice(0, 8).join(",")}`)
+        if (bad.length)
+          s.warnings.push(`barrier missed pages at step ${s.recPrefixLen + b.trace.length - 1}: ${bad.slice(0, 8).join(",")}`)
       }
-      if (s.trace.length >= s.maxSteps || s.store.poolBytes > s.byteBudget) {
-        s.truncated = true
+      if (s.recPrefixLen + b.trace.length >= s.maxSteps || s.store.poolBytes > s.byteBudget) {
+        b.truncated = true
         this._abortActivation()
         return false
       }
@@ -259,23 +402,24 @@ export class TimeTravelEngine {
   /** After the main activation: promise jobs + virtual timers, then the end state. */
   async _drainPhases(ok) {
     const s = this.session
+    const b = s.recBranch
     let rounds = 0
-    while (ok && !s.truncated && rounds++ < 10000) {
+    while (ok && !b.truncated && rounds++ < 10000) {
       if (this.vm.exports.tt_pending_jobs()) {
         ok = await this._pumpSteps(this.vm.drive("tt_run_jobs"), { name: "tt_run_jobs", args: [] })
         continue
       }
       if (this.vm.exports.tt_timer_count() > 0) {
-        s.trace.push({ l: 0, c: 0, d: 0, entry: null, timer: true })
-        s.store.captureFrom(this.mem(), this.vm.readAndClearDirtyPages(), 1)
+        b.trace.push({ l: 0, c: 0, d: 0, entry: null, timer: true })
+        s.store.captureFrom(this.mem(), this.vm.readAndClearDirtyPages(), 1, b.id)
         ok = await this._pumpSteps(this.vm.drive("tt_fire_timer"), { name: "tt_fire_timer", args: [] })
         continue
       }
       break
     }
     if (ok) {
-      s.trace.push({ l: 0, c: 0, d: 0, entry: null, end: true })
-      s.store.captureFrom(this.mem(), this.vm.readAndClearDirtyPages(), 2)
+      b.trace.push({ l: 0, c: 0, d: 0, entry: null, end: true })
+      s.store.captureFrom(this.mem(), this.vm.readAndClearDirtyPages(), 2, b.id)
     }
   }
 
@@ -297,19 +441,222 @@ export class TimeTravelEngine {
   }
 
   // ---- navigation (pure memory, no execution) -----------------------------
-  /** Move the debugger position. O(deltas between here and there). */
+  /** Move the debugger position within the view timeline. O(deltas walked). */
   positionTo(target) {
     const s = this.session
     if (!s.finished) throw new Error("no finished recording")
-    target = Math.max(0, Math.min(target, s.trace.length - 1))
+    const len = this._compositeLen(s.view)
+    target = Math.max(0, Math.min(target, len - 1))
+    const { branchId, local } = this._mapGlobal(s.view, target)
+    this._navigateTo(branchId, local)
+    s.pos = target
+    return target
+  }
+
+  /**
+   * Move the LIVE memory to state (branch, local) — the tree walk. Undo the
+   * current path up to the lowest common ancestor, move within it, redo down
+   * the target path. Every transition is a recorded delta applied in the
+   * direction it was captured; crossing a fork boundary is exact because a
+   * branch's first delta was captured against the parent state it hangs at.
+   */
+  _navigateTo(tb, tl) {
+    const s = this.session
     const mem = this.mem()
     if (s.memDirty) {
       s.store.heal(mem)
       s.memDirty = false
     }
-    while (s.pos < target) this.session.store.applyForward(++s.pos, mem)
-    while (s.pos > target) this.session.store.applyBackward(s.pos--, mem)
-    return s.pos
+    const pathOf = (bid, local) => {
+      const arr = []
+      let b = s.branches[bid]
+      let p = local
+      while (b) {
+        arr.push({ id: b.id, pos: p })
+        p = b.forkPos
+        b = b.parentId != null ? s.branches[b.parentId] : null
+      }
+      return arr.reverse() // root-first
+    }
+    const A = pathOf(s.at.branchId, s.at.local)
+    const B = pathOf(tb, tl)
+    let k = 0
+    while (k + 1 < A.length && k + 1 < B.length && A[k + 1].id === B[k + 1].id) k++
+    // undo the tail of the current path above the common branch
+    for (let lvl = A.length - 1; lvl > k; lvl--) {
+      const { id, pos } = A[lvl]
+      for (let i = pos; i >= 0; i--) s.store.applyBackward(i, mem, id)
+    }
+    // move within the common branch
+    let cur = A[k].pos
+    const want = B[k].pos
+    while (cur < want) s.store.applyForward(++cur, mem, A[k].id)
+    while (cur > want) s.store.applyBackward(cur--, mem, A[k].id)
+    // redo down into the target path
+    for (let lvl = k + 1; lvl < B.length; lvl++) {
+      const { id, pos } = B[lvl]
+      for (let i = 0; i <= pos; i++) s.store.applyForward(i, mem, id)
+    }
+    s.at = { branchId: tb, local: tl }
+  }
+
+  // ---- the multiverse -----------------------------------------------------
+  /** All live timelines, root-first, with tree metadata. */
+  timelines() {
+    const s = this.session
+    const depth = new Map()
+    const out = []
+    for (const b of s.branches) {
+      if (!b) continue
+      depth.set(b.id, b.parentId == null ? 0 : depth.get(b.parentId) + 1)
+      out.push({
+        id: b.id,
+        parentId: b.parentId,
+        depth: depth.get(b.id),
+        forkedAt: b.forkedAt,
+        edit: b.edit,
+        steps: this._compositeLen(b.id),
+        error: b.error,
+        truncated: b.truncated,
+        current: b.id === s.view,
+      })
+    }
+    return out
+  }
+
+  /** Present another timeline through the linear trace/pos API. */
+  switchTo(branchId, pos = null) {
+    const s = this.session
+    if (!s.finished) throw new Error("recording in progress")
+    if (!s.branches[branchId]) throw new Error(`no timeline ${branchId}`)
+    s.view = branchId
+    return this.positionTo(pos == null ? this._compositeLen(branchId) - 1 : pos)
+  }
+
+  /** Delete a timeline and its descendants; their pages are freed. */
+  pruneBranch(branchId) {
+    const s = this.session
+    if (!s.finished) throw new Error("recording in progress")
+    if (branchId === 0) throw new Error("cannot prune the root timeline")
+    const doomed = s.branches[branchId]
+    if (!doomed) throw new Error(`no timeline ${branchId}`)
+    const dead = new Set([branchId])
+    let grew = true
+    while (grew) {
+      grew = false
+      for (const b of s.branches) {
+        if (b && b.parentId != null && dead.has(b.parentId) && !dead.has(b.id)) {
+          dead.add(b.id)
+          grew = true
+        }
+      }
+    }
+    // move the live state and the view off the doomed subtree first: the
+    // pruned branch's base state survives on its parent
+    if (dead.has(s.view) || dead.has(s.at.branchId)) {
+      this._navigateTo(doomed.parentId, doomed.forkPos)
+      s.view = doomed.parentId
+      s.pos = this._prefixLen(doomed.parentId) + doomed.forkPos
+    }
+    for (const id of dead) s.branches[id] = null
+    s.store.prune(dead)
+    s.cachedInspect.clear()
+    s.version++
+    return [...dead]
+  }
+
+  /**
+   * BFS across the multiverse: evaluate `expr` at every recorded state of
+   * every timeline — shared prefixes are visited exactly once, at the
+   * branch that owns them; breadth-first by fork depth, then creation
+   * order. Returns truthy hits as {branch, pos, local, value}, where pos
+   * is a global position valid after switchTo(branch).
+   */
+  searchAll(expr, { limit = 200, branch = null } = {}) {
+    const s = this.session
+    if (!s.finished) throw new Error("no finished recording")
+    const saveView = s.view
+    const savePos = s.pos
+    const alive = s.branches.filter(Boolean)
+    const depth = new Map()
+    for (const b of alive) depth.set(b.id, b.parentId == null ? 0 : depth.get(b.parentId) + 1)
+    const order =
+      branch != null
+        ? [s.branches[branch]].filter(Boolean)
+        : alive.slice().sort((a, b) => depth.get(a.id) - depth.get(b.id) || a.id - b.id)
+    const hits = []
+    let visited = 0
+    let errors = 0
+    try {
+      outer: for (const b of order) {
+        const prefix = this._prefixLen(b.id)
+        s.view = b.id
+        for (let local = 0; local < b.trace.length; local++) {
+          this.positionTo(prefix + local)
+          const r = this.consoleEval(expr)
+          visited++
+          if (r.error) {
+            errors++
+            continue
+          }
+          if (envTruthy(r.value)) {
+            hits.push({ branch: b.id, pos: prefix + local, local, value: r.value })
+            if (hits.length >= limit) break outer
+          }
+        }
+      }
+    } finally {
+      s.view = saveView
+      this.positionTo(savePos)
+    }
+    return { hits, visited, errors }
+  }
+
+  /**
+   * "What would have happened if?" — the counterfactual frontier. Fork the
+   * SAME moment once per candidate edit (breadth-first level of the tree),
+   * record each hypothetical future, and report the outcomes side by side.
+   * With `probe`, the expression is evaluated at each new timeline's end;
+   * with `scan`, also BFS-scan the new timeline for the FIRST state where
+   * the probe turns truthy. All timelines stay recorded and jumpable; the
+   * view returns to where it was.
+   */
+  async whatIf(pos, edits, { probe = null, scan = false, onProgress = null } = {}) {
+    const s = this.session
+    if (!s.finished) throw new Error("no finished recording")
+    const saveView = s.view
+    const savePos = s.pos
+    pos = Math.max(0, Math.min(pos, this._compositeLen(saveView) - 1))
+    const out = []
+    try {
+      for (const edit of edits) {
+        s.view = saveView // every hypothesis forks the SAME state
+        const summary = await this.forkFrom(pos, edit, onProgress)
+        const rec = {
+          edit: edit == null ? null : String(edit),
+          branch: s.view,
+          forkedAt: pos,
+          steps: summary.steps,
+          error: summary.error,
+          result: summary.result,
+          truncated: summary.truncated,
+        }
+        if (probe != null) {
+          this.positionTo(summary.steps - 1)
+          const r = this.consoleEval(probe)
+          rec.probe = r.error ? { error: r.error } : { value: r.value }
+          if (scan) {
+            const found = this.searchAll(probe, { branch: rec.branch, limit: 1 })
+            rec.firstTrue = found.hits.length ? found.hits[0].pos : null
+          }
+        }
+        out.push(rec)
+      }
+    } finally {
+      s.view = saveView
+      this.positionTo(savePos)
+    }
+    return out
   }
 
   // ---- transactional inspection / evaluation ------------------------------
@@ -320,9 +667,11 @@ export class TimeTravelEngine {
   inspect() {
     const s = this.session
     if (!s.finished) return null
-    const cached = s.cachedInspect.get(s.pos)
+    const { branchId, local } = this._mapGlobal(s.view, s.pos)
+    const key = branchId + ":" + local
+    const cached = s.cachedInspect.get(key)
     if (cached) return cached
-    const entry = s.trace[s.pos]
+    const entry = s.branches[branchId].trace[local]
     let parsed = { stack: [], frames: [], globals: [] }
     this._transact = { inspect: null }
     this._deadline = now() + 3000
@@ -348,7 +697,7 @@ export class TimeTravelEngine {
       this._transact = null
       this._deadline = Infinity
     }
-    s.cachedInspect.set(s.pos, parsed)
+    s.cachedInspect.set(key, parsed)
     return parsed
   }
 
@@ -367,7 +716,7 @@ export class TimeTravelEngine {
   consoleEval(src) {
     const s = this.session
     if (!s.finished) return { error: { t: "str", v: "no program loaded" } }
-    const entry = s.trace[s.pos]
+    const entry = this._entryAt(s.pos)
     this._transact = { evalResult: null }
     this.vm.stagedArg = new TextEncoder().encode(String(src))
     this._deadline = now() + 3000
@@ -402,38 +751,61 @@ export class TimeTravelEngine {
   // ---- info ---------------------------------------------------------------
   progress() {
     const s = this.session
+    const steps = s.recBranch ? s.recPrefixLen + s.recBranch.trace.length : this._compositeLen(s.view)
     return {
-      steps: s.trace.length,
+      steps,
       checkpoints: s.store.count,
       memBytes: this.vm.memory.buffer.byteLength,
       cow: s.store.stats(),
     }
   }
 
+  _compositeDirty(bid) {
+    const s = this.session
+    const arr = []
+    for (const { id, upto } of this._segments(bid)) {
+      const counts = s.store.dirtyCounts(id)
+      for (let i = 0; i <= upto; i++) arr.push(counts[i])
+    }
+    return arr
+  }
+
   summary() {
     const s = this.session
+    const b = s.branches[s.view]
     return {
-      steps: s.trace.length,
-      truncated: s.truncated,
+      steps: this._compositeLen(s.view),
+      truncated: b.truncated,
       warnings: s.warnings,
-      error: s.error,
-      result: s.result,
+      error: b.error,
+      result: b.result,
       cow: s.store.stats(),
       suppressedSteps: this.vm.exports.tt_suppressed(),
-      forkedAt: s.forkedAt ?? null,
-      dirtyCounts: s.store.dirtyCounts(),
+      forkedAt: b.forkedAt ?? null,
+      branch: b.id,
+      branches: s.branches.filter(Boolean).length,
+      dirtyCounts: this._compositeDirty(s.view),
       pageHeat: [...s.store.pageHeat.entries()],
       memBytes: this.vm.memory.buffer.byteLength,
     }
   }
 
   get trace() {
-    return this.session ? this.session.trace : []
+    const s = this.session
+    if (!s) return []
+    if (s.branches.length === 1) return s.branches[0].trace
+    return this._composite(s.view)
   }
   get pos() {
     return this.session ? this.session.pos : 0
   }
+  get branch() {
+    return this.session ? this.session.view : 0
+  }
   get consoleEntries() {
-    return this.session ? this.session.consoleEntries : []
+    const s = this.session
+    if (!s) return []
+    if (s.branches.length === 1) return s.branches[0].console
+    return this._consoleComposite(s.view)
   }
 }

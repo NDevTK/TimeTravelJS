@@ -1,4 +1,5 @@
-// Per-step copy-on-write history of the VM's linear memory.
+// Copy-on-write history of the VM's linear memory — a TREE of per-step
+// delta chains.
 //
 // Every executed step gets a delta: the set of pages whose bytes changed
 // since the previous step, stored as immutable page objects deduplicated by
@@ -7,8 +8,17 @@
 // unchanged — copy-on-write in the literal sense: a page is copied exactly
 // when a write made it differ.
 //
+// Chains form the branch structure of the multiverse: chain 0 is the root
+// timeline; a fork opens a new chain whose delta 0 transitions FROM the
+// parent state it was captured against. All chains intern pages into one
+// shared pool and update one shared live table (there is exactly one live
+// memory), so sibling timelines pay only for the pages they actually
+// diverge on — their common prefix is literally the same chain.
+//
 // Navigation applies deltas backward (old refs) or forward (new refs) and
-// never re-executes anything.
+// never re-executes anything. Which deltas to apply — the walk through the
+// tree — is the engine's job; the store only guarantees each chain's
+// transitions are exact both ways.
 //
 // Pages are Uint32Array(256) (1 KB) — word-typed so the capture hot loop
 // compares without allocating views.
@@ -18,8 +28,8 @@ const WORDS = PAGE_SIZE / 4
 
 export class DeltaStore {
   constructor() {
-    this.deltas = [] // deltas[i]: state i-1 → state i; deltas[0] = base image
-    this.liveTable = [] // Uint32Array page refs for the CURRENT position
+    this.chains = [{ deltas: [] }] // chains[id] = {deltas} | null (pruned)
+    this.liveTable = [] // Uint32Array page refs for the CURRENT live state
     this.liveLen = 0
     this.pool = new Map() // hash -> page[] (content-deduplicated pages)
     this.poolBytes = 0
@@ -28,8 +38,25 @@ export class DeltaStore {
     this.pageHeat = new Map() // page index -> times dirtied
   }
 
+  /** root-chain deltas — the whole history when no fork ever happened */
+  get deltas() {
+    return this.chains[0].deltas
+  }
+
   get count() {
-    return this.deltas.length
+    let n = 0
+    for (const c of this.chains) if (c) n += c.deltas.length
+    return n
+  }
+
+  /** open a new chain whose delta 0 will be captured against the CURRENT live state */
+  newChain() {
+    this.chains.push({ deltas: [] })
+    return this.chains.length - 1
+  }
+
+  chainLen(chainId) {
+    return this.chains[chainId] ? this.chains[chainId].deltas.length : 0
   }
 
   _intern(u32, base) {
@@ -93,10 +120,10 @@ export class DeltaStore {
 
   /**
    * Capture the differences between `mem` (Uint8Array over the whole linear
-   * memory) and the live table as the next delta. Full scan; used for the
-   * base image. `excludeRanges` = [[pageLo, pageHi), …] left out of history.
+   * memory) and the live table as the chain's next delta. Full scan; used
+   * for the base image. `excludeRanges` = [[pageLo, pageHi), …] left out.
    */
-  capture(mem, tag = 0, excludeRanges = null) {
+  capture(mem, tag = 0, excludeRanges = null, chainId = 0) {
     const len = mem.byteLength
     const pageCount = Math.ceil(len / PAGE_SIZE)
     const u32 = new Uint32Array(mem.buffer, 0, (len >> 2))
@@ -107,9 +134,10 @@ export class DeltaStore {
     }
     const delta = { changes, oldLen: this.liveLen, newLen: len, tag }
     this.liveLen = len
-    this.deltas.push(delta)
+    const chain = this.chains[chainId].deltas
+    chain.push(delta)
     this.logicalBytes += len
-    return this.deltas.length - 1
+    return chain.length - 1
   }
 
   /**
@@ -117,7 +145,7 @@ export class DeltaStore {
    * Marked-but-unchanged pages are dropped (content compare keeps the store
    * exact and maximally shared).
    */
-  captureFrom(mem, pages, tag = 0) {
+  captureFrom(mem, pages, tag = 0, chainId = 0) {
     const len = mem.byteLength
     const u32 = new Uint32Array(mem.buffer, 0, (len >> 2))
     const changes = []
@@ -128,9 +156,10 @@ export class DeltaStore {
     }
     const delta = { changes, oldLen: this.liveLen, newLen: len, tag }
     this.liveLen = len
-    this.deltas.push(delta)
+    const chain = this.chains[chainId].deltas
+    chain.push(delta)
     this.logicalBytes += len
-    return this.deltas.length - 1
+    return chain.length - 1
   }
 
   /**
@@ -171,9 +200,9 @@ export class DeltaStore {
     mem.set(new Uint8Array(page.buffer, page.byteOffset, PAGE_SIZE), p * PAGE_SIZE)
   }
 
-  /** Apply state transition i-1 → i onto mem (and the live table). */
-  applyForward(i, mem) {
-    const d = this.deltas[i]
+  /** Apply the chain's state transition i-1 → i onto mem (and the live table). */
+  applyForward(i, mem, chainId = 0) {
+    const d = this.chains[chainId].deltas[i]
     for (const [p, , page] of d.changes) {
       this._writePage(mem, p, page)
       this.liveTable[p] = page
@@ -181,9 +210,9 @@ export class DeltaStore {
     this.liveLen = d.newLen
   }
 
-  /** Apply state transition i → i-1 onto mem (and the live table). */
-  applyBackward(i, mem) {
-    const d = this.deltas[i]
+  /** Apply the chain's state transition i → i-1 onto mem (and the live table). */
+  applyBackward(i, mem, chainId = 0) {
+    const d = this.chains[chainId].deltas[i]
     for (const [p, oldPage] of d.changes) {
       if (oldPage) {
         this._writePage(mem, p, oldPage)
@@ -250,25 +279,23 @@ export class DeltaStore {
     return written
   }
 
-  /**
-   * Drop all history after position `pos` (timeline fork). The live table
-   * must already BE at `pos`. Stats are recomputed over what remains.
-   */
-  truncateTo(pos) {
-    if (pos >= this.deltas.length - 1) return
-    this.deltas.length = pos + 1
+  /** Recompute pool/heat/logical stats over the surviving chains. */
+  _rebuild() {
     const seen = new Set()
     let bytes = 0
     let logical = 0
     const heat = new Map()
-    for (const d of this.deltas) {
-      logical += d.newLen
-      for (const [p, oldPage, newPage] of d.changes) {
-        heat.set(p, (heat.get(p) ?? 0) + 1)
-        for (const page of [oldPage, newPage]) {
-          if (page && !seen.has(page)) {
-            seen.add(page)
-            bytes += PAGE_SIZE
+    for (const c of this.chains) {
+      if (!c) continue
+      for (const d of c.deltas) {
+        logical += d.newLen
+        for (const [p, oldPage, newPage] of d.changes) {
+          heat.set(p, (heat.get(p) ?? 0) + 1)
+          for (const page of [oldPage, newPage]) {
+            if (page && !seen.has(page)) {
+              seen.add(page)
+              bytes += PAGE_SIZE
+            }
           }
         }
       }
@@ -292,8 +319,34 @@ export class DeltaStore {
     this.pageHeat = heat
   }
 
+  /**
+   * Drop whole chains (a pruned timeline subtree). The live state must be
+   * on a surviving chain. Chain ids stay stable (slots become null).
+   */
+  prune(deadChainIds) {
+    let any = false
+    for (const id of deadChainIds) {
+      if (id > 0 && this.chains[id]) {
+        this.chains[id] = null
+        any = true
+      }
+    }
+    if (any) this._rebuild()
+  }
+
+  /**
+   * Drop all history after position `pos` of a chain. The live table must
+   * already BE at `pos` on that chain. Used to trim a truncated recording.
+   */
+  truncateTo(pos, chainId = 0) {
+    const chain = this.chains[chainId].deltas
+    if (pos >= chain.length - 1) return
+    chain.length = pos + 1
+    this._rebuild()
+  }
+
   clear() {
-    this.deltas = []
+    this.chains = [{ deltas: [] }]
     this.liveTable = []
     this.liveLen = 0
     this.pool = new Map()
@@ -305,7 +358,7 @@ export class DeltaStore {
 
   stats() {
     return {
-      snapshots: this.deltas.length,
+      snapshots: this.count,
       uniquePages: this.poolPages,
       retainedBytes: this.poolBytes,
       naiveBytes: this.logicalBytes,
@@ -314,8 +367,9 @@ export class DeltaStore {
     }
   }
 
-  /** dirty page count per delta — feeds the timeline/memory visualizations */
-  dirtyCounts() {
-    return this.deltas.map((d) => d.changes.length)
+  /** dirty page count per delta of one chain — feeds the visualizations */
+  dirtyCounts(chainId = 0) {
+    const c = this.chains[chainId]
+    return c ? c.deltas.map((d) => d.changes.length) : []
   }
 }

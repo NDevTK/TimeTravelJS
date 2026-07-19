@@ -50,6 +50,7 @@
     </div>
     <input type="range" id="timeline-slider" class="timeline-slider" min="0" max="0" value="0" step="1" />
     <canvas id="timeline-canvas" class="timeline-canvas" height="46"></canvas>
+    <div id="branch-strip" class="branch-strip" hidden></div>
   </section>
 
   <main class="workspace">
@@ -97,6 +98,20 @@
           <span class="console-chevron">❯</span>
           <input id="console-input" class="console-input" placeholder="Enter: evaluate here (disposable) · Shift+Enter: apply as edit and fork the timeline" />
           <button class="btn fork-btn" id="fork-btn" title="Fork the timeline at this step: discard the future, apply the edit on the left (if any) to the live frame, and let execution continue — recording a new future (Shift+Enter)">⑂ fork</button>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-whatif">
+        <div class="panel-title"><span>what if — counterfactual timelines</span><span class="panel-hint">BFS across branches</span></div>
+        <div class="panel-body whatif-body">
+          <textarea id="whatif-edits" class="whatif-edits" rows="3" spellcheck="false"
+            placeholder="one edit per line — each forks the CURRENT step into its own timeline, e.g.&#10;item.price = 1&#10;item.price = 99"></textarea>
+          <div class="whatif-row">
+            <input id="whatif-probe" class="whatif-probe" spellcheck="false"
+              placeholder="probe (optional): expression to watch, e.g. total > 100" />
+            <button class="btn" id="whatif-run" title="Fork the current step once per edit, record every hypothetical future, and compare them — the original timeline is kept">⑂ explore</button>
+          </div>
+          <div id="whatif-results" class="whatif-results"></div>
         </div>
       </section>
 
