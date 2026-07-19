@@ -84,29 +84,32 @@ is honestly a fork, not a patch):
   snapshot; `Math.random()` gets a fixed seed;
 - a source-filename filter so only user code (`program.js`) produces steps.
 
-### 2. Suspending IS returning (with Asyncify as the fallback)
+### 2. Suspending IS returning (no Asyncify, no stack switching)
 
-Because no C stack spans a step on the stackless path, parking the machine
-is just the dispatch loop *returning to the host*, and resuming is a fresh
-call (`JS_TTCallStart`/`JS_TTCallResume`). The suspended machine has **no
-wasm activation at all** — its complete state is linear memory, restorable
-from any snapshot by construction.
+Parking the machine is just the dispatch loop *returning to the host*, and
+resuming is a fresh call (`JS_TTCallStart`/`JS_TTCallResume`). The
+suspended machine has **no wasm activation at all** — its complete state is
+linear memory, restorable from any snapshot by construction. Everything
+that used to need a C frame between the loop and user code was converted:
+constructors, generator creation and resumption, async function segments,
+promise reaction / thenable jobs and timer callbacks run **in the loop**
+via pre/post protocol halves shared verbatim with the classic C paths, and
+the callback-taking Array builtins are self-hosted in the debug runtime.
+The Asyncify pass is gone from the build entirely.
 
-Steps reached while native C frames are genuinely live — a `sort`
-comparator, a getter invoked from a C path, generator bodies, promise
-jobs — still suspend through Binaryen's **Asyncify** pass: the C stack
-unwinds into a fixed buffer inside the data segment and the engine records
-the one wasm global (the shadow stack pointer) that a rewind needs. The
-recorder mixes both freely, per step; the test suite pins each path.
+The narrow residue — user code invoked synchronously from *inside* an
+unconverted C builtin (a getter reached from a C path, proxy traps,
+`toPrimitive` coercions, async generators) — executes normally but cannot
+become a snapshot; such steps are counted honestly as
+`summary.suppressedSteps`.
 
-The driver (`src/vm.js`) owns both protocols in ~250 lines: park-by-return,
-one suspendable import for the fallback, deterministic WASI shims. No
-Emscripten, no handles, no FFI layer.
+The driver (`src/vm.js`) is one protocol and ~150 lines: park-by-return
+plus deterministic WASI shims. No Emscripten, no handles, no FFI layer.
 
 ### 3. Copy-on-write history with a hardware-style write barrier
 
 WebAssembly has no MMU page traps, so the build synthesizes them:
-`native/barrier.mjs` is a post-Asyncify bytecode pass that rewrites **every
+`native/barrier.mjs` is a wasm bytecode pass that rewrites **every
 store instruction** (plus `memory.copy`/`fill`/`init`) to also mark its 1 KB
 page in a dirty map inside the data segment. Each step then captures
 O(pages written) instead of O(heap): the recorder reads-and-clears the map,
@@ -119,15 +122,12 @@ memory after every step to prove the barrier misses nothing.
 
 ### 4. Inspection is a disposable transaction
 
-At a return-parked position it barely deserves the name: restore P's pages
-and *call* the inspector — the restored memory **is** the parked machine,
-its frame chain live and walkable, repeatably, with nothing to rewind. At an
-Asyncify position, inspection is a one-shot transaction: restore the pages
-and the recorded stack pointer, rewind into the suspension, run the
-inspector or a console evaluation inside the live interpreter, abort the
-disposable activation. Either way, whatever the transaction touched is
-healed from the page store afterwards. Recorded history is immutable no
-matter what an evaluation does.
+It barely deserves the name: restore position P's pages and *call* the
+inspector — the restored memory **is** the parked machine, its frame chain
+live and walkable, repeatably, with nothing to rewind and no stack state
+outside linear memory. Whatever the inspection or console evaluation
+touched is healed from the page store afterwards. Recorded history is
+immutable no matter what an evaluation does.
 
 ### 5. Forking is the same machinery, allowed to commit
 
@@ -178,11 +178,10 @@ site nor the tests require a C toolchain.
   compare). Recordings are still capped (default 20 000 steps, 256 MB
   retained); the recorded prefix of a truncated run is fully navigable.
   Opcode granularity multiplies step counts ~5–15×.
-- Steps under genuinely live C frames (sort comparators, getters reached
-  from C paths, generator bodies, promise jobs, constructors) suspend via
-  the Asyncify fallback rather than by return — same capabilities, plus a
-  one-rewind-per-activation rule for inspections there. Converting those
-  reentry sites to the stackless path is the remaining migration.
+- Steps inside user code invoked synchronously from an unconverted C
+  builtin (getters reached from C paths, proxy trap handlers, `toPrimitive`
+  coercions, async generator bodies) execute correctly but cannot become
+  snapshots — they are counted per recording as `suppressedSteps`.
 - Inlined tail calls keep the caller's frame: proper-tail-call space
   guarantees are traded for park-anywhere (depth is bounded by the 2 MB
   frame arena, ~18 000 frames).
@@ -194,6 +193,26 @@ site nor the tests require a C toolchain.
   timing is virtual by design.
 - One recording session lives in the VM at a time; pressing Record resets the
   context (the wasm instance is reused).
+
+## Conformance: tc39/test262
+
+The rewritten core is checked against the full conformance suite with the
+official `run-test262` harness compiled natively against this repo's
+`quickjs.c`: **49 / 43 790 errors — the failing-test list is byte-identical
+to pristine QuickJS 2026-06-04**, before and after every stage of the
+stackless migration (inlined calls, arena frames, constructor/generator/
+async conversion, job pumps). The rewrite is semantics-preserving across
+the language surface.
+
+On top of that, `tools/test262-stepped.mjs` runs a corpus sample through
+the ENGINE with per-step snapshotting enabled and lets each test's own
+assertions judge: stepping does not alter semantics (the one deliberate
+exception: proper-tail-call *space* guarantees — inlined tail calls keep
+the caller frame, so `tco-*` tests exhaust the frame arena by design).
+
+```
+node tools/test262-stepped.mjs <path-to-test262-clone> test/language/statements 7
+```
 
 ## License
 
