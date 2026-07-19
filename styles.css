@@ -419,3 +419,9 @@ body {
 .footer a { color: var(--accent); text-decoration: none; }
 .footer a:hover { text-decoration: underline; }
 .footer em { color: var(--accent-2); font-style: normal; }
+
+/* ---- v6: DOM document panels ---- */
+.html-title { border-top: 1px solid var(--border, #2a2f3a); margin-top: 6px; }
+.html-input { min-height: 84px; max-height: 160px; resize: vertical; width: 100%; box-sizing: border-box; }
+.dom-body { padding: 0; }
+.dom-preview { width: 100%; height: 180px; border: 0; background: #fff; border-radius: 0 0 8px 8px; }

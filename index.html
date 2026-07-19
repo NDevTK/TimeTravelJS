@@ -65,6 +65,11 @@
           <textarea id="code-input" class="code-input" spellcheck="false" autocomplete="off" wrap="off"></textarea>
         </div>
       </div>
+      <div class="panel-title html-title">
+        <span>document (html)</span>
+        <span class="panel-hint">optional — parsed by the embedded engine; the DOM time-travels with the JS</span>
+      </div>
+      <textarea id="html-input" class="code-input html-input" spellcheck="false" autocomplete="off" wrap="off" placeholder="&lt;ul id=&quot;list&quot;&gt;&lt;/ul&gt;"></textarea>
     </section>
 
     <section class="side">
@@ -76,6 +81,13 @@
       <section class="panel" id="panel-stack">
         <div class="panel-title"><span>call stack</span></div>
         <div class="panel-body" id="stack-body"><div class="empty-note">—</div></div>
+      </section>
+
+      <section class="panel" id="panel-dom" hidden>
+        <div class="panel-title"><span>document — at this step</span><span class="panel-hint">the DOM rewinds with the timeline</span></div>
+        <div class="panel-body dom-body">
+          <iframe id="dom-preview" class="dom-preview" sandbox="allow-same-origin" title="document preview"></iframe>
+        </div>
       </section>
 
       <section class="panel panel-console" id="panel-console">

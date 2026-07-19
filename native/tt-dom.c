@@ -109,7 +109,7 @@ void tt_dom_destroy(void)
         g_dom_sel = NULL;
     }
     if (g_dom_doc) {
-        lxb_html_document_css_destroy(g_dom_doc);
+        lxb_style_destroy(g_dom_doc);
         lxb_html_document_destroy(g_dom_doc);
         g_dom_doc = NULL;
     }
@@ -121,9 +121,8 @@ int tt_dom_load_html(const char *html, size_t len)
     g_dom_doc = lxb_html_document_create();
     if (!g_dom_doc)
         return 1;
-    if (lxb_html_document_css_init(g_dom_doc, true) != LXB_STATUS_OK)
+    if (lxb_style_init(g_dom_doc) != LXB_STATUS_OK)
         return 2;
-    lxb_html_document_style_mutation_init(g_dom_doc);
     if (lxb_html_document_parse(g_dom_doc, (const lxb_char_t *)html, len)
         != LXB_STATUS_OK)
         return 3;
@@ -314,7 +313,8 @@ static JSValue js_dom_data_get(JSContext *ctx, JSValueConst t, int argc, JSValue
     lxb_dom_node_t *node = tt_dom_node_arg(ctx, argv[0]);
     lxb_dom_character_data_t *cd;
     if (!node || (node->type != LXB_DOM_NODE_TYPE_TEXT &&
-                  node->type != LXB_DOM_NODE_TYPE_COMMENT))
+                  node->type != LXB_DOM_NODE_TYPE_COMMENT &&
+                  node->type != LXB_DOM_NODE_TYPE_PROCESSING_INSTRUCTION))
         return JS_NULL;
     cd = lxb_dom_interface_character_data(node);
     return JS_NewStringLen(ctx, (const char *)cd->data.data, cd->data.length);
@@ -535,41 +535,87 @@ static JSValue js_dom_by_attr(JSContext *ctx, JSValueConst t, int argc, JSValueC
     return r;
 }
 
-/* cascaded style of one element → "prop: value; prop2: v2" pieces as a
-   JS array [name, value, name, value, ...] */
+/* fresh selector re-match of one element against every attached
+   stylesheet (Lexbor's mutation steps only track the style attribute, so
+   class/attribute changes require matching at read time). Returns a flat
+   array [specificity, "decls", specificity, "decls", ...] in document
+   order; the setup runtime cascades. */
 typedef struct {
-    JSContext *ctx;
-    JSValue arr;
-    uint32_t i;
-} tt_style_ctx_t;
+    uint32_t max_spec;
+    int hit;
+} tt_match_spec_t;
 
-static lxb_status_t tt_style_cb(lxb_dom_element_t *el,
-                                const lxb_css_rule_declaration_t *declr,
-                                void *ud, lxb_css_selector_specificity_t spec,
-                                bool is_weak)
+static lxb_status_t tt_match_spec_cb(lxb_dom_node_t *node,
+                                     lxb_css_selector_specificity_t spec,
+                                     void *ud)
 {
-    tt_style_ctx_t *sc = ud;
-    tt_buf_t decl = { 0 };
-    /* serialized as "name: value"; the setup runtime splits it */
-    lxb_css_rule_declaration_serialize(declr, tt_buf_cb, &decl);
-    JS_SetPropertyUint32(sc->ctx, sc->arr, sc->i++,
-                         JS_NewStringLen(sc->ctx, decl.p ? decl.p : "", decl.len));
-    free(decl.p);
+    tt_match_spec_t *m = ud;
+    m->hit = 1;
+    if ((uint32_t)spec > m->max_spec)
+        m->max_spec = (uint32_t)spec;
     return LXB_STATUS_OK;
+}
+
+static void tt_dom_match_rules(JSContext *ctx, lxb_dom_node_t *node,
+                               lxb_css_rule_t *rule, JSValue arr, uint32_t *i)
+{
+    while (rule) {
+        switch (rule->type) {
+        case LXB_CSS_RULE_LIST:
+            tt_dom_match_rules(ctx, node, lxb_css_rule_list(rule)->first, arr, i);
+            break;
+        case LXB_CSS_RULE_STYLE: {
+            lxb_css_rule_style_t *st = lxb_css_rule_style(rule);
+            tt_match_spec_t m = { 0, 0 };
+            if (st->selector && st->declarations) {
+                lxb_selectors_clean(g_dom_sel);
+                lxb_selectors_match_node(g_dom_sel, node, st->selector,
+                                         tt_match_spec_cb, &m);
+                if (m.hit) {
+                    tt_buf_t decl = { 0 };
+                    lxb_css_rule_declaration_list_serialize(st->declarations,
+                                                            tt_buf_cb, &decl);
+                    JS_SetPropertyUint32(ctx, arr, (*i)++,
+                                         JS_NewUint32(ctx, m.max_spec));
+                    JS_SetPropertyUint32(ctx, arr, (*i)++,
+                                         JS_NewStringLen(ctx, decl.p ? decl.p : "",
+                                                         decl.len));
+                    free(decl.p);
+                }
+            }
+            break;
+        }
+        default:
+            break;
+        }
+        rule = rule->next;
+    }
 }
 
 static JSValue js_dom_computed(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv)
 {
     lxb_dom_node_t *node = tt_dom_node_arg(ctx, argv[0]);
-    tt_style_ctx_t sc;
-    if (!node || node->type != LXB_DOM_NODE_TYPE_ELEMENT)
-        return JS_NewArray(ctx);
-    sc.ctx = ctx;
-    sc.arr = JS_NewArray(ctx);
-    sc.i = 0;
-    lxb_dom_element_style_walk(lxb_dom_interface_element(node), tt_style_cb,
-                               &sc, false);
-    return sc.arr;
+    lxb_dom_document_css_t *css;
+    JSValue arr = JS_NewArray(ctx);
+    uint32_t i = 0;
+    size_t k;
+    if (!node || node->type != LXB_DOM_NODE_TYPE_ELEMENT || !g_dom_doc)
+        return arr;
+    css = lxb_dom_interface_document(g_dom_doc)->css;
+    if (!css || !css->stylesheets)
+        return arr;
+    for (k = 0; k < lexbor_array_length(css->stylesheets); k++) {
+        lxb_css_stylesheet_t *sst = lexbor_array_get(css->stylesheets, k);
+        if (sst && sst->root) {
+            if (sst->root->type == LXB_CSS_RULE_LIST ||
+                sst->root->type == LXB_CSS_RULE_STYLESHEET)
+                tt_dom_match_rules(ctx, node,
+                                   lxb_css_rule_list(sst->root)->first, arr, &i);
+            else
+                tt_dom_match_rules(ctx, node, sst->root, arr, &i);
+        }
+    }
+    return arr;
 }
 
 /* stylesheet text appended at runtime (beyond <style> elements, which the
@@ -594,6 +640,48 @@ static JSValue js_dom_add_css(JSContext *ctx, JSValueConst t, int argc, JSValueC
         lxb_css_parser_destroy(p, true);
     JS_FreeCString(ctx, css);
     return JS_UNDEFINED;
+}
+
+static JSValue js_dom_ns(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv)
+{
+    lxb_dom_node_t *n = tt_dom_node_arg(ctx, argv[0]);
+    const char *nm = "";
+    if (n && n->ns == LXB_NS_SVG)
+        nm = "svg";
+    else if (n && n->ns == LXB_NS_MATH)
+        nm = "math";
+    return JS_NewString(ctx, nm);
+}
+
+static JSValue js_dom_doctype_ids(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv)
+{
+    lxb_dom_node_t *n = tt_dom_node_arg(ctx, argv[0]);
+    JSValue arr = JS_NewArray(ctx);
+    if (n && n->type == LXB_DOM_NODE_TYPE_DOCUMENT_TYPE) {
+        lxb_dom_document_type_t *dt = lxb_dom_interface_document_type(n);
+        size_t nlen = 0;
+        const lxb_char_t *nm = lxb_dom_document_type_name(dt, &nlen);
+        JS_SetPropertyUint32(ctx, arr, 0,
+                             JS_NewStringLen(ctx, nm ? (const char *)nm : "", nlen));
+        JS_SetPropertyUint32(ctx, arr, 1,
+                             JS_NewStringLen(ctx, (const char *)dt->public_id.data,
+                                             dt->public_id.length));
+        JS_SetPropertyUint32(ctx, arr, 2,
+                             JS_NewStringLen(ctx, (const char *)dt->system_id.data,
+                                             dt->system_id.length));
+    }
+    return arr;
+}
+
+static JSValue js_dom_template_content(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv)
+{
+    lxb_dom_node_t *n = tt_dom_node_arg(ctx, argv[0]);
+    if (n && n->type == LXB_DOM_NODE_TYPE_ELEMENT &&
+        n->local_name == LXB_TAG_TEMPLATE && n->ns == LXB_NS_HTML) {
+        lxb_html_template_element_t *te = lxb_html_interface_template(n);
+        return tt_dom_node_ret(ctx, te->content);
+    }
+    return tt_dom_node_ret(ctx, NULL);
 }
 
 static const JSCFunctionListEntry tt_dom_funcs[] = {
@@ -630,6 +718,9 @@ static const JSCFunctionListEntry tt_dom_funcs[] = {
     JS_CFUNC_DEF("byAttr", 3, js_dom_by_attr),
     JS_CFUNC_DEF("computed", 1, js_dom_computed),
     JS_CFUNC_DEF("addCss", 1, js_dom_add_css),
+    JS_CFUNC_DEF("ns", 1, js_dom_ns),
+    JS_CFUNC_DEF("doctypeIds", 1, js_dom_doctype_ids),
+    JS_CFUNC_DEF("templateContent", 1, js_dom_template_content),
 };
 
 void tt_dom_register(JSContext *ctx)

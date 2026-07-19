@@ -131,6 +131,48 @@ console.log("main script done, rolled dice:", Math.floor(Math.random() * 6) + 1)
 `,
   },
   {
+    id: "dom",
+    name: "DOM + CSS (document time travel)",
+    html: `<style>
+  li { color: #345; }
+  li.done { color: #9a9; }
+</style>
+<h1 id="title">todos</h1>
+<ul id="list"></ul>
+<p id="status">empty</p>
+`,
+    code: `// The document lives INSIDE the machine: scrub the timeline and watch
+// the preview panel replay every mutation, style change, and event.
+const list = document.getElementById("list");
+const status = document.getElementById("status");
+
+function addTodo(text) {
+  const li = document.createElement("li");
+  li.textContent = text;
+  li.addEventListener("toggle", () => {
+    li.classList.toggle("done");
+    li.style.textDecoration = li.matches(".done") ? "line-through" : "";
+  });
+  list.appendChild(li);
+  status.textContent = list.children.length + " item(s)";
+  return li;
+}
+
+const todos = ["invent time machine", "test time machine", "profit"];
+const items = todos.map(addTodo);
+
+// events dispatch through capture/target/bubble like a real DOM
+items[1].dispatchEvent(new Event("toggle"));
+items[0].dispatchEvent(new Event("toggle"));
+items[0].dispatchEvent(new Event("toggle")); // undo the first one
+
+const done = document.querySelectorAll("li.done").length;
+status.textContent = done + " of " + items.length + " done";
+console.log("done item:", document.querySelector("li.done"));
+console.log("computed color:", getComputedStyle(items[1]).color);
+`,
+  },
+  {
     id: "crash",
     name: "Debug a crash (travel back from an error)",
     code: `// This program crashes. Jump to the end, then step BACKWARD to find out

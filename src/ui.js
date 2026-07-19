@@ -153,6 +153,9 @@ export class DebuggerUI {
 
     this.els = {
       sampleSelect: $("#sample-select"),
+      htmlInput: $("#html-input"),
+      domPanel: $("#panel-dom"),
+      domFrame: $("#dom-preview"),
       granularitySelect: $("#granularity-select"),
       runBtn: $("#run-btn"),
       status: $("#status-pill"),
@@ -192,6 +195,7 @@ export class DebuggerUI {
       const sample = SAMPLES.find((s) => s.id === this.els.sampleSelect.value)
       if (sample) {
         this.els.code.value = sample.code
+        if (this.els.htmlInput) this.els.htmlInput.value = sample.html || ""
         this.refreshGutter()
         this.record()
       }
@@ -419,9 +423,13 @@ export class DebuggerUI {
     this.els.runBtn.disabled = true
     this.setStatus("busy", "recording…")
     try {
+      const htmlSrc = this.els.htmlInput?.value ?? ""
       const summary = await this.engine.run(
         this.els.code.value,
-        { granularity: this.els.granularitySelect?.value === "opcode" ? "opcode" : "line" },
+        {
+          granularity: this.els.granularitySelect?.value === "opcode" ? "opcode" : "line",
+          html: htmlSrc.trim() ? htmlSrc : undefined,
+        },
         (p) => this.setStatus("busy", `recording… ${p.steps} steps · ${p.checkpoints} snapshots`),
       )
       const cow = summary.cow
@@ -597,6 +605,21 @@ export class DebuggerUI {
     }
   }
 
+  renderDom(ins) {
+    const { domPanel, domFrame } = this.els
+    if (!domPanel || !domFrame) return
+    if (!ins || ins.dom == null) {
+      domPanel.hidden = true
+      this._lastDom = null
+      return
+    }
+    domPanel.hidden = false
+    if (ins.dom !== this._lastDom) {
+      this._lastDom = ins.dom
+      domFrame.srcdoc = ins.dom
+    }
+  }
+
   renderInspection() {
     const { varsBody, stackBody, varsHint } = this.els
     varsBody.textContent = ""
@@ -607,6 +630,7 @@ export class DebuggerUI {
       return
     }
     const ins = this.engine.inspect() // {stack, frames, globals} — innermost first
+    this.renderDom(ins)
     const entry = this.currentEntry()
     const frameIdx = Math.min(this.selectedFrame ?? 0, Math.max(0, (ins.frames?.length ?? 1) - 1))
     varsHint.textContent = entry && entry.l ? `line ${entry.l}` : entry?.end ? "program finished" : ""
