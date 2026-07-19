@@ -18965,7 +18965,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto async_init_call;
                     goto gen_init_call;
                 }
-                /* stackless: unwrap bound-function chains in-loop */
+                /* stackless: unwrap bound-function chains in-loop (not in
+                   tail position: BOUND frames push their result and resume
+                   at cur_pc, but a tail opcode has no continuation) */
                 if (opcode != OP_tail_call &&
                     JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
                     JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_BOUND_FUNCTION) {
@@ -19113,11 +19115,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto gen_init_call;
                 }
                 /* stackless: bound chains and Function.prototype
-                   call/apply unwrap in-loop */
-                if (opcode == OP_call_method &&
+                   call/apply unwrap in-loop (tail calls too) */
+                if ((opcode == OP_call_method || opcode == OP_tail_call_method) &&
                     JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT) {
                     JSObject *cfp = JS_VALUE_GET_OBJ(call_argv[-1]);
-                    if (cfp->class_id == JS_CLASS_BOUND_FUNCTION) {
+                    if (cfp->class_id == JS_CLASS_BOUND_FUNCTION &&
+                        opcode == OP_call_method) {
                         uw_base = -2;
                         goto unwrap_bound;
                     }
@@ -19125,6 +19128,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         cfp->u.cfunc.cproto == JS_CFUNC_generic &&
                         cfp->u.cfunc.c_function.generic == js_function_call &&
                         cfp->u.cfunc.realm == ctx && /* realm of thrown errors */
+                        /* tail form only from normal callers: it must
+                           flow through TAIL_METHOD's goto-done, and a
+                           non-normal caller cannot host a TAIL frame */
+                        (opcode == OP_call_method ||
+                         b->func_kind == JS_FUNC_NORMAL) &&
                         JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT &&
                         JS_VALUE_GET_OBJ(call_argv[-2])->class_id == JS_CLASS_BYTECODE_FUNCTION) {
                         if (unlikely(js_poll_interrupts(ctx)))
@@ -19136,7 +19144,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pf_argc = call_argc > 0 ? call_argc - 1 : 0;
                         pf_argv = call_argc > 0 ? call_argv + 1 : NULL;
                         pf_flags = 0;
-                        pf_kind = TT_FRAME_CALL_METHOD;
+                        pf_kind = (opcode == OP_tail_call_method &&
+                                   b->func_kind == JS_FUNC_NORMAL)
+                                  ? TT_FRAME_TAIL_METHOD : TT_FRAME_CALL_METHOD;
                         pf_ctor_this = JS_UNDEFINED;
                         pf_aux_i = 0;
                         pf_cargc = call_argc; /* pop the ORIGINAL call shape */
@@ -19144,6 +19154,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto push_frame;
                     }
                     if (cfp->class_id == JS_CLASS_C_FUNCTION &&
+                        opcode == OP_call_method && /* APPLY frames push their result */
                         cfp->u.cfunc.cproto == JS_CFUNC_generic_magic &&
                         cfp->u.cfunc.c_function.generic_magic == js_function_apply &&
                         cfp->u.cfunc.magic == 0 &&
