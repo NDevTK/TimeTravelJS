@@ -9,7 +9,7 @@
  #define CONFIG_ATOMICS
  #endif
  
-@@ -360,6 +360,36 @@
+@@ -360,6 +360,48 @@
      JSInterruptHandler *interrupt_handler;
      void *interrupt_opaque;
  
@@ -42,11 +42,23 @@
 +    JSValue tt_job_vals[4];
 +    void *tt_job_aux;         /* kind 2: JSAsyncFunctionState* */
 +    JSContext *tt_job_realm;  /* held ref while parked */
++    /* one-shot defer slot: when set, a BYTECODE getter/setter reached by
++       the property machinery is handed back (dup'd into the slot, slot
++       cleared) instead of being invoked from C — the dispatch loop then
++       runs it in-loop. */
++    JSValue *tt_defer_slot;
++    /* staged defer for opcodes whose key must be coerced first: promoted to
++       tt_defer_slot by JS_Get/SetPropertyValue after ToPropertyKey, so the
++       coercion itself can never consume the defer */
++    JSValue *tt_defer_pending;
++    int tt_defer_kind;  /* armed intent: 1 = accessor sites */
++    void *tt_defer_aux; /* proxy-get handoff: arena block [target, key,
++                           receiver, handler]; set with the deferred trap */
 +
      JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
      void *host_promise_rejection_tracker_opaque;
  
-@@ -409,7 +439,7 @@
+@@ -409,7 +451,7 @@
      JSValue cur_func; /* current function, JS_UNDEFINED if the frame is detached */
      JSValue *arg_buf; /* arguments */
      JSValue *var_buf; /* variables */
@@ -55,7 +67,7 @@
      const uint8_t *cur_pc; /* only used in bytecode functions : PC of the
                          instruction after the call */
      int arg_count;
-@@ -417,8 +447,46 @@
+@@ -417,8 +459,72 @@
      /* only used in generators. Current stack pointer value. NULL if
         the function is running. */
      JSValue *cur_sp;
@@ -97,12 +109,38 @@
 +    TT_FRAME_GEN,           /* generator body resumed in-loop (heap frame)  */
 +    TT_FRAME_GEN_INIT,      /* generator creation prologue run in-loop      */
 +    TT_FRAME_ASYNC,         /* async function first segment run in-loop     */
++    TT_FRAME_FOROF,         /* user iterator next() for OP_for_of_next      */
++    TT_FRAME_ITERNEXT,      /* user iterator next() for OP_iterator_next    */
++    TT_FRAME_ITERCALL,      /* user iterator throw/return for OP_iterator_call */
++    TT_FRAME_GETTER,        /* deferred bytecode getter (shape in tt_aux_i)  */
++    TT_FRAME_SETTER,        /* deferred bytecode setter (shape in tt_aux_i)  */
++    TT_FRAME_BOUND_CALL,    /* unwrapped bound chain, OP_call shape          */
++    TT_FRAME_BOUND_METHOD,  /* unwrapped bound chain, OP_call_method shape   */
++    TT_FRAME_APPLY,         /* f.apply(this, array): owned flattened argv    */
++    TT_FRAME_TOPRIM,        /* OrdinaryToPrimitive method run in-loop        */
++    TT_FRAME_HASINST,       /* bytecode Symbol.hasInstance for OP_instanceof */
++    TT_FRAME_FOROF_START,   /* bytecode Symbol.iterator for OP_for_of_start  */
++    TT_FRAME_PROXY_GET,     /* bytecode proxy get trap; post = invariant check */
++    TT_FRAME_AGEN,          /* async generator body driven in-loop            */
++    TT_FRAME_AGEN_INIT,     /* async generator creation prologue in-loop      */
++    TT_FRAME_APPEND_START,  /* bytecode Symbol.iterator for OP_append (spread)*/
++    TT_FRAME_APPEND_NEXT,   /* bytecode next() for one OP_append element      */
++};
++
++/* how a TT_FRAME_GEN resume returns its value to the caller (tt_aux_i is
++   magic | (shape << 8) | (extra << 16)) */
++enum {
++    TT_GENSHAPE_METHOD = 0, /* gen.next(...) call: pop 2+argc, push result obj */
++    TT_GENSHAPE_FOROF,      /* OP_for_of_next: raw value/done, extra = offset byte */
++    TT_GENSHAPE_ITERNEXT,   /* OP_iterator_next: replace sp[-1] with result obj */
++    TT_GENSHAPE_ITERCALL,   /* OP_iterator_call: replace sp[-1], push false */
++    TT_GENSHAPE_APPEND,     /* OP_append element: define into array, pump on */
 +};
 +
  typedef enum {
      JS_GC_OBJ_TYPE_JS_OBJECT,
      JS_GC_OBJ_TYPE_FUNCTION_BYTECODE,
-@@ -2081,6 +2149,9 @@
+@@ -2081,6 +2187,9 @@
      rt->malloc_ctx.mf = *mf;
      rt->malloc_ctx.malloc_state = ms;
      rt->malloc_gc_threshold = 256 * 1024;
@@ -112,7 +150,7 @@
  
      init_list_head(&rt->context_list);
      init_list_head(&rt->gc_obj_list);
-@@ -2134,6 +2205,10 @@
+@@ -2134,6 +2243,10 @@
  }
  
  /* default memory allocation functions with memory limitation */
@@ -123,7 +161,7 @@
  static size_t js_def_malloc_usable_size(const void *ptr)
  {
  #if defined(__APPLE__)
-@@ -2142,7 +2217,7 @@
+@@ -2142,7 +2255,7 @@
      return _msize((void *)ptr);
  #elif defined(__EMSCRIPTEN__)
      return 0;
@@ -132,7 +170,7 @@
      return malloc_usable_size((void *)ptr);
  #else
      /* change this to `return 0;` if compilation fails */
-@@ -2408,6 +2483,10 @@
+@@ -2408,6 +2521,10 @@
      int i;
  
      JS_FreeValueRT(rt, rt->current_exception);
@@ -143,7 +181,7 @@
  
      list_for_each_safe(el, el1, &rt->job_list) {
          JSJobEntry *e = list_entry(el, JSJobEntry, link);
-@@ -7499,6 +7578,160 @@
+@@ -7499,6 +7616,160 @@
      return 0;
  }
  
@@ -304,7 +342,127 @@
  /* return a string property without executing arbitrary JS code (used
     when dumping the stack trace or in debug print). */
  static const char *get_prop_string(JSContext *ctx, JSValueConst obj, JSAtom prop)
-@@ -17584,6 +17817,74 @@
+@@ -8274,6 +8545,15 @@
+                         return JS_UNDEFINED;
+                     } else {
+                         JSValue func = JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter);
++                        /* TimeTravelJS: hand a bytecode getter back to the
++                           dispatch loop instead of invoking it from C */
++                        if (unlikely(ctx->rt->tt_defer_slot != NULL) &&
++                            ctx->rt->tt_defer_kind == 1 &&
++                            pr->u.getset.getter->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++                            *ctx->rt->tt_defer_slot = JS_DupValue(ctx, func);
++                            ctx->rt->tt_defer_slot = NULL;
++                            return JS_UNINITIALIZED;
++                        }
+                         /* Note: the field could be removed in the getter */
+                         func = JS_DupValue(ctx, func);
+                         return JS_CallFree(ctx, func, this_obj, 0, NULL);
+@@ -9031,6 +9311,7 @@
+ {
+     JSAtom atom;
+     JSValue ret;
++    JSValue *tt_pending;
+ 
+     if (likely(JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT &&
+                JS_VALUE_GET_TAG(prop) == JS_TAG_INT)) {
+@@ -9086,6 +9367,9 @@
+         }
+     } else {
+     slow_path:
++        /* the staged defer must not be consumable during key coercion */
++        tt_pending = ctx->rt->tt_defer_pending;
++        ctx->rt->tt_defer_pending = NULL;
+         /* ToObject() must be done before ToPropertyKey() */
+         if (JS_IsNull(this_obj) || JS_IsUndefined(this_obj)) {
+             JS_FreeValue(ctx, prop);
+@@ -9095,7 +9379,9 @@
+         JS_FreeValue(ctx, prop);
+         if (unlikely(atom == JS_ATOM_NULL))
+             return JS_EXCEPTION;
++        ctx->rt->tt_defer_slot = tt_pending;
+         ret = JS_GetProperty(ctx, this_obj, atom);
++        ctx->rt->tt_defer_slot = NULL;
+         JS_FreeAtom(ctx, atom);
+         return ret;
+     }
+@@ -9410,6 +9696,15 @@
+     JSValue ret, func;
+     if (likely(setter)) {
+         func = JS_MKPTR(JS_TAG_OBJECT, setter);
++        /* TimeTravelJS: hand a bytecode setter back to the dispatch loop
++           (val stays owned by the caller's stack slot) */
++        if (unlikely(ctx->rt->tt_defer_slot != NULL) &&
++            ctx->rt->tt_defer_kind == 1 &&
++            setter->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++            *ctx->rt->tt_defer_slot = JS_DupValue(ctx, func);
++            ctx->rt->tt_defer_slot = NULL;
++            return -2;
++        }
+         /* Note: the field could be removed in the setter */
+         func = JS_DupValue(ctx, func);
+         ret = JS_CallFree(ctx, func, this_obj, 1, (JSValueConst *)&val);
+@@ -15137,7 +15432,6 @@
+             JS_FreeValue(ctx, op2);
+             goto exception;
+         }
+-
+         op2 = JS_ToPrimitiveFree(ctx, op2, HINT_NONE);
+         if (JS_IsException(op2)) {
+             JS_FreeValue(ctx, op1);
+@@ -16724,6 +17018,51 @@
+     return 0;
+ }
+ 
++/* TimeTravelJS stackless: finish OP_for_of_next after the iterator's next
++   produced (val, done) with done 0 = yielded value, 1 = completed,
++   2 = raw result object. Mirrors JS_IteratorNext + js_for_of_next exactly. */
++static __exception int tt_forof_finish(JSContext *ctx, JSValue *sp, int offset,
++                                       JSValue val, int done)
++{
++    JSValue value = JS_UNDEFINED;
++    int d = 1;
++
++    if (JS_IsException(val))
++        goto fail;
++    if (done == 0) {
++        value = val;
++        d = 0;
++    } else if (done != 2) {
++        JS_FreeValue(ctx, val);
++        value = JS_UNDEFINED;
++        d = 1;
++    } else {
++        JSValue done_val = JS_GetProperty(ctx, val, JS_ATOM_done);
++        if (JS_IsException(done_val)) {
++            JS_FreeValue(ctx, val);
++            goto fail;
++        }
++        d = JS_ToBoolFree(ctx, done_val);
++        value = JS_UNDEFINED;
++        if (!d)
++            value = JS_GetProperty(ctx, val, JS_ATOM_value);
++        JS_FreeValue(ctx, val);
++        if (JS_IsException(value))
++            goto fail;
++    }
++    if (d) {
++        JS_FreeValue(ctx, sp[offset]);
++        sp[offset] = JS_UNDEFINED;
++    }
++    sp[0] = value;
++    sp[1] = JS_NewBool(ctx, d);
++    return 0;
++ fail:
++    JS_FreeValue(ctx, sp[offset]);
++    sp[offset] = JS_UNDEFINED;
++    return -1;
++}
++
+ static __exception int js_for_await_of_next(JSContext *ctx, JSValue *sp)
+ {
+     JSValue obj, iter, next;
+@@ -17584,6 +17923,218 @@
  
  #define JS_CALL_FLAG_COPY_ARGV   (1 << 1)
  #define JS_CALL_FLAG_GENERATOR   (1 << 2)
@@ -349,7 +507,121 @@
 +    rt->tt_arena_top = (uint8_t *)sf;
 +}
 +
++/* raw value block from the arena (for synthesized argument vectors); freed
++   by repointing the arena top at it */
++static JSValue *tt_arena_alloc_vals(JSRuntime *rt, size_t n)
++{
++    size_t size;
++    uint8_t *base;
++
++    if (unlikely(!rt->tt_arena_base)) {
++        rt->tt_arena_base = js_malloc_rt(rt, TT_FRAME_ARENA_SIZE);
++        if (!rt->tt_arena_base)
++            return NULL;
++        rt->tt_arena_top = rt->tt_arena_base;
++        rt->tt_arena_limit = rt->tt_arena_base + TT_FRAME_ARENA_SIZE;
++    }
++    size = (sizeof(JSValue) * n + 15) & ~(size_t)15;
++    base = rt->tt_arena_top;
++    if (unlikely(size > (size_t)(rt->tt_arena_limit - base)))
++        return NULL;
++    rt->tt_arena_top = base + size;
++    return (JSValue *)base;
++}
++
++/* Which method would OrdinaryToPrimitive invoke on val, starting at step?
++   Pure property reads — never calls user code. Returns 0 = none callable
++   remain, 1 = *pmethod is bytecode (owned), 2 = *pmethod is a C callable
++   (owned), -1 = exception. *pstep = the step the method was found at. */
++/* Absorb one iterator result for OP_append's spread frame machine.
++   The stack is [array pos source]; blk = [enumobj, next-method] in the
++   arena. mode 0: val is a raw not-done value; mode 1: done (val freed);
++   mode 2: val IS the iterator-result object — parse .done/.value exactly
++   like JS_IteratorNext's generic tail. Returns 1 = spread finished (blk
++   released), 0 = keep pumping, -1 = exception (iterator closed like the
++   classic helper's exception path, blk released). */
++static int tt_append_step(JSContext *ctx, JSValue *sp, JSValue *blk,
++                          JSValue val, int mode)
++{
++    JSRuntime *rt = ctx->rt;
++    JSValue v;
++
++    if (mode == 2) {
++        int r;
++        if (!JS_IsObject(val)) {
++            JS_FreeValue(ctx, val);
++            JS_ThrowTypeError(ctx, "iterator must return an object");
++            goto fail;
++        }
++        r = JS_ToBoolFree(ctx, JS_GetProperty(ctx, val, JS_ATOM_done));
++        if (r < 0) {
++            JS_FreeValue(ctx, val);
++            goto fail;
++        }
++        if (r) {
++            JS_FreeValue(ctx, val);
++            goto finished;
++        }
++        v = JS_GetProperty(ctx, val, JS_ATOM_value);
++        JS_FreeValue(ctx, val);
++        if (JS_IsException(v))
++            goto fail;
++    } else if (mode == 1) {
++        JS_FreeValue(ctx, val);
++        goto finished;
++    } else {
++        v = val;
++    }
++    {
++        uint32_t pos = (uint32_t)JS_VALUE_GET_INT(sp[-2]);
++        if (JS_DefinePropertyValueUint32(ctx, sp[-3], pos, v,
++                                         JS_PROP_C_W_E) < 0)
++            goto fail;
++        sp[-2] = JS_NewInt32(ctx, pos + 1);
++    }
++    return 0;
++ finished:
++    JS_FreeValue(ctx, blk[0]);
++    JS_FreeValue(ctx, blk[1]);
++    rt->tt_arena_top = (uint8_t *)blk;
++    return 1;
++ fail:
++    JS_IteratorClose(ctx, blk[0], TRUE);
++    JS_FreeValue(ctx, blk[0]);
++    JS_FreeValue(ctx, blk[1]);
++    rt->tt_arena_top = (uint8_t *)blk;
++    return -1;
++}
++
++static int tt_toprim_pick(JSContext *ctx, JSValueConst val, int hint, int step,
++                          JSValue *pmethod, int *pstep)
++{
++    int i;
++
++    if (hint != HINT_STRING)
++        hint = HINT_NUMBER;
++    for (i = step; i < 2; i++) {
++        JSAtom name = ((i ^ hint) == 0) ? JS_ATOM_toString : JS_ATOM_valueOf;
++        JSValue m = JS_GetProperty(ctx, val, name);
++        if (JS_IsException(m))
++            return -1;
++        if (JS_IsFunction(ctx, m)) {
++            *pmethod = m;
++            *pstep = i;
++            return (JS_VALUE_GET_TAG(m) == JS_TAG_OBJECT &&
++                    JS_VALUE_GET_OBJ(m)->class_id == JS_CLASS_BYTECODE_FUNCTION)
++                ? 1 : 2;
++        }
++        JS_FreeValue(ctx, m);
++    }
++    return 0;
++}
++
 +/* stackless in-loop protocol pieces defined later in this file */
++/* XXX: use enum */
++#define GEN_MAGIC_NEXT   0
++#define GEN_MAGIC_RETURN 1
++#define GEN_MAGIC_THROW  2
 +struct JSGeneratorData;
 +static int js_generator_resume_pre(JSContext *ctx, struct JSGeneratorData *s,
 +                                   int magic, JSValueConst arg,
@@ -364,6 +636,36 @@
 +static JSValue js_create_iterator_result(JSContext *ctx, JSValue val, BOOL done);
 +static JSAsyncFunctionState *tt_generator_func_state(struct JSGeneratorData *s);
 +static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor, int class_id);
++static JSValue js_function_call(JSContext *ctx, JSValueConst this_val,
++                                int argc, JSValueConst *argv);
++static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
++                                 int argc, JSValueConst *argv, int magic);
++static JSValue js_string_constructor(JSContext *ctx, JSValueConst new_target,
++                                     int argc, JSValueConst *argv);
++static JSValue js_string_concat(JSContext *ctx, JSValueConst this_val,
++                                int argc, JSValueConst *argv);
++struct JSAsyncGeneratorData;
++static int js_async_generator_resume_pre(JSContext *ctx,
++                                         struct JSAsyncGeneratorData *s);
++static int js_async_generator_resume_post(JSContext *ctx,
++                                          struct JSAsyncGeneratorData *s,
++                                          JSValue func_ret);
++static JSValue js_async_generator_next_prelude(JSContext *ctx,
++                                               JSValueConst this_val,
++                                               JSValueConst arg, int magic,
++                                               struct JSAsyncGeneratorData **pdrive);
++static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val,
++                                       int argc, JSValueConst *argv,
++                                       int magic);
++static JSAsyncFunctionState *tt_agen_func_state(struct JSAsyncGeneratorData *s);
++static struct JSAsyncGeneratorData *js_async_generator_create_pre(JSContext *ctx,
++                                                                  JSValueConst func_obj,
++                                                                  JSValueConst this_obj,
++                                                                  int argc, JSValueConst *argv);
++static JSValue js_async_generator_create_post(JSContext *ctx,
++                                              struct JSAsyncGeneratorData *s,
++                                              JSValueConst func_obj,
++                                              JSValue func_ret);
 +static struct JSGeneratorData *js_generator_create_pre(JSContext *ctx,
 +                                                       JSValueConst func_obj,
 +                                                       JSValueConst this_obj,
@@ -379,7 +681,18 @@
  
  static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                                    JSValueConst this_obj,
-@@ -17777,15 +18078,63 @@
+@@ -17593,6 +18144,10 @@
+     JSCFunctionType func;
+     JSObject *p;
+     JSStackFrame sf_s, *sf = &sf_s, *prev_sf;
++    /* TimeTravelJS: nested native execution must not consume an armed
++       accessor-defer slot (see JS_CallInternal) */
++    if (unlikely(rt->tt_defer_slot != NULL))
++        rt->tt_defer_slot = NULL;
+     JSValue ret_val;
+     JSValueConst *arg_buf;
+     int arg_count, i;
+@@ -17777,15 +18332,226 @@
      JSContext *ctx;
      JSObject *p;
      JSFunctionBytecode *b;
@@ -397,7 +710,17 @@
 +    JSValue *pf_argv;
 +    JSValue pf_ctor_this; /* owned legacy `this` for TT_FRAME_CTOR pushes */
 +    int pf_argc, pf_flags, pf_kind;
++    int pf_cargc; /* caller-stack slots for the pop fixup (call-site argc) */
++    int pf_aux_i; /* continuation data stored into the new frame's tt_aux_i */
++    void *pf_aux; /* continuation pointer stored into the new frame's tt_aux */
++    JSValue tt_dfn; /* deferred accessor landing slot (see rt->tt_defer_slot) */
 +    int gi_base; /* caller-slot base for gen_init_call (-1 call, -2 method) */
++    int uw_base; /* caller-slot base for unwrap_bound (-1 call, -2 method) */
++    int call_argc;
++    JSValue *call_argv;
++    JSValue ap_iter;  /* OP_append frame machine: the iterator object */
++    int ap_flag;      /*   is-array-iterator fast-path eligibility    */
++    JSValue *ap_blk;  /*   arena block [enumobj, next-method]         */
 +
 +/* TimeTravelJS: check the step hook before dispatching the next opcode.
 +   `pc` points at the upcoming instruction here (before the opcode fetch).
@@ -440,6 +763,159 @@
 +        argc = sf->tt_orig_argc;                                 \
 +        argv = sf->tt_orig_argv;                                 \
 +    } while (0)
++
++/* Coerce ONE object-valued stack slot toward a primitive IN-LOOP, exactly
++   as JS_ToPrimitiveFree would: a present Symbol.toPrimitive is read once
++   and called per spec (bytecode method -> TT_FRAME_TOPRIM frame with the
++   hint string staged in an arena block; C method -> inline call; object
++   result -> TypeError, no ordinary fallback); otherwise valueOf/toString
++   run in OrdinaryToPrimitive order the same two ways. The frame's post
++   substitutes the primitive into the slot (aux_i carries the slot's
++   sp-relative offset) and re-dispatches the armed instruction (aux_i
++   carries its byte length), which then re-scans: convergence because the
++   object count strictly decreases. Falling out the bottom of the macro
++   means the slot now holds a primitive (C methods ran inline). nosymv 1
++   = the caller is a ToString continuation that must reject a symbol
++   result itself (String() would otherwise re-dispatch into its
++   direct-symbol special case). */
++#define TT_COERCE_SLOT(sl_slot, hintv, deltav, nosymv)                  \
++    {                                                                   \
++        int cc_step, cc_r;                                              \
++        JSValue cc_m, cc_v;                                             \
++        cc_m = JS_GetProperty(ctx, *(sl_slot), JS_ATOM_Symbol_toPrimitive); \
++        if (JS_IsException(cc_m))                                       \
++            goto exception;                                             \
++        if (!JS_IsUndefined(cc_m) && !JS_IsNull(cc_m)) {                \
++            JSAtom cc_ha = ((hintv) == HINT_STRING) ? JS_ATOM_string :  \
++                           ((hintv) == HINT_NUMBER) ? JS_ATOM_number :  \
++                           JS_ATOM_default;                             \
++            if (JS_VALUE_GET_TAG(cc_m) == JS_TAG_OBJECT &&              \
++                JS_VALUE_GET_OBJ(cc_m)->class_id == JS_CLASS_BYTECODE_FUNCTION) { \
++                JSValue *cc_blk;                                        \
++                if (unlikely(js_poll_interrupts(ctx))) {                \
++                    JS_FreeValue(ctx, cc_m);                            \
++                    goto exception;                                     \
++                }                                                       \
++                cc_blk = tt_arena_alloc_vals(rt, 1);                    \
++                if (unlikely(!cc_blk)) {                                \
++                    JS_FreeValue(ctx, cc_m);                            \
++                    JS_ThrowStackOverflow(caller_ctx);                  \
++                    goto exception;                                     \
++                }                                                       \
++                cc_blk[0] = JS_AtomToString(ctx, cc_ha);                \
++                sf->cur_sp = sp;                                        \
++                pf_func = cc_m;                                         \
++                pf_this = *(sl_slot);                                   \
++                pf_new_target = JS_UNDEFINED;                           \
++                pf_argc = 1;                                            \
++                pf_argv = cc_blk;                                       \
++                pf_flags = 0;                                           \
++                pf_kind = TT_FRAME_TOPRIM;                              \
++                pf_ctor_this = cc_m;                                    \
++                pf_aux_i = (int)((uint32_t)(int)((sl_slot) - sp) << 16) | \
++                           ((nosymv) << 12) |                           \
++                           ((deltav) << 8) | (0xE << 4) | (hintv);      \
++                pf_cargc = 0;                                           \
++                pf_aux = cc_blk;                                        \
++                goto push_frame;                                        \
++            }                                                           \
++            {                                                           \
++                JSValue cc_hs = JS_AtomToString(ctx, cc_ha);            \
++                cc_v = JS_CallFree(ctx, cc_m, *(sl_slot), 1,            \
++                                   (JSValueConst *)&cc_hs);             \
++                JS_FreeValue(ctx, cc_hs);                               \
++            }                                                           \
++            if (JS_IsException(cc_v))                                   \
++                goto exception;                                         \
++            if (JS_VALUE_GET_TAG(cc_v) == JS_TAG_OBJECT) {              \
++                JS_FreeValue(ctx, cc_v);                                \
++                JS_ThrowTypeError(ctx, "toPrimitive");                  \
++                goto exception;                                         \
++            }                                                           \
++            if ((nosymv) && JS_VALUE_GET_TAG(cc_v) == JS_TAG_SYMBOL) {  \
++                JS_FreeValue(ctx, cc_v);                                \
++                JS_ThrowTypeError(ctx, "cannot convert symbol to string"); \
++                goto exception;                                         \
++            }                                                           \
++            JS_FreeValue(ctx, *(sl_slot));                              \
++            *(sl_slot) = cc_v;                                          \
++        } else {                                                        \
++            cc_step = 0;                                                \
++            for (;;) {                                                  \
++                cc_r = tt_toprim_pick(ctx, *(sl_slot), hintv,           \
++                                      cc_step, &cc_m, &cc_step);        \
++                if (cc_r < 0)                                           \
++                    goto exception;                                     \
++                if (cc_r == 0) {                                        \
++                    JS_ThrowTypeError(ctx, "toPrimitive");              \
++                    goto exception;                                     \
++                }                                                       \
++                if (cc_r == 1) {                                        \
++                    if (unlikely(js_poll_interrupts(ctx))) {            \
++                        JS_FreeValue(ctx, cc_m);                        \
++                        goto exception;                                 \
++                    }                                                   \
++                    sf->cur_sp = sp;                                    \
++                    pf_func = cc_m;                                     \
++                    pf_this = *(sl_slot);                               \
++                    pf_new_target = JS_UNDEFINED;                       \
++                    pf_argc = 0;                                        \
++                    pf_argv = NULL;                                     \
++                    pf_flags = 0;                                       \
++                    pf_kind = TT_FRAME_TOPRIM;                          \
++                    pf_ctor_this = cc_m;                                \
++                    pf_aux_i = (int)((uint32_t)(int)((sl_slot) - sp) << 16) | \
++                               ((nosymv) << 12) |                       \
++                               ((deltav) << 8) | (cc_step << 4) | (hintv); \
++                    pf_cargc = 0;                                       \
++                    pf_aux = NULL;                                      \
++                    goto push_frame;                                    \
++                }                                                       \
++                cc_v = JS_CallFree(ctx, cc_m, *(sl_slot), 0, NULL);     \
++                if (JS_IsException(cc_v))                               \
++                    goto exception;                                     \
++                if (JS_VALUE_GET_TAG(cc_v) != JS_TAG_OBJECT) {          \
++                    if ((nosymv) && JS_VALUE_GET_TAG(cc_v) == JS_TAG_SYMBOL) { \
++                        JS_FreeValue(ctx, cc_v);                        \
++                        JS_ThrowTypeError(ctx, "cannot convert symbol to string"); \
++                        goto exception;                                 \
++                    }                                                   \
++                    JS_FreeValue(ctx, *(sl_slot));                      \
++                    *(sl_slot) = cc_v;                                  \
++                    break;                                              \
++                }                                                       \
++                JS_FreeValue(ctx, cc_v);                                \
++                cc_step++;                                              \
++                if (cc_step >= 2) {                                     \
++                    JS_ThrowTypeError(ctx, "toPrimitive");              \
++                    goto exception;                                     \
++                }                                                       \
++            }                                                           \
++        }                                                               \
++    }
++
++/* Both operands of a binary operator, left to right (each armed
++   instruction is 1 byte). eqmode 1 restricts coercion to loose-eq's
++   object-vs-primitive rule; eqmode 2 (strict equality: never coerces)
++   compiles the block away. */
++#define TT_COERCE_OPERANDS(hintv, eqmode)                               \
++    if ((eqmode) != 2) {                                                \
++        int cc_w;                                                       \
++        for (cc_w = 0; cc_w < 2; cc_w++) {                              \
++            if (JS_VALUE_GET_TAG(sp[-2 + cc_w]) != JS_TAG_OBJECT)       \
++                continue;                                               \
++            if (eqmode) {                                               \
++                uint32_t cc_ot = JS_VALUE_GET_NORM_TAG(sp[-1 - cc_w]);  \
++                if (!(cc_ot == JS_TAG_INT || cc_ot == JS_TAG_FLOAT64 || \
++                      cc_ot == JS_TAG_BOOL || cc_ot == JS_TAG_STRING || \
++                      cc_ot == JS_TAG_STRING_ROPE ||                    \
++                      cc_ot == JS_TAG_SHORT_BIG_INT ||                  \
++                      cc_ot == JS_TAG_BIG_INT || cc_ot == JS_TAG_SYMBOL)) \
++                    continue;                                           \
++            }                                                           \
++            TT_COERCE_SLOT(&sp[-2 + cc_w], hintv, 1, 0)                 \
++        }                                                               \
++    }
  
  #if !DIRECT_DISPATCH
 -#define SWITCH(pc)      switch (opcode = *pc++)
@@ -447,7 +923,7 @@
  #define CASE(op)        case op
  #define DEFAULT         default
  #define BREAK           break
-@@ -17800,7 +18149,7 @@
+@@ -17800,7 +18566,7 @@
  #include "quickjs-opcode.h"
          [ OP_COUNT ... 255 ] = &&case_default
      };
@@ -456,8 +932,18 @@
  #ifdef OPCODE_ASM_LABEL
  #define CASE(op)        case_ ## op: asm volatile("label_" #op ":\n.globl label_" #op); dummy_case_ ## op
  #else
-@@ -17812,19 +18161,34 @@
+@@ -17810,21 +18576,44 @@
+ #define BREAK           SWITCH(pc)
+ #endif
  
++    /* TimeTravelJS: an armed accessor-defer slot belongs to exactly one
++       pending property operation. Any nested JS execution (coercions,
++       exotic handlers) must not consume it — disarm on entry; the nested
++       window's accessors then take the classic C path. */
++    if (unlikely(rt->tt_defer_slot != NULL))
++        rt->tt_defer_slot = NULL;
++    if (unlikely(rt->tt_defer_pending != NULL))
++        rt->tt_defer_pending = NULL;
      if (js_poll_interrupts(caller_ctx))
          return JS_EXCEPTION;
 +    if (unlikely(flags & JS_CALL_FLAG_TT_RESUME)) {
@@ -499,7 +985,7 @@
              sp = sf->cur_sp;
              sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
              pc = sf->cur_pc;
-@@ -17849,52 +18213,87 @@
+@@ -17849,58 +18638,93 @@
          return call_func(caller_ctx, func_obj, this_obj, argc,
                           (JSValueConst *)argv, flags);
      }
@@ -526,6 +1012,9 @@
 +    pf_flags = flags;
 +    pf_kind = TT_FRAME_ENTRY;
 +    pf_ctor_this = JS_UNDEFINED;
++    pf_aux_i = 0;
++    pf_cargc = 0;
++    pf_aux = NULL;
 +
 +    /* TimeTravelJS stackless: push an interpreter frame in the arena and
 +       (re)enter the dispatch loop. Reached from the C entry above and from
@@ -575,15 +1064,15 @@
 +        nsf->cur_pc = fb->byte_code_buf;
 +        nsf->cur_sp = NULL;
 +        nsf->tt_frame_kind = pf_kind;
-+        nsf->tt_call_argc = (uint16_t)pf_argc;
++        nsf->tt_call_argc = (uint16_t)pf_cargc;
 +        nsf->tt_this = pf_this;
 +        nsf->tt_new_target = pf_new_target;
 +        nsf->tt_orig_argv = pf_argv;
 +        nsf->tt_orig_argc = pf_argc;
 +        nsf->tt_frame_base = vals;
 +        nsf->tt_ctor_this = pf_ctor_this;
-+        nsf->tt_aux = NULL;
-+        nsf->tt_aux_i = 0;
++        nsf->tt_aux = pf_aux;
++        nsf->tt_aux_i = pf_aux_i;
 +        nsf->arg_buf = pf_argv;
 +        nsf->arg_count = pf_argc;
 +        if (unlikely(arg_allocated_size)) {
@@ -629,7 +1118,13 @@
  
   restart:
      for(;;) {
-@@ -18214,6 +18613,43 @@
+-        int call_argc;
+-        JSValue *call_argv;
+-
+         SWITCH(pc) {
+         CASE(OP_push_i32):
+             *sp++ = JS_NewInt32(ctx, get_u32(pc));
+@@ -18214,6 +19038,78 @@
              has_call_argc:
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -638,7 +1133,8 @@
 +                if (opcode != OP_tail_call &&
 +                    JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
 +                    (JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_GENERATOR_FUNCTION ||
-+                     JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_FUNCTION)) {
++                     JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_FUNCTION ||
++                     JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION)) {
 +                    if (unlikely(js_poll_interrupts(ctx)))
 +                        goto exception;
 +                    pf_func = call_argv[-1];
@@ -648,7 +1144,18 @@
 +                    gi_base = -1;
 +                    if (JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_FUNCTION)
 +                        goto async_init_call;
++                    if (JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION)
++                        goto agen_init_call;
 +                    goto gen_init_call;
++                }
++                /* stackless: unwrap bound-function chains in-loop (not in
++                   tail position: BOUND frames push their result and resume
++                   at cur_pc, but a tail opcode has no continuation) */
++                if (opcode != OP_tail_call &&
++                    JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
++                    JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_BOUND_FUNCTION) {
++                    uw_base = -1;
++                    goto unwrap_bound;
 +                }
 +                /* TimeTravelJS stackless: a bytecode callee continues in
 +                   THIS loop — push a frame instead of recursing. (Inlined
@@ -668,12 +1175,35 @@
 +                    pf_flags = 0;
 +                    pf_kind = (opcode == OP_tail_call) ? TT_FRAME_TAIL : TT_FRAME_CALL;
 +                    pf_ctor_this = JS_UNDEFINED;
++                    pf_aux_i = 0;
++                    pf_cargc = pf_argc;
++                    pf_aux = NULL;
 +                    goto push_frame;
++                }
++                /* TimeTravelJS: String(obj) observably only ToStrings its
++                   argument — coerce it in-loop (parkable), then run the
++                   pristine builtin on the primitive. */
++                if (call_argc >= 1 &&
++                    JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT &&
++                    JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT) {
++                    JSObject *ccp = JS_VALUE_GET_OBJ(call_argv[-1]);
++                    if (ccp->class_id == JS_CLASS_C_FUNCTION &&
++                        ccp->u.cfunc.cproto == JS_CFUNC_constructor_or_func &&
++                        ccp->u.cfunc.c_function.constructor_or_func == js_string_constructor &&
++                        ccp->u.cfunc.realm == ctx) {
++                        int cs_delta;
++#if SHORT_OPCODES
++                        cs_delta = (opcode >= OP_call0 && opcode <= OP_call3) ? 1 : 3;
++#else
++                        cs_delta = 3;
++#endif
++                        TT_COERCE_SLOT(&call_argv[0], HINT_STRING, cs_delta, 1)
++                    }
 +                }
                  ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                            JS_UNDEFINED, call_argc, call_argv, 0);
                  if (unlikely(JS_IsException(ret_val)))
-@@ -18232,6 +18668,36 @@
+@@ -18232,6 +19128,52 @@
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -705,19 +1235,36 @@
 +                    pf_argc = call_argc;
 +                    pf_argv = call_argv;
 +                    pf_flags = JS_CALL_FLAG_CONSTRUCTOR;
++                    pf_aux_i = 0;
++                    pf_cargc = pf_argc;
++                    pf_aux = NULL;
 +                    goto push_frame;
++                }
++                /* TimeTravelJS: new String(obj) — same in-loop ToString of
++                   the argument as the plain call form. */
++                if (call_argc >= 1 &&
++                    JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_OBJECT &&
++                    JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT) {
++                    JSObject *ccp = JS_VALUE_GET_OBJ(call_argv[-2]);
++                    if (ccp->class_id == JS_CLASS_C_FUNCTION &&
++                        ccp->u.cfunc.cproto == JS_CFUNC_constructor_or_func &&
++                        ccp->u.cfunc.c_function.constructor_or_func == js_string_constructor &&
++                        ccp->u.cfunc.realm == ctx) {
++                        TT_COERCE_SLOT(&call_argv[0], HINT_STRING, 3, 1)
++                    }
 +                }
                  ret_val = JS_CallConstructorInternal(ctx, call_argv[-2],
                                                       call_argv[-1],
                                                       call_argc, call_argv, 0);
-@@ -18250,6 +18716,94 @@
+@@ -18250,6 +19192,240 @@
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
 +                if (opcode == OP_call_method &&
 +                    JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
 +                    (JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_GENERATOR_FUNCTION ||
-+                     JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_FUNCTION)) {
++                     JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_FUNCTION ||
++                     JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION)) {
 +                    if (unlikely(js_poll_interrupts(ctx)))
 +                        goto exception;
 +                    pf_func = call_argv[-1];
@@ -727,7 +1274,81 @@
 +                    gi_base = -2;
 +                    if (JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_FUNCTION)
 +                        goto async_init_call;
++                    if (JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION)
++                        goto agen_init_call;
 +                    goto gen_init_call;
++                }
++                /* stackless: bound chains and Function.prototype
++                   call/apply unwrap in-loop (tail calls too) */
++                if ((opcode == OP_call_method || opcode == OP_tail_call_method) &&
++                    JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT) {
++                    JSObject *cfp = JS_VALUE_GET_OBJ(call_argv[-1]);
++                    if (cfp->class_id == JS_CLASS_BOUND_FUNCTION &&
++                        opcode == OP_call_method) {
++                        uw_base = -2;
++                        goto unwrap_bound;
++                    }
++                    if (cfp->class_id == JS_CLASS_C_FUNCTION &&
++                        cfp->u.cfunc.cproto == JS_CFUNC_generic &&
++                        cfp->u.cfunc.c_function.generic == js_function_call &&
++                        cfp->u.cfunc.realm == ctx && /* realm of thrown errors */
++                        /* tail form only from normal callers: it must
++                           flow through TAIL_METHOD's goto-done, and a
++                           non-normal caller cannot host a TAIL frame */
++                        (opcode == OP_call_method ||
++                         b->func_kind == JS_FUNC_NORMAL) &&
++                        JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT &&
++                        JS_VALUE_GET_OBJ(call_argv[-2])->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++                        if (unlikely(js_poll_interrupts(ctx)))
++                            goto exception;
++                        sf->cur_sp = sp;
++                        pf_func = call_argv[-2];
++                        pf_this = call_argc > 0 ? call_argv[0] : JS_UNDEFINED;
++                        pf_new_target = JS_UNDEFINED;
++                        pf_argc = call_argc > 0 ? call_argc - 1 : 0;
++                        pf_argv = call_argc > 0 ? call_argv + 1 : NULL;
++                        pf_flags = 0;
++                        pf_kind = (opcode == OP_tail_call_method &&
++                                   b->func_kind == JS_FUNC_NORMAL)
++                                  ? TT_FRAME_TAIL_METHOD : TT_FRAME_CALL_METHOD;
++                        pf_ctor_this = JS_UNDEFINED;
++                        pf_aux_i = 0;
++                        pf_cargc = call_argc; /* pop the ORIGINAL call shape */
++                        pf_aux = NULL;
++                        goto push_frame;
++                    }
++                    if (cfp->class_id == JS_CLASS_C_FUNCTION &&
++                        opcode == OP_call_method && /* APPLY frames push their result */
++                        cfp->u.cfunc.cproto == JS_CFUNC_generic_magic &&
++                        cfp->u.cfunc.c_function.generic_magic == js_function_apply &&
++                        cfp->u.cfunc.magic == 0 &&
++                        cfp->u.cfunc.realm == ctx && /* realm of thrown errors */
++                        JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT &&
++                        JS_VALUE_GET_OBJ(call_argv[-2])->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++                        JSValue *utab = NULL;
++                        uint32_t utablen = 0;
++                        if (unlikely(js_poll_interrupts(ctx)))
++                            goto exception;
++                        if (call_argc > 1 && !JS_IsUndefined(call_argv[1]) &&
++                            !JS_IsNull(call_argv[1])) {
++                            utab = build_arg_list(ctx, &utablen, call_argv[1]);
++                            if (!utab)
++                                goto exception;
++                        }
++                        sf->cur_sp = sp;
++                        pf_func = call_argv[-2];
++                        pf_this = call_argc > 0 ? call_argv[0] : JS_UNDEFINED;
++                        pf_new_target = JS_UNDEFINED;
++                        pf_argc = (int)utablen;
++                        pf_argv = utab;
++                        pf_flags = 0;
++                        pf_kind = TT_FRAME_APPLY;
++                        pf_ctor_this = JS_UNDEFINED;
++                        pf_aux_i = (int)utablen;
++                        pf_cargc = call_argc;
++                        pf_aux = utab;
++                        goto push_frame;
++                    }
 +                }
 +                /* TimeTravelJS stackless: gen.next/return/throw on a
 +                   suspended generator runs the BODY in this loop (the
@@ -786,6 +1407,74 @@
 +                        goto restart;
 +                    }
 +                }
++                /* TimeTravelJS: agObj.next/return/throw — enqueue via the
++                   C prelude, hand the promise to the caller, then drive
++                   the async generator body in-loop (parkable). */
++                if (opcode == OP_call_method &&
++                    JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
++                    JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_C_FUNCTION &&
++                    JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.cproto == JS_CFUNC_generic_magic &&
++                    JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.c_function.generic_magic == js_async_generator_next &&
++                    JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.realm == ctx &&
++                    JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT &&
++                    JS_VALUE_GET_OBJ(call_argv[-2])->class_id == JS_CLASS_ASYNC_GENERATOR) {
++                    struct JSAsyncGeneratorData *ags;
++                    JSValue agp, agobj;
++                    int agmagic = JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.magic;
++                    if (unlikely(js_poll_interrupts(ctx)))
++                        goto exception;
++                    agp = js_async_generator_next_prelude(ctx, call_argv[-2],
++                                                          call_argc > 0 ? call_argv[0] : JS_UNDEFINED,
++                                                          agmagic, &ags);
++                    if (JS_IsException(agp))
++                        goto exception;
++                    agobj = JS_DupValue(ctx, call_argv[-2]);
++                    for(i = -2; i < call_argc; i++)
++                        JS_FreeValue(ctx, call_argv[i]);
++                    sp -= call_argc + 2;
++                    *sp++ = agp;
++                    if (ags && js_async_generator_resume_pre(ctx, ags)) {
++                        JSAsyncFunctionState *afs = tt_agen_func_state(ags);
++                        JSStackFrame *gsf = &afs->frame;
++                        sf->cur_sp = sp;
++                        gsf->tt_frame_kind = TT_FRAME_AGEN;
++                        gsf->tt_aux = ags;
++                        gsf->tt_ctor_this = agobj; /* the drive's ref */
++                        gsf->prev_frame = rt->current_stack_frame;
++                        rt->current_stack_frame = gsf;
++                        sf = gsf;
++                        TT_LOAD_FRAME();
++                        sp = sf->cur_sp;
++                        sf->cur_sp = NULL;
++                        pc = sf->cur_pc;
++                        if (afs->throw_flag)
++                            goto exception;
++                        goto restart;
++                    }
++                    JS_FreeValue(ctx, agobj);
++                    BREAK;
++                }
++                /* TimeTravelJS: builtin String.prototype.concat (the
++                   compiler's template-literal engine) observably only
++                   ToStrings `this` and each argument, left to right —
++                   coerce every object operand in-loop (parkable), then
++                   run the pristine builtin on primitives. */
++                if (call_argc < 30000 &&
++                    JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT) {
++                    JSObject *ccp = JS_VALUE_GET_OBJ(call_argv[-1]);
++                    if (ccp->class_id == JS_CLASS_C_FUNCTION &&
++                        ccp->u.cfunc.cproto == JS_CFUNC_generic &&
++                        ccp->u.cfunc.c_function.generic == js_string_concat &&
++                        ccp->u.cfunc.realm == ctx) {
++                        int cs_i;
++                        for (cs_i = -2; cs_i < call_argc; cs_i++) {
++                            if (cs_i == -1 || /* the callee slot */
++                                JS_VALUE_GET_TAG(call_argv[cs_i]) != JS_TAG_OBJECT)
++                                continue;
++                            TT_COERCE_SLOT(&call_argv[cs_i], HINT_STRING, 3, 0)
++                        }
++                    }
++                }
 +                if (likely(JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
 +                           JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_BYTECODE_FUNCTION) &&
 +                    !(opcode == OP_tail_call_method && b->func_kind != JS_FUNC_NORMAL)) {
@@ -800,17 +1489,809 @@
 +                    pf_flags = 0;
 +                    pf_kind = (opcode == OP_tail_call_method) ? TT_FRAME_TAIL_METHOD : TT_FRAME_CALL_METHOD;
 +                    pf_ctor_this = JS_UNDEFINED;
++                    pf_aux_i = 0;
++                    pf_cargc = pf_argc;
++                    pf_aux = NULL;
 +                    goto push_frame;
 +                }
                  ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                            JS_UNDEFINED, call_argc, call_argv, 0);
                  if (unlikely(JS_IsException(ret_val)))
-@@ -20578,8 +21132,104 @@
+@@ -18994,17 +20170,123 @@
+             sp += 2;
+             BREAK;
+         CASE(OP_for_of_start):
+-            sf->cur_pc = pc;
+-            if (js_for_of_start(ctx, sp, FALSE))
+-                goto exception;
+-            sp += 1;
+-            *sp++ = JS_NewCatchOffset(ctx, 0);
++            {
++                /* TimeTravelJS: JS_GetIterator + js_for_of_start mirrored
++                   in-loop so a bytecode Symbol.iterator method runs as an
++                   inline frame (parkable). C methods (arrays, strings,
++                   generators) still run inline. */
++                JSValue fs_m, fs_iter, fs_next;
++                sf->cur_pc = pc;
++                fs_m = JS_GetProperty(ctx, sp[-1], JS_ATOM_Symbol_iterator);
++                if (JS_IsException(fs_m))
++                    goto exception;
++                if (!JS_IsFunction(ctx, fs_m)) {
++                    JS_FreeValue(ctx, fs_m);
++                    JS_ThrowTypeError(ctx, "value is not iterable");
++                    goto exception;
++                }
++                if (JS_VALUE_GET_TAG(fs_m) == JS_TAG_OBJECT &&
++                    JS_VALUE_GET_OBJ(fs_m)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++                    if (unlikely(js_poll_interrupts(ctx))) {
++                        JS_FreeValue(ctx, fs_m);
++                        goto exception;
++                    }
++                    sf->cur_sp = sp;
++                    pf_func = fs_m;
++                    pf_this = sp[-1];
++                    pf_new_target = JS_UNDEFINED;
++                    pf_argc = 0;
++                    pf_argv = NULL;
++                    pf_flags = 0;
++                    pf_kind = TT_FRAME_FOROF_START;
++                    pf_ctor_this = fs_m;
++                    pf_aux_i = 0;
++                    pf_cargc = 0;
++                    pf_aux = NULL;
++                    goto push_frame;
++                }
++                fs_iter = JS_GetIterator2(ctx, sp[-1], fs_m);
++                JS_FreeValue(ctx, fs_m);
++                if (JS_IsException(fs_iter))
++                    goto exception;
++                JS_FreeValue(ctx, sp[-1]);
++                sp[-1] = fs_iter;
++                fs_next = JS_GetProperty(ctx, fs_iter, JS_ATOM_next);
++                if (JS_IsException(fs_next))
++                    goto exception;
++                *sp++ = fs_next;
++                *sp++ = JS_NewCatchOffset(ctx, 0);
++            }
+             BREAK;
+         CASE(OP_for_of_next):
+             {
+                 int offset = -3 - pc[0];
++                int offbyte = pc[0];
+                 pc += 1;
+                 sf->cur_pc = pc;
++                /* TimeTravelJS stackless: user `next` methods and generator
++                   bodies run in THIS loop; C stays only for built-in
++                   iterators (which never run user code). */
++                if (!JS_IsUndefined(sp[offset]) &&
++                    JS_VALUE_GET_TAG(sp[offset + 1]) == JS_TAG_OBJECT) {
++                    JSObject *nmp = JS_VALUE_GET_OBJ(sp[offset + 1]);
++                    if (nmp->class_id == JS_CLASS_C_FUNCTION &&
++                        nmp->u.cfunc.cproto == JS_CFUNC_iterator_next &&
++                        nmp->u.cfunc.c_function.iterator_next == js_generator_next &&
++                        JS_VALUE_GET_TAG(sp[offset]) == JS_TAG_OBJECT &&
++                        JS_VALUE_GET_OBJ(sp[offset])->class_id == JS_CLASS_GENERATOR) {
++                        struct JSGeneratorData *gs = JS_GetOpaque(sp[offset], JS_CLASS_GENERATOR);
++                        BOOL gdone;
++                        JSValue gret;
++                        if (unlikely(js_poll_interrupts(ctx)))
++                            goto exception;
++                        if (js_generator_resume_pre(ctx, gs, GEN_MAGIC_NEXT,
++                                                    JS_UNDEFINED, &gdone, &gret)) {
++                            if (tt_forof_finish(ctx, sp, offset, gret,
++                                                gdone == 2 ? 2 : (gdone ? 1 : 0)))
++                                goto exception;
++                            sp += 2;
++                            BREAK;
++                        }
++                        {
++                            JSAsyncFunctionState *fs = tt_generator_func_state(gs);
++                            JSStackFrame *gsf = &fs->frame;
++                            sf->cur_sp = sp;
++                            gsf->tt_frame_kind = TT_FRAME_GEN;
++                            gsf->tt_aux = gs;
++                            gsf->tt_aux_i = GEN_MAGIC_NEXT |
++                                (TT_GENSHAPE_FOROF << 8) | (offbyte << 16);
++                            gsf->tt_call_argc = 0;
++                            gsf->prev_frame = rt->current_stack_frame;
++                            rt->current_stack_frame = gsf;
++                            sf = gsf;
++                            TT_LOAD_FRAME();
++                            sp = sf->cur_sp;
++                            sf->cur_sp = NULL;
++                            pc = sf->cur_pc;
++                            if (fs->throw_flag)
++                                goto exception;
++                            goto restart;
++                        }
++                    }
++                    if (nmp->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++                        if (unlikely(js_poll_interrupts(ctx)))
++                            goto exception;
++                        sf->cur_sp = sp;
++                        pf_func = sp[offset + 1];
++                        pf_this = sp[offset];
++                        pf_new_target = JS_UNDEFINED;
++                        pf_argc = 0;
++                        pf_argv = NULL;
++                        pf_flags = 0;
++                        pf_kind = TT_FRAME_FOROF;
++                        pf_ctor_this = JS_UNDEFINED;
++                        pf_aux_i = offbyte;
++                    pf_cargc = pf_argc;
++                    pf_aux = NULL;
++                        goto push_frame;
++                    }
++                }
+                 if (js_for_of_next(ctx, sp, offset))
+                     goto exception;
+                 sp += 2;
+@@ -19072,6 +20354,109 @@
+             {
+                 JSValue ret;
+                 sf->cur_pc = pc;
++                /* stackless: user next() and generator bodies run in-loop */
++                if (JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT) {
++                    JSObject *nmp = JS_VALUE_GET_OBJ(sp[-3]);
++                    if (nmp->class_id == JS_CLASS_C_FUNCTION &&
++                        nmp->u.cfunc.cproto == JS_CFUNC_iterator_next &&
++                        nmp->u.cfunc.c_function.iterator_next == js_generator_next &&
++                        JS_VALUE_GET_TAG(sp[-4]) == JS_TAG_OBJECT &&
++                        JS_VALUE_GET_OBJ(sp[-4])->class_id == JS_CLASS_GENERATOR) {
++                        struct JSGeneratorData *gs = JS_GetOpaque(sp[-4], JS_CLASS_GENERATOR);
++                        BOOL gdone;
++                        JSValue gret;
++                        if (unlikely(js_poll_interrupts(ctx)))
++                            goto exception;
++                        if (js_generator_resume_pre(ctx, gs, GEN_MAGIC_NEXT,
++                                                    sp[-1], &gdone, &gret)) {
++                            if (JS_IsException(gret))
++                                goto exception;
++                            if (gdone != 2) {
++                                gret = js_create_iterator_result(ctx, gret, gdone);
++                                if (JS_IsException(gret))
++                                    goto exception;
++                            }
++                            JS_FreeValue(ctx, sp[-1]);
++                            sp[-1] = gret;
++                            BREAK;
++                        }
++                        {
++                            JSAsyncFunctionState *fs = tt_generator_func_state(gs);
++                            JSStackFrame *gsf = &fs->frame;
++                            sf->cur_sp = sp;
++                            gsf->tt_frame_kind = TT_FRAME_GEN;
++                            gsf->tt_aux = gs;
++                            gsf->tt_aux_i = GEN_MAGIC_NEXT | (TT_GENSHAPE_ITERNEXT << 8);
++                            gsf->tt_call_argc = 0;
++                            gsf->prev_frame = rt->current_stack_frame;
++                            rt->current_stack_frame = gsf;
++                            sf = gsf;
++                            TT_LOAD_FRAME();
++                            sp = sf->cur_sp;
++                            sf->cur_sp = NULL;
++                            pc = sf->cur_pc;
++                            if (fs->throw_flag)
++                                goto exception;
++                            goto restart;
++                        }
++                    }
++                    /* async generator .next via iteration (for-await):
++                       run the enqueue prelude, deliver the promise, then
++                       drive the body in-loop (parkable) */
++                    if (nmp->class_id == JS_CLASS_C_FUNCTION &&
++                        nmp->u.cfunc.cproto == JS_CFUNC_generic_magic &&
++                        nmp->u.cfunc.c_function.generic_magic == js_async_generator_next &&
++                        nmp->u.cfunc.realm == ctx &&
++                        JS_VALUE_GET_TAG(sp[-4]) == JS_TAG_OBJECT &&
++                        JS_VALUE_GET_OBJ(sp[-4])->class_id == JS_CLASS_ASYNC_GENERATOR) {
++                        struct JSAsyncGeneratorData *ags;
++                        JSValue agp;
++                        if (unlikely(js_poll_interrupts(ctx)))
++                            goto exception;
++                        agp = js_async_generator_next_prelude(ctx, sp[-4], sp[-1],
++                                                              nmp->u.cfunc.magic, &ags);
++                        if (JS_IsException(agp))
++                            goto exception;
++                        JS_FreeValue(ctx, sp[-1]);
++                        sp[-1] = agp;
++                        if (ags && js_async_generator_resume_pre(ctx, ags)) {
++                            JSAsyncFunctionState *afs = tt_agen_func_state(ags);
++                            JSStackFrame *gsf = &afs->frame;
++                            sf->cur_sp = sp;
++                            gsf->tt_frame_kind = TT_FRAME_AGEN;
++                            gsf->tt_aux = ags;
++                            gsf->tt_ctor_this = JS_DupValue(ctx, sp[-4]);
++                            gsf->prev_frame = rt->current_stack_frame;
++                            rt->current_stack_frame = gsf;
++                            sf = gsf;
++                            TT_LOAD_FRAME();
++                            sp = sf->cur_sp;
++                            sf->cur_sp = NULL;
++                            pc = sf->cur_pc;
++                            if (afs->throw_flag)
++                                goto exception;
++                            goto restart;
++                        }
++                        BREAK;
++                    }
++                    if (nmp->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++                        if (unlikely(js_poll_interrupts(ctx)))
++                            goto exception;
++                        sf->cur_sp = sp;
++                        pf_func = sp[-3];
++                        pf_this = sp[-4];
++                        pf_new_target = JS_UNDEFINED;
++                        pf_argc = 1;
++                        pf_argv = sp - 1;
++                        pf_flags = 0;
++                        pf_kind = TT_FRAME_ITERNEXT;
++                        pf_ctor_this = JS_UNDEFINED;
++                        pf_aux_i = 0;
++                    pf_cargc = pf_argc;
++                    pf_aux = NULL;
++                        goto push_frame;
++                    }
++                }
+                 ret = JS_Call(ctx, sp[-3], sp[-4],
+                               1, (JSValueConst *)(sp - 1));
+                 if (JS_IsException(ret))
+@@ -19096,6 +20481,78 @@
+                 if (JS_IsUndefined(method) || JS_IsNull(method)) {
+                     ret_flag = TRUE;
+                 } else {
++                    /* stackless: inner generator throw/return and user
++                       methods run in-loop */
++                    if (JS_VALUE_GET_TAG(method) == JS_TAG_OBJECT) {
++                        JSObject *nmp = JS_VALUE_GET_OBJ(method);
++                        if (nmp->class_id == JS_CLASS_C_FUNCTION &&
++                            nmp->u.cfunc.cproto == JS_CFUNC_iterator_next &&
++                            nmp->u.cfunc.c_function.iterator_next == js_generator_next &&
++                            JS_VALUE_GET_TAG(sp[-4]) == JS_TAG_OBJECT &&
++                            JS_VALUE_GET_OBJ(sp[-4])->class_id == JS_CLASS_GENERATOR) {
++                            struct JSGeneratorData *gs = JS_GetOpaque(sp[-4], JS_CLASS_GENERATOR);
++                            int gmagic = nmp->u.cfunc.magic;
++                            BOOL gdone;
++                            JSValue gret;
++                            JS_FreeValue(ctx, method);
++                            if (unlikely(js_poll_interrupts(ctx)))
++                                goto exception;
++                            if (js_generator_resume_pre(ctx, gs, gmagic,
++                                                        (flags & 2) ? JS_UNDEFINED : sp[-1],
++                                                        &gdone, &gret)) {
++                                if (JS_IsException(gret))
++                                    goto exception;
++                                if (gdone != 2) {
++                                    gret = js_create_iterator_result(ctx, gret, gdone);
++                                    if (JS_IsException(gret))
++                                        goto exception;
++                                }
++                                JS_FreeValue(ctx, sp[-1]);
++                                sp[-1] = gret;
++                                sp[0] = JS_FALSE;
++                                sp += 1;
++                                BREAK;
++                            }
++                            {
++                                JSAsyncFunctionState *fs = tt_generator_func_state(gs);
++                                JSStackFrame *gsf = &fs->frame;
++                                sf->cur_sp = sp;
++                                gsf->tt_frame_kind = TT_FRAME_GEN;
++                                gsf->tt_aux = gs;
++                                gsf->tt_aux_i = gmagic | (TT_GENSHAPE_ITERCALL << 8);
++                                gsf->tt_call_argc = 0;
++                                gsf->prev_frame = rt->current_stack_frame;
++                                rt->current_stack_frame = gsf;
++                                sf = gsf;
++                                TT_LOAD_FRAME();
++                                sp = sf->cur_sp;
++                                sf->cur_sp = NULL;
++                                pc = sf->cur_pc;
++                                if (fs->throw_flag)
++                                    goto exception;
++                                goto restart;
++                            }
++                        }
++                        if (nmp->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++                            if (unlikely(js_poll_interrupts(ctx))) {
++                                JS_FreeValue(ctx, method);
++                                goto exception;
++                            }
++                            sf->cur_sp = sp;
++                            pf_func = method;
++                            pf_this = sp[-4];
++                            pf_new_target = JS_UNDEFINED;
++                            pf_argc = (flags & 2) ? 0 : 1;
++                            pf_argv = (flags & 2) ? NULL : sp - 1;
++                            pf_flags = 0;
++                            pf_kind = TT_FRAME_ITERCALL;
++                            pf_ctor_this = method; /* owned; freed at fixup */
++                            pf_aux_i = 0;
++                    pf_cargc = pf_argc;
++                    pf_aux = NULL;
++                            goto push_frame;
++                        }
++                    }
+                     if (flags & 2) {
+                         /* no argument */
+                         ret = JS_CallFree(ctx, method, sp[-4],
+@@ -19173,9 +20630,33 @@
+                 } else {                                                \
+                 name ## _slow_path:                                     \
+                     sf->cur_pc = pc;                                    \
++                    rt->tt_defer_kind = 1;                              \
++                    rt->tt_defer_slot = &tt_dfn;                        \
+                     val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], 0); \
++                    rt->tt_defer_slot = NULL;                           \
+                     if (unlikely(JS_IsException(val)))                  \
+                         goto exception;                                 \
++                    if (unlikely(JS_VALUE_GET_TAG(val) == JS_TAG_UNINITIALIZED)) { \
++                        sf->cur_sp = sp;                                \
++                        pf_func = tt_dfn;                               \
++                        pf_this = sp[-1];                               \
++                        pf_new_target = JS_UNDEFINED;                   \
++                        pf_argc = 0;                                    \
++                        pf_argv = NULL;                                 \
++                        pf_flags = 0;                                   \
++                        pf_kind = TT_FRAME_GETTER;                      \
++                        pf_ctor_this = tt_dfn;                          \
++                        pf_aux_i = keep;                                \
++                        if (unlikely(rt->tt_defer_aux != NULL)) {       \
++                            pf_argv = (JSValue *)rt->tt_defer_aux;      \
++                            pf_this = pf_argv[3];                       \
++                            pf_argc = 3;                                \
++                            pf_kind = TT_FRAME_PROXY_GET;               \
++                            pf_aux = rt->tt_defer_aux;                  \
++                            rt->tt_defer_aux = NULL;                    \
++                        }                                               \
++                        goto push_frame;                                \
++                    }                                                   \
+                 }                                                       \
+                 if (keep) {                                             \
+                     *sp++ = val;                                        \
+@@ -19230,8 +20711,25 @@
+                 } else {
+                 put_field_slow_path:
+                     sf->cur_pc = pc;
++                    rt->tt_defer_kind = 1;
++                    rt->tt_defer_slot = &tt_dfn;
+                     ret = JS_SetPropertyInternal(ctx, obj, atom, sp[-1], obj,
+                                                  JS_PROP_THROW_STRICT);
++                    rt->tt_defer_slot = NULL;
++                    if (unlikely(ret == -2)) {
++                        /* bytecode setter: run it in-loop */
++                        sf->cur_sp = sp;
++                        pf_func = tt_dfn;
++                        pf_this = sp[-2];
++                        pf_new_target = JS_UNDEFINED;
++                        pf_argc = 1;
++                        pf_argv = sp - 1;
++                        pf_flags = 0;
++                        pf_kind = TT_FRAME_SETTER;
++                        pf_ctor_this = tt_dfn;
++                        pf_aux_i = 0;
++                        goto push_frame;
++                    }
+                     JS_FreeValue(ctx, obj);
+                     sp -= 2;
+                     if (unlikely(ret < 0))
+@@ -19439,7 +20937,18 @@
+                 } else {                                                \
+                     name ## _slow_path:                                 \
+                     sf->cur_pc = pc;                                    \
++                    /* an object KEY coerces via ToPropertyKey inside — \
++                       park it (receiver nullness throws first, like the \
++                       C path) */                                       \
++                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT &&    \
++                        !JS_IsUndefined(sp[-2]) && !JS_IsNull(sp[-2])) { \
++                        TT_COERCE_SLOT(&sp[-1], HINT_STRING, 1, 0)      \
++                        prop = sp[-1];                                  \
++                    }                                                   \
++                    rt->tt_defer_kind = 1;                              \
++                    rt->tt_defer_pending = &tt_dfn;                     \
+                     val = JS_GetPropertyValue(ctx, obj, prop);          \
++                    rt->tt_defer_pending = NULL;                        \
+                     if (unlikely(JS_IsException(val))) {                \
+                         if (keep)                                       \
+                             sp[-1] = JS_UNDEFINED;                      \
+@@ -19447,6 +20956,28 @@
+                             sp--;                                       \
+                         goto exception;                                 \
+                     }                                                   \
++                    if (unlikely(JS_VALUE_GET_TAG(val) == JS_TAG_UNINITIALIZED)) { \
++                        sp[-1] = JS_UNDEFINED; /* key already consumed */ \
++                        sf->cur_sp = sp;                                \
++                        pf_func = tt_dfn;                               \
++                        pf_this = sp[-2];                               \
++                        pf_new_target = JS_UNDEFINED;                   \
++                        pf_argc = 0;                                    \
++                        pf_argv = NULL;                                 \
++                        pf_flags = 0;                                   \
++                        pf_kind = TT_FRAME_GETTER;                      \
++                        pf_ctor_this = tt_dfn;                          \
++                        pf_aux_i = 2 + keep;                            \
++                        if (unlikely(rt->tt_defer_aux != NULL)) {       \
++                            pf_argv = (JSValue *)rt->tt_defer_aux;      \
++                            pf_this = pf_argv[3];                       \
++                            pf_argc = 3;                                \
++                            pf_kind = TT_FRAME_PROXY_GET;               \
++                            pf_aux = rt->tt_defer_aux;                  \
++                            rt->tt_defer_aux = NULL;                    \
++                        }                                               \
++                        goto push_frame;                                \
++                    }                                                   \
+                 }                                                       \
+                 if (keep) {                                             \
+                     sp[-1] = val;                                       \
+@@ -19495,6 +21026,8 @@
+                             goto exception;
+                         }
+                         sf->cur_pc = pc;
++                        if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT)
++                            TT_COERCE_SLOT(&sp[-1], HINT_STRING, 1, 0)
+                         ret_val = JS_ToPropertyKey(ctx, sp[-1]);
+                         if (JS_IsException(ret_val))
+                             goto exception;
+@@ -19610,7 +21143,29 @@
+                 } else {
+                 put_array_el_slow_path:
+                     sf->cur_pc = pc;
++                    /* the set path coerces the key before the receiver
++                       check (classic order) — park an object key */
++                    if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT)
++                        TT_COERCE_SLOT(&sp[-2], HINT_STRING, 1, 0)
++                    rt->tt_defer_kind = 1;
++                    rt->tt_defer_pending = &tt_dfn;
+                     ret = JS_SetPropertyValue(ctx, sp[-3], sp[-2], sp[-1], JS_PROP_THROW_STRICT);
++                    rt->tt_defer_pending = NULL;
++                    if (unlikely(ret == -2)) {
++                        /* bytecode setter: run it in-loop (key consumed) */
++                        sp[-2] = JS_UNDEFINED;
++                        sf->cur_sp = sp;
++                        pf_func = tt_dfn;
++                        pf_this = sp[-3];
++                        pf_new_target = JS_UNDEFINED;
++                        pf_argc = 1;
++                        pf_argv = sp - 1;
++                        pf_flags = 0;
++                        pf_kind = TT_FRAME_SETTER;
++                        pf_ctor_this = tt_dfn;
++                        pf_aux_i = 1;
++                        goto push_frame;
++                    }
+                     JS_FreeValue(ctx, sp[-3]);
+                     sp -= 3;
+                     if (unlikely(ret < 0))
+@@ -19695,10 +21250,55 @@
+ 
+         CASE(OP_append):    /* array pos enumobj -- array pos */
+             {
++                /* TimeTravelJS: js_append_enumerate mirrored as a frame
++                   machine so bytecode Symbol.iterator methods, user next()
++                   methods and generator bodies park per element. The
++                   is-array-iterator probe read happens first, exactly like
++                   the classic helper. */
++                JSValue ap_m;
++                JSCFunctionType ap_ft;
+                 sf->cur_pc = pc;
+-                if (js_append_enumerate(ctx, sp))
++                ap_m = JS_GetProperty(ctx, sp[-1], JS_ATOM_Symbol_iterator);
++                if (JS_IsException(ap_m))
+                     goto exception;
+-                JS_FreeValue(ctx, *--sp);
++                ap_ft.generic_magic = js_create_array_iterator;
++                ap_flag = JS_IsCFunction(ctx, ap_m, ap_ft.generic,
++                                         JS_ITERATOR_KIND_VALUE);
++                JS_FreeValue(ctx, ap_m);
++                /* JS_GetIterator inline: the second read + the method call */
++                ap_m = JS_GetProperty(ctx, sp[-1], JS_ATOM_Symbol_iterator);
++                if (JS_IsException(ap_m))
++                    goto exception;
++                if (!JS_IsFunction(ctx, ap_m)) {
++                    JS_FreeValue(ctx, ap_m);
++                    JS_ThrowTypeError(ctx, "value is not iterable");
++                    goto exception;
++                }
++                if (JS_VALUE_GET_TAG(ap_m) == JS_TAG_OBJECT &&
++                    JS_VALUE_GET_OBJ(ap_m)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++                    if (unlikely(js_poll_interrupts(ctx))) {
++                        JS_FreeValue(ctx, ap_m);
++                        goto exception;
++                    }
++                    sf->cur_sp = sp;
++                    pf_func = ap_m;
++                    pf_this = sp[-1];
++                    pf_new_target = JS_UNDEFINED;
++                    pf_argc = 0;
++                    pf_argv = NULL;
++                    pf_flags = 0;
++                    pf_kind = TT_FRAME_APPEND_START;
++                    pf_ctor_this = ap_m;
++                    pf_aux_i = ap_flag;
++                    pf_cargc = 0;
++                    pf_aux = NULL;
++                    goto push_frame;
++                }
++                ap_iter = JS_GetIterator2(ctx, sp[-1], ap_m);
++                JS_FreeValue(ctx, ap_m);
++                if (JS_IsException(ap_iter))
++                    goto exception;
++                goto append_phase_b;
+             }
+             BREAK;
+ 
+@@ -19760,6 +21360,7 @@
+                 } else {
+                 add_slow_case:
+                     sf->cur_pc = pc;
++                    TT_COERCE_OPERANDS(HINT_NONE, 0)
+                     if (js_add_slow(ctx, sp))
+                         goto exception;
+                     sp--;
+@@ -20253,7 +21854,7 @@
+             BREAK;
+ 
+ 
+-#define OP_CMP(opcode, binary_op, slow_call)              \
++#define OP_CMP(opcode, binary_op, slow_call, eq_mode)     \
+             CASE(opcode):                                 \
+                 {                                         \
+                 JSValue op1, op2;                         \
+@@ -20264,6 +21865,7 @@
+                     sp--;                                               \
+                 } else {                                                \
+                     sf->cur_pc = pc;                                    \
++                    TT_COERCE_OPERANDS(((eq_mode) == 1 ? HINT_NONE : HINT_NUMBER), eq_mode) \
+                     if (slow_call)                                      \
+                         goto exception;                                 \
+                     sp--;                                               \
+@@ -20271,14 +21873,14 @@
+                 }                                                       \
+             BREAK
+ 
+-            OP_CMP(OP_lt, <, js_relational_slow(ctx, sp, opcode));
+-            OP_CMP(OP_lte, <=, js_relational_slow(ctx, sp, opcode));
+-            OP_CMP(OP_gt, >, js_relational_slow(ctx, sp, opcode));
+-            OP_CMP(OP_gte, >=, js_relational_slow(ctx, sp, opcode));
+-            OP_CMP(OP_eq, ==, js_eq_slow(ctx, sp, 0));
+-            OP_CMP(OP_neq, !=, js_eq_slow(ctx, sp, 1));
+-            OP_CMP(OP_strict_eq, ==, js_strict_eq_slow(ctx, sp, 0));
+-            OP_CMP(OP_strict_neq, !=, js_strict_eq_slow(ctx, sp, 1));
++            OP_CMP(OP_lt, <, js_relational_slow(ctx, sp, opcode), 0);
++            OP_CMP(OP_lte, <=, js_relational_slow(ctx, sp, opcode), 0);
++            OP_CMP(OP_gt, >, js_relational_slow(ctx, sp, opcode), 0);
++            OP_CMP(OP_gte, >=, js_relational_slow(ctx, sp, opcode), 0);
++            OP_CMP(OP_eq, ==, js_eq_slow(ctx, sp, 0), 1);
++            OP_CMP(OP_neq, !=, js_eq_slow(ctx, sp, 1), 1);
++            OP_CMP(OP_strict_eq, ==, js_strict_eq_slow(ctx, sp, 0), 2);
++            OP_CMP(OP_strict_neq, !=, js_strict_eq_slow(ctx, sp, 1), 2);
+ 
+         CASE(OP_in):
+             sf->cur_pc = pc;
+@@ -20293,10 +21895,59 @@
+             sp--;
+             BREAK;
+         CASE(OP_instanceof):
+-            sf->cur_pc = pc;
+-            if (js_operator_instanceof(ctx, sp))
+-                goto exception;
+-            sp--;
++            {
++                /* TimeTravelJS: JS_IsInstanceOf mirrored in-loop so a
++                   bytecode Symbol.hasInstance runs as an inline frame
++                   (parkable). C methods (the normal Function.prototype
++                   one) still run inline. */
++                int hi_b;
++                JSValue hi_m;
++                sf->cur_pc = pc;
++                if (!JS_IsObject(sp[-1])) {
++                    JS_ThrowTypeError(ctx, "invalid 'instanceof' right operand");
++                    goto exception;
++                }
++                hi_m = JS_GetProperty(ctx, sp[-1], JS_ATOM_Symbol_hasInstance);
++                if (JS_IsException(hi_m))
++                    goto exception;
++                if (!JS_IsNull(hi_m) && !JS_IsUndefined(hi_m)) {
++                    if (JS_VALUE_GET_TAG(hi_m) == JS_TAG_OBJECT &&
++                        JS_VALUE_GET_OBJ(hi_m)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++                        if (unlikely(js_poll_interrupts(ctx))) {
++                            JS_FreeValue(ctx, hi_m);
++                            goto exception;
++                        }
++                        sf->cur_sp = sp;
++                        pf_func = hi_m;
++                        pf_this = sp[-1];
++                        pf_new_target = JS_UNDEFINED;
++                        pf_argc = 1;
++                        pf_argv = &sp[-2]; /* borrowed: the tested value */
++                        pf_flags = 0;
++                        pf_kind = TT_FRAME_HASINST;
++                        pf_ctor_this = hi_m;
++                        pf_aux_i = 0;
++                        pf_cargc = 0;
++                        pf_aux = NULL;
++                        goto push_frame;
++                    }
++                    hi_b = JS_ToBoolFree(ctx, JS_CallFree(ctx, hi_m, sp[-1], 1,
++                                                          (JSValueConst *)&sp[-2]));
++                } else {
++                    /* legacy case */
++                    if (!JS_IsFunction(ctx, sp[-1])) {
++                        JS_ThrowTypeError(ctx, "invalid 'instanceof' right operand");
++                        goto exception;
++                    }
++                    hi_b = JS_OrdinaryIsInstanceOf(ctx, sp[-2], sp[-1]);
++                }
++                if (hi_b < 0)
++                    goto exception;
++                JS_FreeValue(ctx, sp[-2]);
++                JS_FreeValue(ctx, sp[-1]);
++                sp[-2] = JS_NewBool(ctx, hi_b);
++                sp--;
++            }
+             BREAK;
+         CASE(OP_typeof):
+             {
+@@ -20350,6 +22001,10 @@
+                 break;
+             default:
+                 sf->cur_pc = pc;
++                /* TimeTravelJS: computed-key ToPrimitive parks (symbols
++                   are legal keys, so no nosym) */
++                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT)
++                    TT_COERCE_SLOT(&sp[-1], HINT_STRING, 1, 0)
+                 ret_val = JS_ToPropertyKey(ctx, sp[-1]);
+                 if (JS_IsException(ret_val))
+                     goto exception;
+@@ -20411,9 +22066,37 @@
+                             } 
+                             val = JS_UNDEFINED;
+                         } else {
+-                            val = JS_GetProperty(ctx, obj, atom);
++                            /* TimeTravelJS: defer a bytecode getter under
++                               with scope to an in-loop frame (parkable);
++                               resume lands at the taken-branch target. */
++                            rt->tt_defer_kind = 1;
++                            rt->tt_defer_slot = &tt_dfn;
++                            val = JS_GetPropertyInternal(ctx, obj, atom, obj, 0);
++                            rt->tt_defer_slot = NULL;
+                             if (unlikely(JS_IsException(val)))
+                                 goto exception;
++                            if (unlikely(JS_VALUE_GET_TAG(val) == JS_TAG_UNINITIALIZED)) {
++                                sf->cur_pc = pc + diff - 5;
++                                sf->cur_sp = sp;
++                                pf_func = tt_dfn;
++                                pf_this = sp[-1];
++                                pf_new_target = JS_UNDEFINED;
++                                pf_argc = 0;
++                                pf_argv = NULL;
++                                pf_flags = 0;
++                                pf_kind = TT_FRAME_GETTER;
++                                pf_ctor_this = tt_dfn;
++                                pf_aux_i = 0; /* replace sp[-1] */
++                                if (unlikely(rt->tt_defer_aux != NULL)) {
++                                    pf_argv = (JSValue *)rt->tt_defer_aux;
++                                    pf_this = pf_argv[3];
++                                    pf_argc = 3;
++                                    pf_kind = TT_FRAME_PROXY_GET;
++                                    pf_aux = rt->tt_defer_aux;
++                                    rt->tt_defer_aux = NULL;
++                                }
++                                goto push_frame;
++                            }
+                         }
+                         set_value(ctx, &sp[-1], val);
+                         break;
+@@ -20426,10 +22109,28 @@
+                             if (is_strict_mode(ctx)) {
+                                 JS_ThrowReferenceErrorNotDefined(ctx, atom);
+                                 goto exception;
+-                            } 
++                            }
+                         }
++                        rt->tt_defer_kind = 1;
++                        rt->tt_defer_slot = &tt_dfn;
+                         ret = JS_SetPropertyInternal(ctx, obj, atom, sp[-2], obj,
+                                                      JS_PROP_THROW_STRICT);
++                        rt->tt_defer_slot = NULL;
++                        if (unlikely(ret == -2)) {
++                            /* bytecode setter under with scope: in-loop */
++                            sf->cur_pc = pc + diff - 5;
++                            sf->cur_sp = sp;
++                            pf_func = tt_dfn;
++                            pf_this = sp[-1];
++                            pf_new_target = JS_UNDEFINED;
++                            pf_argc = 1;
++                            pf_argv = sp - 2; /* borrowed: the value */
++                            pf_flags = 0;
++                            pf_kind = TT_FRAME_SETTER;
++                            pf_ctor_this = tt_dfn;
++                            pf_aux_i = 0; /* free both slots, pop 2 */
++                            goto push_frame;
++                        }
+                         JS_FreeValue(ctx, sp[-1]);
+                         sp -= 2;
+                         if (unlikely(ret < 0))
+@@ -20455,9 +22156,34 @@
+                         if (!ret) {
+                             val = JS_UNDEFINED;
+                         } else {
+-                            val = JS_GetProperty(ctx, obj, atom);
++                            rt->tt_defer_kind = 1;
++                            rt->tt_defer_slot = &tt_dfn;
++                            val = JS_GetPropertyInternal(ctx, obj, atom, obj, 0);
++                            rt->tt_defer_slot = NULL;
+                             if (unlikely(JS_IsException(val)))
+                                 goto exception;
++                            if (unlikely(JS_VALUE_GET_TAG(val) == JS_TAG_UNINITIALIZED)) {
++                                sf->cur_pc = pc + diff - 5;
++                                sf->cur_sp = sp;
++                                pf_func = tt_dfn;
++                                pf_this = sp[-1];
++                                pf_new_target = JS_UNDEFINED;
++                                pf_argc = 0;
++                                pf_argv = NULL;
++                                pf_flags = 0;
++                                pf_kind = TT_FRAME_GETTER;
++                                pf_ctor_this = tt_dfn;
++                                pf_aux_i = 1; /* push the value */
++                                if (unlikely(rt->tt_defer_aux != NULL)) {
++                                    pf_argv = (JSValue *)rt->tt_defer_aux;
++                                    pf_this = pf_argv[3];
++                                    pf_argc = 3;
++                                    pf_kind = TT_FRAME_PROXY_GET;
++                                    pf_aux = rt->tt_defer_aux;
++                                    rt->tt_defer_aux = NULL;
++                                }
++                                goto push_frame;
++                            }
+                         }
+                         *sp++ = val;
+                         break;
+@@ -20578,8 +22304,219 @@
      done_generator:
          sf->cur_pc = pc;
          sf->cur_sp = sp;
 -    } else {
 -    done:
++        if (sf->tt_frame_kind == TT_FRAME_AGEN) {
++            /* async generator body ran inline: shared post half, then
++               keep driving the request queue with further in-loop body
++               runs until an await is armed or the queue goes idle */
++            struct JSAsyncGeneratorData *ags = sf->tt_aux;
++            JSValue agref = sf->tt_ctor_this;
++            int agstop;
++            rt->current_stack_frame = sf->prev_frame;
++            sf->tt_frame_kind = TT_FRAME_ENTRY; /* pump-path resumes */
++            sf->tt_ctor_this = JS_UNDEFINED;
++            ret_val = async_func_finish(ctx, tt_agen_func_state(ags), ret_val);
++            agstop = js_async_generator_resume_post(ctx, ags, ret_val);
++            if (!agstop && js_async_generator_resume_pre(ctx, ags)) {
++                JSAsyncFunctionState *afs = tt_agen_func_state(ags);
++                JSStackFrame *gsf = &afs->frame;
++                gsf->tt_frame_kind = TT_FRAME_AGEN;
++                gsf->tt_aux = ags;
++                gsf->tt_ctor_this = agref; /* carry the drive's ref */
++                gsf->prev_frame = rt->current_stack_frame;
++                rt->current_stack_frame = gsf;
++                sf = gsf;
++                TT_LOAD_FRAME();
++                sp = sf->cur_sp;
++                sf->cur_sp = NULL;
++                pc = sf->cur_pc;
++                if (afs->throw_flag)
++                    goto exception;
++                goto restart;
++            }
++            /* drive idle: release the generator ref, continue the caller */
++            JS_FreeValue(ctx, agref);
++            sf = rt->current_stack_frame;
++            TT_LOAD_FRAME();
++            sp = sf->cur_sp;
++            sf->cur_sp = NULL;
++            pc = sf->cur_pc;
++            goto restart;
++        }
 +        if (sf->tt_frame_kind == TT_FRAME_ASYNC) {
 +            /* async first segment finished (completed or hit an await):
 +               settle/wire via the shared post-half, return the promise */
@@ -835,6 +2316,33 @@
 +                    JS_FreeValue(ctx, cav[i]);
 +                sp = cav + abase;
 +                *sp++ = apromise;
++            }
++            goto restart;
++        }
++        if (sf->tt_frame_kind == TT_FRAME_AGEN_INIT) {
++            /* async generator creation prologue finished: build the
++               generator object with the shared post half */
++            struct JSAsyncGeneratorData *ags = sf->tt_aux;
++            int gcargc = sf->tt_call_argc;
++            int gbase = sf->tt_aux_i;
++            JSValueConst gfv = sf->cur_func;
++            rt->current_stack_frame = sf->prev_frame;
++            sf->tt_frame_kind = TT_FRAME_ENTRY;
++            ret_val = async_func_finish(ctx, tt_agen_func_state(ags), ret_val);
++            ret_val = js_async_generator_create_post(ctx, ags, gfv, ret_val);
++            sf = rt->current_stack_frame;
++            TT_LOAD_FRAME();
++            sp = sf->cur_sp;
++            sf->cur_sp = NULL;
++            pc = sf->cur_pc;
++            if (unlikely(JS_IsException(ret_val)))
++                goto exception;
++            {
++                JSValue *cav = sp - gcargc;
++                for(i = gbase; i < gcargc; i++)
++                    JS_FreeValue(ctx, cav[i]);
++                sp = cav + gbase;
++                *sp++ = ret_val;
 +            }
 +            goto restart;
 +        }
@@ -869,25 +2377,74 @@
 +        }
 +        if (sf->tt_frame_kind == TT_FRAME_GEN) {
 +            /* generator body ran inline: run the C post-protocol here, then
-+               hand the iterator result to the caller frame like any inlined
-+               method return */
++               deliver the result to the caller frame in the shape the call
++               site expects (method call, for-of, yield* delegation) */
 +            struct JSGeneratorData *gs = sf->tt_aux;
 +            JSAsyncFunctionState *fs = tt_generator_func_state(gs);
 +            int gcargc = sf->tt_call_argc;
++            int gshape = (sf->tt_aux_i >> 8) & 0xff;
++            int gextra = (sf->tt_aux_i >> 16) & 0xff;
++            JSValue *gablk = NULL;
 +            BOOL gdone;
++            if (gshape == TT_GENSHAPE_APPEND) {
++                /* the OP_append arena block rides as a tagged pointer */
++                gablk = JS_VALUE_GET_PTR(sf->tt_ctor_this);
++                sf->tt_ctor_this = JS_UNDEFINED;
++            }
 +            rt->current_stack_frame = sf->prev_frame;
 +            sf->tt_frame_kind = TT_FRAME_ENTRY; /* future C-path resumes */
 +            ret_val = async_func_finish(ctx, fs, ret_val);
 +            ret_val = js_generator_resume_post(ctx, gs, ret_val, &gdone);
-+            if (!JS_IsException(ret_val) && gdone != 2)
++            if (gshape != TT_GENSHAPE_FOROF && gshape != TT_GENSHAPE_APPEND &&
++                !JS_IsException(ret_val) && gdone != 2)
 +                ret_val = js_create_iterator_result(ctx, ret_val, gdone);
 +            sf = rt->current_stack_frame;
 +            TT_LOAD_FRAME();
 +            sp = sf->cur_sp;
 +            sf->cur_sp = NULL;
 +            pc = sf->cur_pc;
++            if (gshape == TT_GENSHAPE_FOROF) {
++                int goffset = -3 - gextra;
++                if (tt_forof_finish(ctx, sp, goffset, ret_val,
++                                    JS_IsException(ret_val) ? 0 :
++                                    (gdone == 2 ? 2 : (gdone ? 1 : 0))))
++                    goto exception;
++                sp += 2;
++                goto restart;
++            }
++            if (gshape == TT_GENSHAPE_APPEND) {
++                int ap_r;
++                if (JS_IsException(ret_val)) {
++                    JS_IteratorClose(ctx, gablk[0], TRUE);
++                    JS_FreeValue(ctx, gablk[0]);
++                    JS_FreeValue(ctx, gablk[1]);
++                    rt->tt_arena_top = (uint8_t *)gablk;
++                    goto exception;
++                }
++                ap_r = tt_append_step(ctx, sp, gablk, ret_val,
++                                      gdone == 2 ? 2 : (gdone ? 1 : 0));
++                if (ap_r < 0)
++                    goto exception;
++                if (ap_r == 0) {
++                    ap_blk = gablk;
++                    goto append_pump;
++                }
++                JS_FreeValue(ctx, *--sp);
++                goto restart;
++            }
 +            if (unlikely(JS_IsException(ret_val)))
 +                goto exception;
++            if (gshape == TT_GENSHAPE_ITERNEXT) {
++                JS_FreeValue(ctx, sp[-1]);
++                sp[-1] = ret_val;
++                goto restart;
++            }
++            if (gshape == TT_GENSHAPE_ITERCALL) {
++                JS_FreeValue(ctx, sp[-1]);
++                sp[-1] = ret_val;
++                *sp++ = JS_FALSE;
++                goto restart;
++            }
 +            {
 +                JSValue *cav = sp - gcargc;
 +                for(i = -2; i < gcargc; i++)
@@ -907,20 +2464,32 @@
 +       to C. Tail-call frames make the caller return the same value (via
 +       goto done in the caller's context). */
 +    {
-+        int kind, cargc;
++        int kind, cargc, kaux;
++        void *kaux_p;
 +        JSValue ctor_this;
          if (unlikely(b->var_ref_count != 0)) {
              /* variable references reference the stack: must close them */
              close_var_refs(rt, b, sf);
-@@ -20588,9 +21238,112 @@
+@@ -20588,9 +22525,658 @@
          for(pval = local_buf; pval < sp; pval++) {
              JS_FreeValue(ctx, *pval);
          }
 +        rt->current_stack_frame = sf->prev_frame;
 +        kind = sf->tt_frame_kind;
 +        cargc = sf->tt_call_argc;
++        kaux = sf->tt_aux_i;
++        kaux_p = sf->tt_aux;
 +        ctor_this = sf->tt_ctor_this;
 +        tt_arena_pop(rt, sf);
++        if (kind == TT_FRAME_BOUND_CALL || kind == TT_FRAME_BOUND_METHOD) {
++            /* release the synthesized (borrowed) argument block */
++            rt->tt_arena_top = (uint8_t *)kaux_p;
++        }
++        if (kind == TT_FRAME_TOPRIM && kaux_p) {
++            /* exotic @@toPrimitive: hint-string argument block */
++            JS_FreeValue(ctx, ((JSValue *)kaux_p)[0]);
++            rt->tt_arena_top = (uint8_t *)kaux_p;
++        }
 +        if (kind == TT_FRAME_ENTRY) {
 +            rt->tt_loop_depth--;
 +            return ret_val;
@@ -931,13 +2500,294 @@
 +        sf->cur_sp = NULL;
 +        pc = sf->cur_pc;
 +        if (unlikely(JS_IsException(ret_val))) {
-+            if (kind == TT_FRAME_CTOR)
++            if (kind == TT_FRAME_CTOR || kind == TT_FRAME_ITERCALL ||
++                kind == TT_FRAME_GETTER || kind == TT_FRAME_SETTER ||
++                kind == TT_FRAME_TOPRIM || kind == TT_FRAME_HASINST ||
++                kind == TT_FRAME_FOROF_START || kind == TT_FRAME_PROXY_GET ||
++                kind == TT_FRAME_APPEND_START)
 +                JS_FreeValue(ctx, ctor_this);
++            if (kind == TT_FRAME_PROXY_GET) {
++                JSValue *pg_blk = (JSValue *)kaux_p;
++                JS_FreeValue(ctx, pg_blk[0]);
++                JS_FreeValue(ctx, pg_blk[1]);
++                JS_FreeValue(ctx, pg_blk[2]);
++                JS_FreeValue(ctx, pg_blk[3]);
++                rt->tt_arena_top = (uint8_t *)pg_blk;
++            }
++            if (kind == TT_FRAME_APPEND_NEXT) {
++                JSValue *ap_eb = (JSValue *)kaux_p;
++                JS_IteratorClose(ctx, ap_eb[0], TRUE);
++                JS_FreeValue(ctx, ap_eb[0]);
++                JS_FreeValue(ctx, ap_eb[1]);
++                rt->tt_arena_top = (uint8_t *)ap_eb;
++            }
++            if (kind == TT_FRAME_APPLY)
++                free_arg_list(ctx, kaux_p, (uint32_t)kaux);
++            if (kind == TT_FRAME_FOROF) {
++                /* js_for_of_next error contract: clear the iterator slot */
++                JS_FreeValue(ctx, sp[-3 - kaux]);
++                sp[-3 - kaux] = JS_UNDEFINED;
++            }
 +            goto exception;
++        }
++        if (kind == TT_FRAME_GETTER) {
++            JS_FreeValue(ctx, ctor_this);
++            switch (kaux) {
++            case 0: /* get_field / get_length */
++                JS_FreeValue(ctx, sp[-1]);
++                sp[-1] = ret_val;
++                break;
++            case 1: /* get_field2 */
++                *sp++ = ret_val;
++                break;
++            case 2: /* get_array_el (key slot dead) */
++                JS_FreeValue(ctx, sp[-2]);
++                sp[-2] = ret_val;
++                sp--;
++                break;
++            default: /* get_array_el2 */
++                sp[-1] = ret_val;
++                break;
++            }
++            goto restart;
++        }
++        if (kind == TT_FRAME_SETTER) {
++            JS_FreeValue(ctx, ctor_this);
++            JS_FreeValue(ctx, ret_val); /* setter return value is discarded */
++            if (kaux == 0) { /* put_field: [obj value] */
++                JS_FreeValue(ctx, sp[-1]);
++                JS_FreeValue(ctx, sp[-2]);
++                sp -= 2;
++            } else { /* put_array_el: [obj key(dead) value] */
++                JS_FreeValue(ctx, sp[-1]);
++                JS_FreeValue(ctx, sp[-3]);
++                sp -= 3;
++            }
++            goto restart;
++        }
++        if (kind == TT_FRAME_HASINST) {
++            int hi_b;
++            JS_FreeValue(ctx, ctor_this);
++            hi_b = JS_ToBoolFree(ctx, ret_val);
++            if (hi_b < 0)
++                goto exception;
++            JS_FreeValue(ctx, sp[-2]);
++            JS_FreeValue(ctx, sp[-1]);
++            sp[-2] = JS_NewBool(ctx, hi_b);
++            sp--;
++            goto restart;
++        }
++        if (kind == TT_FRAME_FOROF_START) {
++            JSValue fs_next;
++            JS_FreeValue(ctx, ctor_this);
++            if (!JS_IsObject(ret_val)) {
++                JS_FreeValue(ctx, ret_val);
++                JS_ThrowTypeErrorNotAnObject(ctx);
++                goto exception;
++            }
++            JS_FreeValue(ctx, sp[-1]);
++            sp[-1] = ret_val;
++            fs_next = JS_GetProperty(ctx, ret_val, JS_ATOM_next);
++            if (JS_IsException(fs_next))
++                goto exception;
++            *sp++ = fs_next;
++            *sp++ = JS_NewCatchOffset(ctx, 0);
++            goto restart;
++        }
++        if (kind == TT_FRAME_APPEND_START) {
++            JS_FreeValue(ctx, ctor_this);
++            if (!JS_IsObject(ret_val)) {
++                JS_FreeValue(ctx, ret_val);
++                JS_ThrowTypeErrorNotAnObject(ctx);
++                goto exception;
++            }
++            ap_iter = ret_val;
++            ap_flag = kaux;
++            goto append_phase_b;
++        }
++        if (kind == TT_FRAME_APPEND_NEXT) {
++            int ap_r = tt_append_step(ctx, sp, (JSValue *)kaux_p, ret_val, 2);
++            if (ap_r < 0)
++                goto exception;
++            if (ap_r == 0) {
++                ap_blk = (JSValue *)kaux_p;
++                goto append_pump;
++            }
++            JS_FreeValue(ctx, *--sp);
++            goto restart;
++        }
++        if (kind == TT_FRAME_PROXY_GET) {
++            /* the trap ran; mirror js_proxy_get's invariant check, then
++               substitute per the accessor site shape in kaux */
++            JSValue *pg_blk = (JSValue *)kaux_p;
++            JSPropertyDescriptor pg_desc;
++            JSAtom pg_atom;
++            int pg_res;
++            JS_FreeValue(ctx, ctor_this);
++            pg_atom = JS_ValueToAtom(ctx, pg_blk[1]);
++            if (unlikely(pg_atom == JS_ATOM_NULL)) {
++                JS_FreeValue(ctx, ret_val);
++                goto proxy_get_blk_fail;
++            }
++            pg_res = JS_GetOwnPropertyInternal(ctx, &pg_desc,
++                                               JS_VALUE_GET_OBJ(pg_blk[0]),
++                                               pg_atom);
++            JS_FreeAtom(ctx, pg_atom);
++            if (pg_res < 0) {
++                JS_FreeValue(ctx, ret_val);
++                goto proxy_get_blk_fail;
++            }
++            if (pg_res) {
++                if ((pg_desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0) {
++                    if (!js_same_value(ctx, pg_desc.value, ret_val))
++                        goto proxy_get_inconsistent;
++                } else if ((pg_desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE)) == JS_PROP_GETSET) {
++                    if (JS_IsUndefined(pg_desc.getter) && !JS_IsUndefined(ret_val)) {
++                    proxy_get_inconsistent:
++                        js_free_desc(ctx, &pg_desc);
++                        JS_FreeValue(ctx, ret_val);
++                        JS_ThrowTypeError(ctx, "proxy: inconsistent get");
++                        goto proxy_get_blk_fail;
++                    }
++                }
++                js_free_desc(ctx, &pg_desc);
++            }
++            JS_FreeValue(ctx, pg_blk[0]);
++            JS_FreeValue(ctx, pg_blk[1]);
++            JS_FreeValue(ctx, pg_blk[2]);
++            JS_FreeValue(ctx, pg_blk[3]);
++            rt->tt_arena_top = (uint8_t *)pg_blk;
++            switch (kaux) {
++            case 0: /* get_field / with_get_var */
++                JS_FreeValue(ctx, sp[-1]);
++                sp[-1] = ret_val;
++                break;
++            case 1: /* get_field2 / with_get_ref */
++                *sp++ = ret_val;
++                break;
++            case 2: /* get_array_el (key slot dead) */
++                JS_FreeValue(ctx, sp[-2]);
++                sp[-2] = ret_val;
++                sp--;
++                break;
++            default: /* get_array_el2 */
++                sp[-1] = ret_val;
++                break;
++            }
++            goto restart;
++        proxy_get_blk_fail:
++            JS_FreeValue(ctx, pg_blk[0]);
++            JS_FreeValue(ctx, pg_blk[1]);
++            JS_FreeValue(ctx, pg_blk[2]);
++            JS_FreeValue(ctx, pg_blk[3]);
++            rt->tt_arena_top = (uint8_t *)pg_blk;
++            goto exception;
++        }
++        if (kind == TT_FRAME_TOPRIM) {
++            int thint = kaux & 0xf;
++            int tstep = (kaux >> 4) & 0xf;
++            int tdelta = (kaux >> 8) & 0xf;
++            int toffset = kaux >> 16; /* arithmetic: slot offset from sp */
++            JSValue *slotp = sp + toffset;
++            if (thint != HINT_STRING)
++                thint = HINT_NUMBER;
++            JS_FreeValue(ctx, ctor_this);
++            if (JS_VALUE_GET_TAG(ret_val) != JS_TAG_OBJECT) {
++                if ((kaux & 0x1000) &&
++                    JS_VALUE_GET_TAG(ret_val) == JS_TAG_SYMBOL) {
++                    /* ToString continuation: a symbol never substitutes
++                       (String() would take its direct-symbol path) */
++                    JS_FreeValue(ctx, ret_val);
++                    JS_ThrowTypeError(ctx, "cannot convert symbol to string");
++                    goto exception;
++                }
++                /* primitive: substitute and re-dispatch the armed instr */
++                JS_FreeValue(ctx, *slotp);
++                *slotp = ret_val;
++                pc = sf->cur_pc - tdelta;
++                goto restart;
++            }
++            JS_FreeValue(ctx, ret_val);
++            if (tstep >= 1) {
++                JS_ThrowTypeError(ctx, "toPrimitive");
++                goto exception;
++            }
++            {
++                /* try the second OrdinaryToPrimitive method */
++                JSAtom mname = ((1 ^ thint) == 0) ? JS_ATOM_toString : JS_ATOM_valueOf;
++                JSValue m2 = JS_GetProperty(ctx, *slotp, mname);
++                if (JS_IsException(m2))
++                    goto exception;
++                if (JS_IsFunction(ctx, m2)) {
++                    if (JS_VALUE_GET_TAG(m2) == JS_TAG_OBJECT &&
++                        JS_VALUE_GET_OBJ(m2)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++                        sf->cur_sp = sp;
++                        pf_func = m2;
++                        pf_this = *slotp;
++                        pf_new_target = JS_UNDEFINED;
++                        pf_argc = 0;
++                        pf_argv = NULL;
++                        pf_flags = 0;
++                        pf_kind = TT_FRAME_TOPRIM;
++                        pf_ctor_this = m2;
++                        pf_aux_i = (int)((uint32_t)toffset << 16) |
++                                   (kaux & 0x1000) |
++                                   (tdelta << 8) | (1 << 4) | thint;
++                        pf_cargc = 0;
++                        pf_aux = NULL;
++                        goto push_frame;
++                    }
++                    {
++                        JSValue r2 = JS_CallFree(ctx, m2, *slotp, 0, NULL);
++                        if (JS_IsException(r2))
++                            goto exception;
++                        if (JS_VALUE_GET_TAG(r2) != JS_TAG_OBJECT) {
++                            JS_FreeValue(ctx, *slotp);
++                            *slotp = r2;
++                            pc = sf->cur_pc - tdelta;
++                            goto restart;
++                        }
++                        JS_FreeValue(ctx, r2);
++                    }
++                }
++                else
++                    JS_FreeValue(ctx, m2);
++                JS_ThrowTypeError(ctx, "toPrimitive");
++                goto exception;
++            }
++        }
++        if (kind == TT_FRAME_FOROF) {
++            int goffset = -3 - kaux;
++            if (!JS_IsObject(ret_val)) {
++                JS_FreeValue(ctx, ret_val);
++                JS_ThrowTypeError(ctx, "iterator must return an object");
++                JS_FreeValue(ctx, sp[goffset]);
++                sp[goffset] = JS_UNDEFINED;
++                goto exception;
++            }
++            if (tt_forof_finish(ctx, sp, goffset, ret_val, 2))
++                goto exception;
++            sp += 2;
++            goto restart;
++        }
++        if (kind == TT_FRAME_ITERNEXT) {
++            JS_FreeValue(ctx, sp[-1]);
++            sp[-1] = ret_val;
++            goto restart;
++        }
++        if (kind == TT_FRAME_ITERCALL) {
++            JS_FreeValue(ctx, ctor_this); /* the fetched throw/return method */
++            JS_FreeValue(ctx, sp[-1]);
++            sp[-1] = ret_val;
++            *sp++ = JS_FALSE;
++            goto restart;
 +        }
 +        {
 +            JSValue *cav = sp - cargc;
-+            int base = (kind == TT_FRAME_CALL || kind == TT_FRAME_TAIL) ? -1 : -2;
++            int base = (kind == TT_FRAME_CALL || kind == TT_FRAME_TAIL ||
++                        kind == TT_FRAME_BOUND_CALL) ? -1 : -2;
++            if (kind == TT_FRAME_APPLY)
++                free_arg_list(ctx, kaux_p, (uint32_t)kaux);
 +            for(i = base; i < cargc; i++)
 +                JS_FreeValue(ctx, cav[i]);
 +            sp = cav + base;
@@ -961,6 +2811,185 @@
 +       (parameter defaults etc.) in this loop up to OP_initial_yield; the
 +       TT_FRAME_GEN_INIT done path builds the generator object. Reached only
 +       by goto with pf_func/pf_this/pf_argc/pf_argv/gi_base staged. */
++ append_phase_b:
++    /* OP_append continues with the iterator in ap_iter (owned) and the
++       fast-path eligibility in ap_flag; stack still [array pos source]. */
++    {
++        JSValue ap_nm = JS_GetProperty(ctx, ap_iter, JS_ATOM_next);
++        if (JS_IsException(ap_nm)) {
++            JS_FreeValue(ctx, ap_iter);
++            goto exception;
++        }
++        if (ap_flag) {
++            /* classic fast path: builtin array iterator over a fast array */
++            JSCFunctionType ap_ft2;
++            JSValue *ap_arrp;
++            uint32_t ap_count;
++            ap_ft2.iterator_next = js_array_iterator_next;
++            if (JS_IsCFunction(ctx, ap_nm, ap_ft2.generic, 0) &&
++                js_get_fast_array(ctx, sp[-1], &ap_arrp, &ap_count)) {
++                uint32_t ap_len, ap_i2, ap_pos;
++                if (js_get_length32(ctx, &ap_len, sp[-1])) {
++                    JS_FreeValue(ctx, ap_iter);
++                    JS_FreeValue(ctx, ap_nm);
++                    goto exception;
++                }
++                if (ap_len == ap_count) {
++                    ap_pos = (uint32_t)JS_VALUE_GET_INT(sp[-2]);
++                    for (ap_i2 = 0; ap_i2 < ap_count; ap_i2++) {
++                        if (JS_DefinePropertyValueUint32(ctx, sp[-3], ap_pos++,
++                                                         JS_DupValue(ctx, ap_arrp[ap_i2]),
++                                                         JS_PROP_C_W_E) < 0) {
++                            JS_FreeValue(ctx, ap_iter);
++                            JS_FreeValue(ctx, ap_nm);
++                            goto exception;
++                        }
++                    }
++                    sp[-2] = JS_NewInt32(ctx, ap_pos);
++                    JS_FreeValue(ctx, ap_iter);
++                    JS_FreeValue(ctx, ap_nm);
++                    JS_FreeValue(ctx, *--sp);
++                    goto restart;
++                }
++                /* length mismatch: elements may live on the prototype —
++                   general case, like the classic helper */
++            }
++        }
++        ap_blk = tt_arena_alloc_vals(rt, 2);
++        if (unlikely(!ap_blk)) {
++            JS_FreeValue(ctx, ap_iter);
++            JS_FreeValue(ctx, ap_nm);
++            JS_ThrowStackOverflow(caller_ctx);
++            goto exception;
++        }
++        ap_blk[0] = ap_iter;
++        ap_blk[1] = ap_nm;
++        goto append_pump;
++    }
++
++ append_pump:
++    /* dispatch ONE next() per pass: bytecode next methods and generator
++       bodies run as frames (parkable); C iterators loop here inline. */
++    {
++        if (JS_VALUE_GET_TAG(ap_blk[1]) == JS_TAG_OBJECT) {
++            JSObject *ap_np = JS_VALUE_GET_OBJ(ap_blk[1]);
++            if (ap_np->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++                if (unlikely(js_poll_interrupts(ctx)))
++                    goto append_pump_fail;
++                sf->cur_sp = sp;
++                pf_func = ap_blk[1];
++                pf_this = ap_blk[0];
++                pf_new_target = JS_UNDEFINED;
++                pf_argc = 0;
++                pf_argv = NULL;
++                pf_flags = 0;
++                pf_kind = TT_FRAME_APPEND_NEXT;
++                pf_ctor_this = JS_UNDEFINED;
++                pf_aux_i = 0;
++                pf_cargc = 0;
++                pf_aux = ap_blk;
++                goto push_frame;
++            }
++            if (ap_np->class_id == JS_CLASS_C_FUNCTION &&
++                ap_np->u.cfunc.cproto == JS_CFUNC_iterator_next &&
++                ap_np->u.cfunc.c_function.iterator_next == js_generator_next &&
++                JS_VALUE_GET_TAG(ap_blk[0]) == JS_TAG_OBJECT &&
++                JS_VALUE_GET_OBJ(ap_blk[0])->class_id == JS_CLASS_GENERATOR) {
++                struct JSGeneratorData *ap_gs =
++                    JS_GetOpaque(ap_blk[0], JS_CLASS_GENERATOR);
++                BOOL ap_gdone;
++                JSValue ap_gret;
++                if (unlikely(js_poll_interrupts(ctx)))
++                    goto append_pump_fail;
++                if (js_generator_resume_pre(ctx, ap_gs, GEN_MAGIC_NEXT,
++                                            JS_UNDEFINED, &ap_gdone, &ap_gret)) {
++                    int ap_r;
++                    if (JS_IsException(ap_gret))
++                        goto append_pump_fail;
++                    ap_r = tt_append_step(ctx, sp, ap_blk, ap_gret,
++                                          ap_gdone == 2 ? 2 : (ap_gdone ? 1 : 0));
++                    if (ap_r < 0)
++                        goto exception;
++                    if (ap_r == 0)
++                        goto append_pump;
++                    JS_FreeValue(ctx, *--sp);
++                    goto restart;
++                }
++                {
++                    /* run the generator body in-loop; the APPEND shape's
++                       completion defines the element and pumps on. The
++                       arena block rides in tt_ctor_this as a tagged
++                       pointer (never refcounted). */
++                    JSAsyncFunctionState *ap_fs = tt_generator_func_state(ap_gs);
++                    JSStackFrame *ap_gsf = &ap_fs->frame;
++                    sf->cur_sp = sp;
++                    ap_gsf->tt_frame_kind = TT_FRAME_GEN;
++                    ap_gsf->tt_aux = ap_gs;
++                    ap_gsf->tt_aux_i = GEN_MAGIC_NEXT | (TT_GENSHAPE_APPEND << 8);
++                    ap_gsf->tt_call_argc = 0;
++                    ap_gsf->tt_ctor_this = JS_MKPTR(JS_TAG_INT, ap_blk);
++                    ap_gsf->prev_frame = rt->current_stack_frame;
++                    rt->current_stack_frame = ap_gsf;
++                    sf = ap_gsf;
++                    TT_LOAD_FRAME();
++                    sp = sf->cur_sp;
++                    sf->cur_sp = NULL;
++                    pc = sf->cur_pc;
++                    if (ap_fs->throw_flag)
++                        goto exception;
++                    goto restart;
++                }
++            }
++        }
++        {
++            BOOL ap_done;
++            JSValue ap_v = JS_IteratorNext(ctx, ap_blk[0], ap_blk[1],
++                                           0, NULL, &ap_done);
++            int ap_r;
++            if (JS_IsException(ap_v))
++                goto append_pump_fail;
++            ap_r = tt_append_step(ctx, sp, ap_blk, ap_v, ap_done ? 1 : 0);
++            if (ap_r < 0)
++                goto exception;
++            if (ap_r == 0)
++                goto append_pump;
++            JS_FreeValue(ctx, *--sp);
++            goto restart;
++        }
++    append_pump_fail:
++        JS_IteratorClose(ctx, ap_blk[0], TRUE);
++        JS_FreeValue(ctx, ap_blk[0]);
++        JS_FreeValue(ctx, ap_blk[1]);
++        rt->tt_arena_top = (uint8_t *)ap_blk;
++        goto exception;
++    }
++
++ agen_init_call:
++    {
++        struct JSAsyncGeneratorData *ags2 =
++            js_async_generator_create_pre(ctx, pf_func, pf_this, pf_argc,
++                                          (JSValueConst *)pf_argv);
++        JSAsyncFunctionState *afs2;
++        JSStackFrame *agsf2;
++        if (unlikely(!ags2))
++            goto exception;
++        afs2 = tt_agen_func_state(ags2);
++        agsf2 = &afs2->frame;
++        sf->cur_sp = sp;
++        agsf2->tt_frame_kind = TT_FRAME_AGEN_INIT;
++        agsf2->tt_aux = ags2;
++        agsf2->tt_aux_i = gi_base;
++        agsf2->tt_call_argc = (uint16_t)pf_argc;
++        agsf2->prev_frame = rt->current_stack_frame;
++        rt->current_stack_frame = agsf2;
++        sf = agsf2;
++        TT_LOAD_FRAME();
++        sp = sf->cur_sp;
++        sf->cur_sp = NULL;
++        pc = sf->cur_pc;
++        goto restart;
++    }
++
 + gen_init_call:
 +    {
 +        struct JSGeneratorData *gs2 =
@@ -984,6 +3013,81 @@
 +        sp = sf->cur_sp;
 +        sf->cur_sp = NULL;
 +        pc = sf->cur_pc;
++        goto restart;
++    }
++
++    /* stackless bound-function unwrap: resolve the chain, synthesize the
++       argument vector in an arena block (all values borrowed, exactly like
++       js_call_bound_function's alloca buffer), run the target in-loop.
++       Reached only by goto with call_argc/call_argv/uw_base staged. */
++ unwrap_bound:
++    {
++        JSObject *bp = JS_VALUE_GET_OBJ(call_argv[-1]);
++        JSBoundFunction *bf;
++        JSValue *ublock;
++        int total = call_argc, nb, i2;
++
++        while (bp->class_id == JS_CLASS_BOUND_FUNCTION) {
++            bf = bp->u.bound_function;
++            total += bf->argc;
++            if (JS_VALUE_GET_TAG(bf->func_obj) != JS_TAG_OBJECT)
++                break;
++            bp = JS_VALUE_GET_OBJ(bf->func_obj);
++        }
++        if (bp->class_id != JS_CLASS_BYTECODE_FUNCTION ||
++            bp->u.func.function_bytecode->func_kind != JS_FUNC_NORMAL)
++            goto unwrap_bound_slow;
++        if (unlikely(js_poll_interrupts(ctx)))
++            goto exception;
++        ublock = tt_arena_alloc_vals(rt, (size_t)total);
++        if (unlikely(!ublock)) {
++            JS_ThrowStackOverflow(caller_ctx);
++            goto exception;
++        }
++        /* tail = the call-site args; walk outer→inner prepending bound args */
++        nb = total - call_argc;
++        for (i2 = 0; i2 < call_argc; i2++)
++            ublock[nb + i2] = call_argv[i2];
++        bp = JS_VALUE_GET_OBJ(call_argv[-1]);
++        while (bp->class_id == JS_CLASS_BOUND_FUNCTION) {
++            bf = bp->u.bound_function;
++            nb -= bf->argc;
++            for (i2 = 0; i2 < bf->argc; i2++)
++                ublock[nb + bf->argc - 1 - i2] = bf->argv[bf->argc - 1 - i2];
++            bp = JS_VALUE_GET_OBJ(bf->func_obj);
++        }
++        /* deepest bound this wins */
++        {
++            JSObject *tp = JS_VALUE_GET_OBJ(call_argv[-1]);
++            JSValueConst deep_this = JS_UNDEFINED;
++            while (tp->class_id == JS_CLASS_BOUND_FUNCTION) {
++                deep_this = tp->u.bound_function->this_val;
++                tp = JS_VALUE_GET_OBJ(tp->u.bound_function->func_obj);
++            }
++            sf->cur_sp = sp;
++            pf_func = JS_MKPTR(JS_TAG_OBJECT, bp);
++            pf_this = deep_this;
++        }
++        pf_new_target = JS_UNDEFINED;
++        pf_argc = total;
++        pf_argv = ublock;
++        pf_flags = 0;
++        pf_kind = (uw_base == -1) ? TT_FRAME_BOUND_CALL : TT_FRAME_BOUND_METHOD;
++        pf_ctor_this = JS_UNDEFINED;
++        pf_aux_i = 0;
++        pf_cargc = call_argc;
++        pf_aux = ublock;
++        goto push_frame;
++    unwrap_bound_slow:
++        ret_val = JS_CallInternal(ctx, call_argv[-1],
++                                  uw_base == -2 ? call_argv[-2] : JS_UNDEFINED,
++                                  JS_UNDEFINED, call_argc, call_argv, 0);
++        if (unlikely(JS_IsException(ret_val)))
++            goto exception;
++        for(i = uw_base; i < call_argc; i++)
++            JS_FreeValue(ctx, call_argv[i]);
++        sp = call_argv + uw_base;
++        *sp++ = ret_val;
 +        goto restart;
 +    }
 +
@@ -1027,7 +3131,7 @@
  }
  
  #ifdef OPCODE_ASM_LABEL
-@@ -20803,6 +21556,19 @@
+@@ -20803,6 +23389,19 @@
      sf->arg_count = arg_buf_len;
      sf->var_buf = sf->arg_buf + arg_buf_len;
      sf->cur_sp = sf->var_buf + b->var_count;
@@ -1047,7 +3151,7 @@
      sf->var_refs = (JSVarRef **)(sf->cur_sp + b->stack_size);
      for(i = 0; i < b->var_ref_count; i++)
          sf->var_refs[i] = NULL;
-@@ -20831,28 +21597,22 @@
+@@ -20831,28 +23430,22 @@
      JS_FreeValueRT(rt, s->this_val);
  }
  
@@ -1083,7 +3187,7 @@
          if (JS_IsUndefined(ret)) {
              ret = sf->cur_sp[-1];
              sf->cur_sp[-1] = JS_UNDEFINED;
-@@ -20862,12 +21622,29 @@
+@@ -20862,12 +23455,29 @@
  
          /* close the closure variables. */
          close_var_refs(rt, b, sf);
@@ -1114,7 +3218,7 @@
  static void __async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
  {
      /* cannot close the closure variables here because it would
-@@ -20915,6 +21692,12 @@
+@@ -20915,6 +23525,12 @@
      JSAsyncFunctionState *func_state;
  } JSGeneratorData;
  
@@ -1127,10 +3231,15 @@
  static void free_generator_stack_rt(JSRuntime *rt, JSGeneratorData *s)
  {
      if (s->state == JS_GENERATOR_STATE_COMPLETED)
-@@ -20957,21 +21740,27 @@
- #define GEN_MAGIC_RETURN 1
- #define GEN_MAGIC_THROW  2
+@@ -20952,26 +23568,27 @@
+     mark_func(rt, &s->func_state->header);
+ }
  
+-/* XXX: use enum */
+-#define GEN_MAGIC_NEXT   0
+-#define GEN_MAGIC_RETURN 1
+-#define GEN_MAGIC_THROW  2
+-
 -static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
 -                                 int argc, JSValueConst *argv,
 -                                 BOOL *pdone, int magic)
@@ -1162,7 +3271,7 @@
          if (magic == GEN_MAGIC_NEXT) {
              goto exec_no_arg;
          } else {
-@@ -20983,7 +21772,7 @@
+@@ -20983,7 +23600,7 @@
      case JS_GENERATOR_STATE_SUSPENDED_YIELD:
          sf = &s->func_state->frame;
          /* cur_sp[-1] was set to JS_UNDEFINED in the previous call */
@@ -1171,7 +3280,7 @@
          if (magic == GEN_MAGIC_THROW &&
              s->state == JS_GENERATOR_STATE_SUSPENDED_YIELD) {
              JS_Throw(ctx, ret);
-@@ -20996,26 +21785,7 @@
+@@ -20996,26 +23613,7 @@
              s->func_state->throw_flag = FALSE;
          }
          s->state = JS_GENERATOR_STATE_EXECUTING;
@@ -1199,7 +3308,7 @@
      case JS_GENERATOR_STATE_COMPLETED:
      done:
          /* execution is finished */
-@@ -21025,10 +21795,10 @@
+@@ -21025,10 +23623,10 @@
              ret = JS_UNDEFINED;
              break;
          case GEN_MAGIC_RETURN:
@@ -1212,7 +3321,7 @@
              break;
          }
          break;
-@@ -21036,33 +21806,88 @@
+@@ -21036,33 +23634,88 @@
          ret = JS_ThrowTypeError(ctx, "cannot invoke a running generator");
          break;
      }
@@ -1311,7 +3420,7 @@
      obj = js_create_from_ctor(ctx, func_obj, JS_CLASS_GENERATOR);
      if (JS_IsException(obj))
          goto fail;
-@@ -21074,6 +21899,22 @@
+@@ -21074,6 +23727,22 @@
      return JS_EXCEPTION;
  }
  
@@ -1334,7 +3443,7 @@
  /* AsyncFunction */
  
  static void js_async_function_resolve_finalizer(JSRuntime *rt, JSValue val)
-@@ -21118,11 +21959,14 @@
+@@ -21118,11 +23787,14 @@
      return 0;
  }
  
@@ -1352,7 +3461,7 @@
      if (s->is_completed) {
          if (JS_IsException(func_ret)) {
              JSValue error;
-@@ -21173,6 +22017,11 @@
+@@ -21173,6 +23845,11 @@
      }
  }
  
@@ -1364,7 +3473,317 @@
  static JSValue js_async_function_resolve_call(JSContext *ctx,
                                                JSValueConst func_obj,
                                                JSValueConst this_obj,
-@@ -47146,6 +47995,12 @@
+@@ -21448,25 +24125,38 @@
+     return res;
+ }
+ 
+-static void js_async_generator_resume_next(JSContext *ctx,
+-                                           JSAsyncGeneratorData *s)
++/* TimeTravelJS: js_async_generator_resume_next split into the pre half
++   (advance the state machine until a body run is staged: 1 = run the
++   body, 0 = nothing runnable) and the post half (absorb one body run's
++   completion: 1 = an await was armed, stop driving). The classic
++   resume_next below is exactly pre/run/post in a loop, so the in-loop
++   and job-pump drivers share every observable step with the C path. */
++static JSAsyncFunctionState *tt_agen_func_state(struct JSAsyncGeneratorData *s)
++{
++    return s->func_state;
++}
++
++static int js_async_generator_resume_pre(JSContext *ctx,
++                                         JSAsyncGeneratorData *s)
+ {
+     JSAsyncGeneratorRequest *next;
+-    JSValue func_ret, value;
++    JSValue value;
+ 
+     for(;;) {
+         if (list_empty(&s->queue))
+-            break;
++            return 0;
+         next = list_entry(s->queue.next, JSAsyncGeneratorRequest, link);
+         switch(s->state) {
+         case JS_ASYNC_GENERATOR_STATE_EXECUTING:
+             /* only happens when restarting execution after await() */
+-            goto resume_exec;
++            return 1;
+         case JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN:
+-            goto done;
++            return 0;
+         case JS_ASYNC_GENERATOR_STATE_SUSPENDED_START:
+             if (next->completion_type == GEN_MAGIC_NEXT) {
+-                goto exec_no_arg;
++                s->func_state->throw_flag = FALSE;
++                s->state = JS_ASYNC_GENERATOR_STATE_EXECUTING;
++                return 1;
+             } else {
+                 js_async_generator_complete(ctx, s);
+             }
+@@ -21480,7 +24170,7 @@
+             } else {
+                 js_async_generator_reject(ctx, s, next->result);
+             }
+-            goto done;
++            return 0;
+         case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD:
+         case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
+             value = JS_DupValue(ctx, next->result);
+@@ -21495,59 +24185,78 @@
+                 s->func_state->frame.cur_sp[0] =
+                     JS_NewInt32(ctx, next->completion_type);
+                 s->func_state->frame.cur_sp++;
+-            exec_no_arg:
+                 s->func_state->throw_flag = FALSE;
+             }
+             s->state = JS_ASYNC_GENERATOR_STATE_EXECUTING;
+-        resume_exec:
+-            func_ret = async_func_resume(ctx, s->func_state);
+-            if (s->func_state->is_completed) {
+-                if (JS_IsException(func_ret)) {
+-                    value = JS_GetException(ctx);
+-                    js_async_generator_complete(ctx, s);
+-                    js_async_generator_reject(ctx, s, value);
+-                    JS_FreeValue(ctx, value);
+-                } else {
+-                    /* end of function */
+-                    js_async_generator_complete(ctx, s);
+-                    js_async_generator_resolve(ctx, s, func_ret, TRUE);
+-                    JS_FreeValue(ctx, func_ret);
+-                }
+-            } else {
+-                int func_ret_code, ret;
+-                assert(JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT);
+-                func_ret_code = JS_VALUE_GET_INT(func_ret);
+-                value = s->func_state->frame.cur_sp[-1];
+-                s->func_state->frame.cur_sp[-1] = JS_UNDEFINED;
+-                switch(func_ret_code) {
+-                case FUNC_RET_YIELD:
+-                case FUNC_RET_YIELD_STAR:
+-                    if (func_ret_code == FUNC_RET_YIELD_STAR)
+-                        s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR;
+-                    else
+-                        s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD;
+-                    js_async_generator_resolve(ctx, s, value, FALSE);
+-                    JS_FreeValue(ctx, value);
+-                    break;
+-                case FUNC_RET_AWAIT:
+-                    ret = js_async_generator_await(ctx, s, value);
+-                    JS_FreeValue(ctx, value);
+-                    if (ret < 0) {
+-                        /* exception: throw it */
+-                        s->func_state->throw_flag = TRUE;
+-                        goto resume_exec;
+-                    }
+-                    goto done;
+-                default:
+-                    abort();
+-                }
++            return 1;
++        default:
++            abort();
++        }
++    }
++}
++
++static int js_async_generator_resume_post(JSContext *ctx,
++                                          JSAsyncGeneratorData *s,
++                                          JSValue func_ret)
++{
++    JSValue value;
++
++    if (s->func_state->is_completed) {
++        if (JS_IsException(func_ret)) {
++            value = JS_GetException(ctx);
++            js_async_generator_complete(ctx, s);
++            js_async_generator_reject(ctx, s, value);
++            JS_FreeValue(ctx, value);
++        } else {
++            /* end of function */
++            js_async_generator_complete(ctx, s);
++            js_async_generator_resolve(ctx, s, func_ret, TRUE);
++            JS_FreeValue(ctx, func_ret);
++        }
++        return 0;
++    } else {
++        int func_ret_code, ret;
++        assert(JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT);
++        func_ret_code = JS_VALUE_GET_INT(func_ret);
++        value = s->func_state->frame.cur_sp[-1];
++        s->func_state->frame.cur_sp[-1] = JS_UNDEFINED;
++        switch(func_ret_code) {
++        case FUNC_RET_YIELD:
++        case FUNC_RET_YIELD_STAR:
++            if (func_ret_code == FUNC_RET_YIELD_STAR)
++                s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR;
++            else
++                s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD;
++            js_async_generator_resolve(ctx, s, value, FALSE);
++            JS_FreeValue(ctx, value);
++            return 0;
++        case FUNC_RET_AWAIT:
++            ret = js_async_generator_await(ctx, s, value);
++            JS_FreeValue(ctx, value);
++            if (ret < 0) {
++                /* exception: throw it (the request is still queued and
++                   the state is EXECUTING, so the next pre() reruns the
++                   body — the classic `goto resume_exec`) */
++                s->func_state->throw_flag = TRUE;
++                return 0;
+             }
+-            break;
++            return 1;
+         default:
+             abort();
+         }
+     }
+- done: ;
++}
++
++static void js_async_generator_resume_next(JSContext *ctx,
++                                           JSAsyncGeneratorData *s)
++{
++    JSValue func_ret;
++
++    while (js_async_generator_resume_pre(ctx, s)) {
++        func_ret = async_func_resume(ctx, s->func_state);
++        if (js_async_generator_resume_post(ctx, s, func_ret))
++            break;
++    }
+ }
+ 
+ static JSValue js_async_generator_resolve_function(JSContext *ctx,
+@@ -21586,14 +24295,19 @@
+ }
+ 
+ /* magic = GEN_MAGIC_x */
+-static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val,
+-                                       int argc, JSValueConst *argv,
+-                                       int magic)
++/* TimeTravelJS: everything js_async_generator_next does BEFORE resuming
++   the body (capability + enqueue). *pdrive is set when the caller must
++   then drive the state machine (classically or in-loop). */
++static JSValue js_async_generator_next_prelude(JSContext *ctx,
++                                               JSValueConst this_val,
++                                               JSValueConst arg, int magic,
++                                               struct JSAsyncGeneratorData **pdrive)
+ {
+     JSAsyncGeneratorData *s = JS_GetOpaque(this_val, JS_CLASS_ASYNC_GENERATOR);
+     JSValue promise, resolving_funcs[2];
+     JSAsyncGeneratorRequest *req;
+ 
++    *pdrive = NULL;
+     promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+     if (JS_IsException(promise))
+         return JS_EXCEPTION;
+@@ -21613,14 +24327,13 @@
+     if (!req)
+         goto fail;
+     req->completion_type = magic;
+-    req->result = JS_DupValue(ctx, argv[0]);
++    req->result = JS_DupValue(ctx, arg);
+     req->promise = JS_DupValue(ctx, promise);
+     req->resolving_funcs[0] = resolving_funcs[0];
+     req->resolving_funcs[1] = resolving_funcs[1];
+     list_add_tail(&req->link, &s->queue);
+-    if (s->state != JS_ASYNC_GENERATOR_STATE_EXECUTING) {
+-        js_async_generator_resume_next(ctx, s);
+-    }
++    if (s->state != JS_ASYNC_GENERATOR_STATE_EXECUTING)
++        *pdrive = s;
+     return promise;
+  fail:
+     JS_FreeValue(ctx, resolving_funcs[0]);
+@@ -21629,29 +24342,54 @@
+     return JS_EXCEPTION;
+ }
+ 
+-static JSValue js_async_generator_function_call(JSContext *ctx, JSValueConst func_obj,
+-                                                JSValueConst this_obj,
+-                                                int argc, JSValueConst *argv,
+-                                                int flags)
++static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val,
++                                       int argc, JSValueConst *argv,
++                                       int magic)
++{
++    JSAsyncGeneratorData *drive;
++    JSValue promise;
++
++    promise = js_async_generator_next_prelude(ctx, this_val, argv[0], magic,
++                                              &drive);
++    if (drive)
++        js_async_generator_resume_next(ctx, drive);
++    return promise;
++}
++
++/* TimeTravelJS: creation split into the pre half (allocate + bind the
++   frame; no user code) and the post half (wrap the prologue's completion
++   into the generator object), shared by the classic path below and the
++   in-loop TT_FRAME_AGEN_INIT frame. */
++static JSAsyncGeneratorData *js_async_generator_create_pre(JSContext *ctx,
++                                                           JSValueConst func_obj,
++                                                           JSValueConst this_obj,
++                                                           int argc, JSValueConst *argv)
+ {
+-    JSValue obj, func_ret;
+     JSAsyncGeneratorData *s;
+ 
+     s = js_mallocz(ctx, sizeof(*s));
+     if (!s)
+-        return JS_EXCEPTION;
++        return NULL;
+     s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_START;
+     init_list_head(&s->queue);
+     s->func_state = async_func_init(ctx, func_obj, this_obj, argc, argv);
+-    if (!s->func_state)
+-        goto fail;
+-    /* execute the function up to 'OP_initial_yield' (no yield nor
+-       await are possible) */
+-    func_ret = async_func_resume(ctx, s->func_state);
++    if (!s->func_state) {
++        js_async_generator_free(ctx->rt, s);
++        return NULL;
++    }
++    return s;
++}
++
++static JSValue js_async_generator_create_post(JSContext *ctx,
++                                              JSAsyncGeneratorData *s,
++                                              JSValueConst func_obj,
++                                              JSValue func_ret)
++{
++    JSValue obj;
++
+     if (JS_IsException(func_ret))
+         goto fail;
+     JS_FreeValue(ctx, func_ret);
+-
+     obj = js_create_from_ctor(ctx, func_obj, JS_CLASS_ASYNC_GENERATOR);
+     if (JS_IsException(obj))
+         goto fail;
+@@ -21663,6 +24401,22 @@
+     return JS_EXCEPTION;
+ }
+ 
++static JSValue js_async_generator_function_call(JSContext *ctx, JSValueConst func_obj,
++                                                JSValueConst this_obj,
++                                                int argc, JSValueConst *argv,
++                                                int flags)
++{
++    JSAsyncGeneratorData *s;
++
++    s = js_async_generator_create_pre(ctx, func_obj, this_obj, argc, argv);
++    if (!s)
++        return JS_EXCEPTION;
++    /* execute the function up to 'OP_initial_yield' (no yield nor
++       await are possible) */
++    return js_async_generator_create_post(ctx, s, func_obj,
++                                          async_func_resume(ctx, s->func_state));
++}
++
+ /* JS parser */
+ 
+ enum {
+@@ -47146,6 +49900,12 @@
  static void js_random_init(JSContext *ctx)
  {
      struct timeval tv;
@@ -1377,12 +3796,92 @@
      gettimeofday(&tv, NULL);
      ctx->random_state = ((int64_t)tv.tv_sec * 1000000) + tv.tv_usec;
      /* the state must be non zero */
-@@ -53280,6 +54135,229 @@
+@@ -50587,8 +53347,15 @@
+     int res;
+     JSValueConst args[3];
+     JSPropertyDescriptor desc;
++    JSValue *tt_save;
+ 
++    /* TimeTravelJS: the handler.get read must not consume an armed
++       accessor defer (it is a nested property read, not the accessor
++       the site armed for) */
++    tt_save = ctx->rt->tt_defer_slot;
++    ctx->rt->tt_defer_slot = NULL;
+     s = get_proxy_method(ctx, &method, obj, JS_ATOM_get);
++    ctx->rt->tt_defer_slot = tt_save;
+     if (!s)
+         return JS_EXCEPTION;
+     /* Note: recursion is possible thru the prototype of s->target */
+@@ -50599,6 +53366,30 @@
+         JS_FreeValue(ctx, method);
+         return JS_EXCEPTION;
+     }
++    /* TimeTravelJS: a bytecode get trap at an armed accessor site defers
++       to an in-loop TT_FRAME_PROXY_GET frame (parkable). The trap args
++       plus the handler ride in an arena block; the frame's post runs the
++       invariant check. Revocation during the trap is safe: the block
++       holds dups and revoke never frees target/handler. */
++    if (unlikely(ctx->rt->tt_defer_slot != NULL) &&
++        ctx->rt->tt_defer_kind == 1 &&
++        JS_VALUE_GET_TAG(method) == JS_TAG_OBJECT &&
++        JS_VALUE_GET_OBJ(method)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++        JSValue *blk = tt_arena_alloc_vals(ctx->rt, 4);
++        if (!blk) {
++            JS_FreeValue(ctx, method);
++            JS_FreeValue(ctx, atom_val);
++            return JS_ThrowStackOverflow(ctx);
++        }
++        blk[0] = JS_DupValue(ctx, s->target);
++        blk[1] = atom_val; /* owned by the block */
++        blk[2] = JS_DupValue(ctx, receiver);
++        blk[3] = JS_DupValue(ctx, s->handler);
++        *ctx->rt->tt_defer_slot = method; /* owned: the trap function */
++        ctx->rt->tt_defer_slot = NULL;
++        ctx->rt->tt_defer_aux = blk;
++        return JS_UNINITIALIZED;
++    }
+     args[0] = s->target;
+     args[1] = atom_val;
+     args[2] = receiver;
+@@ -50636,8 +53427,14 @@
+     JSValue method, ret1, atom_val;
+     int ret, res;
+     JSValueConst args[4];
++    JSValue *tt_save;
+ 
++    /* TimeTravelJS: keep an armed accessor defer away from the nested
++       handler.set read (see js_proxy_get) */
++    tt_save = ctx->rt->tt_defer_slot;
++    ctx->rt->tt_defer_slot = NULL;
+     s = get_proxy_method(ctx, &method, obj, JS_ATOM_set);
++    ctx->rt->tt_defer_slot = tt_save;
+     if (!s)
+         return -1;
+     if (JS_IsUndefined(method)) {
+@@ -53280,6 +56077,317 @@
      return res;
  }
  
 +/* ---- TimeTravelJS stackless job pump ----------------------------------- */
 +/* The tail of promise_reaction_job over owned values (consumes all three). */
++/* the async-generator await continuation this reaction handler resumes,
++   or NULL when it isn't one (or has nothing runnable) */
++static struct JSAsyncGeneratorData *tt_pump_agen_target(JSContext *ctx,
++                                                        JSValueConst handler)
++{
++    JSCFunctionDataRecord *fdr = JS_GetOpaque(handler, JS_CLASS_C_FUNCTION_DATA);
++    JSAsyncGeneratorData *ags;
++
++    if (!fdr || fdr->func != js_async_generator_resolve_function ||
++        fdr->magic >= 2)
++        return NULL;
++    ags = JS_GetOpaque(fdr->data[0], JS_CLASS_ASYNC_GENERATOR);
++    if (!ags || ags->state != JS_ASYNC_GENERATOR_STATE_EXECUTING ||
++        !ags->func_state)
++        return NULL;
++    return ags;
++}
++
 +static JSValue tt_job_reaction_post(JSContext *ctx, JSValue res,
 +                                    JSValue func0, JSValue func1)
 +{
@@ -1419,8 +3918,10 @@
 +}
 +
 +/* Finish a job whose user callback parked: body_ret is the callback's
-+   completion from JS_TTCallResume. Frees the stashed continuation state. */
-+static void tt_job_finish(JSContext *ctx, JSValue body_ret)
++   completion from JS_TTCallResume. Frees the stashed continuation state.
++   Returns 1 when the finish itself re-parked (an async generator drive
++   needed another body run that parked) — the stash stays armed. */
++static int tt_job_finish(JSContext *ctx, JSValue body_ret)
 +{
 +    JSRuntime *rt = ctx->rt;
 +    int kind = rt->tt_job_kind;
@@ -1433,6 +3934,36 @@
 +        body_ret = async_func_finish(ctx, s, body_ret);
 +        js_async_function_post(ctx, s, body_ret);
 +        JS_FreeValue(ctx, rt->tt_job_vals[2]); /* handler ref kept s alive */
++        res = tt_job_reaction_post(ctx, JS_UNDEFINED,
++                                   rt->tt_job_vals[0], rt->tt_job_vals[1]);
++    } else if (kind == 4) {
++        struct JSAsyncGeneratorData *ags = rt->tt_job_aux;
++        JSAsyncFunctionState *afs;
++        JSValue raw;
++        rt->tt_job_aux = NULL;
++        body_ret = async_func_finish(ctx, tt_agen_func_state(ags), body_ret);
++        if (!js_async_generator_resume_post(ctx, ags, body_ret)) {
++            for (;;) {
++                if (!js_async_generator_resume_pre(ctx, ags))
++                    break;
++                afs = tt_agen_func_state(ags);
++                rt->tt_park_ok = TRUE;
++                raw = JS_CallInternal(ctx, JS_MKPTR(JS_TAG_INT, afs),
++                                      afs->this_val, JS_UNDEFINED, afs->argc,
++                                      afs->frame.arg_buf, JS_CALL_FLAG_GENERATOR);
++                if (rt->tt_parked_frame) {
++                    /* re-parked: vals[0..2] stay stashed for the next round */
++                    rt->tt_job_kind = 4;
++                    rt->tt_job_aux = ags;
++                    return 1;
++                }
++                rt->tt_park_ok = FALSE;
++                raw = async_func_finish(ctx, tt_agen_func_state(ags), raw);
++                if (js_async_generator_resume_post(ctx, ags, raw))
++                    break;
++            }
++        }
++        JS_FreeValue(ctx, rt->tt_job_vals[2]); /* handler ref kept ags alive */
 +        res = tt_job_reaction_post(ctx, JS_UNDEFINED,
 +                                   rt->tt_job_vals[0], rt->tt_job_vals[1]);
 +    } else if (kind == 1) {
@@ -1458,6 +3989,7 @@
 +        JS_FreeContext(rt->tt_job_realm);
 +        rt->tt_job_realm = NULL;
 +    }
++    return 0;
 +}
 +
 +/* Run one pending job with park-by-return for its user callback. Returns
@@ -1523,6 +4055,43 @@
 +            raw = async_func_finish(ctx, s, raw);
 +            js_async_function_post(ctx, s, raw);
 +            res = JS_UNDEFINED;
++        } else if (JS_VALUE_GET_TAG(handler) == JS_TAG_OBJECT &&
++                   JS_VALUE_GET_OBJ(handler)->class_id == JS_CLASS_C_FUNCTION_DATA &&
++                   tt_pump_agen_target(ctx, handler) != NULL) {
++            /* await continuation of an async generator: inject the settled
++               value and drive the body runs under park-by-return */
++            struct JSAsyncGeneratorData *ags = tt_pump_agen_target(ctx, handler);
++            JSAsyncFunctionState *afs = tt_agen_func_state(ags);
++            JSCFunctionDataRecord *fdr = JS_GetOpaque(handler, JS_CLASS_C_FUNCTION_DATA);
++            BOOL rej = fdr->magic & 1;
++            JSValue raw;
++            afs->throw_flag = rej;
++            if (rej)
++                JS_Throw(ctx, JS_DupValue(ctx, arg));
++            else
++                afs->frame.cur_sp[-1] = JS_DupValue(ctx, arg);
++            res = JS_UNDEFINED;
++            for (;;) {
++                if (!js_async_generator_resume_pre(ctx, ags))
++                    break;
++                afs = tt_agen_func_state(ags);
++                rt->tt_park_ok = TRUE;
++                raw = JS_CallInternal(ctx, JS_MKPTR(JS_TAG_INT, afs),
++                                      afs->this_val, JS_UNDEFINED, afs->argc,
++                                      afs->frame.arg_buf, JS_CALL_FLAG_GENERATOR);
++                if (rt->tt_parked_frame) {
++                    rt->tt_job_kind = 4;
++                    rt->tt_job_vals[0] = func0;
++                    rt->tt_job_vals[1] = func1;
++                    rt->tt_job_vals[2] = JS_DupValue(ctx, handler);
++                    rt->tt_job_aux = ags;
++                    goto parked;
++                }
++                rt->tt_park_ok = FALSE;
++                raw = async_func_finish(ctx, afs, raw);
++                if (js_async_generator_resume_post(ctx, ags, raw))
++                    break;
++            }
 +        } else if (JS_VALUE_GET_TAG(handler) == JS_TAG_OBJECT &&
 +                   JS_VALUE_GET_OBJ(handler)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
 +            JSValue hfn = JS_DupValue(ctx, handler);
@@ -1607,7 +4176,7 @@
  static void js_promise_resolve_function_free_resolved(JSRuntime *rt,
                                                        JSPromiseFunctionDataResolved *sr)
  {
-@@ -55169,6 +56247,10 @@
+@@ -55169,6 +58277,10 @@
  /* OS dependent: return the UTC time in ms since 1970. */
  static int64_t date_now(void) {
      struct timeval tv;
@@ -1618,7 +4187,7 @@
      gettimeofday(&tv, NULL);
      return (int64_t)tv.tv_sec * 1000 + (tv.tv_usec / 1000);
  }
-@@ -61195,3 +62277,385 @@
+@@ -61195,3 +64307,387 @@
      JS_FreeValue(ctx, obj);
      return 0;
  }
@@ -1937,8 +4506,10 @@
 +    rt->tt_park_ok = FALSE;
 +    if (rt->tt_job_kind) {
 +        /* the parked activation was a job's user callback: run the job's
-+           post half; the pump's caller keeps draining the queue */
-+        tt_job_finish(ctx, ret);
++           post half; the pump's caller keeps draining the queue. The
++           finish may itself re-park (async generator drives). */
++        if (tt_job_finish(ctx, ret))
++            *pparked = 1;
 +        return JS_UNDEFINED;
 +    }
 +    JS_FreeValue(ctx, rt->tt_exec_fn);

@@ -20937,6 +20937,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {                                                \
                     name ## _slow_path:                                 \
                     sf->cur_pc = pc;                                    \
+                    /* an object KEY coerces via ToPropertyKey inside — \
+                       park it (receiver nullness throws first, like the \
+                       C path) */                                       \
+                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT &&    \
+                        !JS_IsUndefined(sp[-2]) && !JS_IsNull(sp[-2])) { \
+                        TT_COERCE_SLOT(&sp[-1], HINT_STRING, 1, 0)      \
+                        prop = sp[-1];                                  \
+                    }                                                   \
                     rt->tt_defer_kind = 1;                              \
                     rt->tt_defer_pending = &tt_dfn;                     \
                     val = JS_GetPropertyValue(ctx, obj, prop);          \
@@ -21018,6 +21026,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto exception;
                         }
                         sf->cur_pc = pc;
+                        if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT)
+                            TT_COERCE_SLOT(&sp[-1], HINT_STRING, 1, 0)
                         ret_val = JS_ToPropertyKey(ctx, sp[-1]);
                         if (JS_IsException(ret_val))
                             goto exception;
@@ -21133,6 +21143,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 put_array_el_slow_path:
                     sf->cur_pc = pc;
+                    /* the set path coerces the key before the receiver
+                       check (classic order) — park an object key */
+                    if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT)
+                        TT_COERCE_SLOT(&sp[-2], HINT_STRING, 1, 0)
                     rt->tt_defer_kind = 1;
                     rt->tt_defer_pending = &tt_dfn;
                     ret = JS_SetPropertyValue(ctx, sp[-3], sp[-2], sp[-1], JS_PROP_THROW_STRICT);
@@ -21987,6 +22001,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 break;
             default:
                 sf->cur_pc = pc;
+                /* TimeTravelJS: computed-key ToPrimitive parks (symbols
+                   are legal keys, so no nosym) */
+                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT)
+                    TT_COERCE_SLOT(&sp[-1], HINT_STRING, 1, 0)
                 ret_val = JS_ToPropertyKey(ctx, sp[-1]);
                 if (JS_IsException(ret_val))
                     goto exception;

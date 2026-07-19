@@ -97,11 +97,20 @@ via pre/post protocol halves shared verbatim with the classic C paths, and
 the callback-taking Array builtins are self-hosted in the debug runtime.
 The Asyncify pass is gone from the build entirely.
 
-The narrow residue — user code invoked synchronously from *inside* an
-unconverted C builtin (a getter reached from a C path, proxy traps,
-`toPrimitive` coercions, async generators) — executes normally but cannot
-become a snapshot; such steps are counted honestly as
-`summary.suppressedSteps`.
+Every reentry path a program normally exercises is converted: property
+accessors (including under `with` and behind proxy `get` traps),
+`ToPrimitive`/`ToString`/`ToPropertyKey` coercions (`+`, comparisons,
+templates, `String()`, computed keys), `instanceof` via
+`Symbol.hasInstance`, user iterables (`for‑of`, spread, destructuring),
+bound functions and `Function.prototype.call`/`apply` (tail position
+included), async generators from creation through `for await`, and the
+callback-taking builtins. The test suite gates on
+`summary.suppressedSteps === 0` for a program spanning that whole
+surface. What still executes under C — counted honestly per recording —
+is a residue of reflective machinery: proxy traps other than
+receiver-level `get`, `IteratorClose` (`.return`) on abrupt completions,
+direct `eval` internals, and class-field initialization observed through
+a proxy.
 
 The driver (`src/vm.js`) is one protocol and ~150 lines: park-by-return
 plus deterministic WASI shims. No Emscripten, no handles, no FFI layer.
@@ -152,10 +161,10 @@ fork:      restore P → apply edit to live frame → CONTINUE ▶──▶─�
 
 ```
 index.html, styles.css       the site (static, no build step)
-dist/quickjs-tt.wasm         the VM (committed artifact, ~2.8 MB)
+dist/quickjs-tt.wasm         the VM (committed artifact, ~1.8 MB)
 vendor/quickjs/              QuickJS 2026-06-04, execution core rewritten (MIT)
 native/tt-wrap.c             wasm embedder: exports, command loop, setup runtime
-native/build.mjs             clang → wasm32-wasi, Binaryen asyncify pass
+native/build.mjs             clang → wasm32-wasi → Binaryen optimize
 native/barrier.mjs           wasm bytecode pass: the dirty-page write barrier
 native/quickjs-changes.patch the complete QuickJS diff, for review
 src/vm.js                    loader + dual park/rewind driver + WASI shims
@@ -178,10 +187,13 @@ site nor the tests require a C toolchain.
   compare). Recordings are still capped (default 20 000 steps, 256 MB
   retained); the recorded prefix of a truncated run is fully navigable.
   Opcode granularity multiplies step counts ~5–15×.
-- Steps inside user code invoked synchronously from an unconverted C
-  builtin (getters reached from C paths, proxy trap handlers, `toPrimitive`
-  coercions, async generator bodies) execute correctly but cannot become
-  snapshots — they are counted per recording as `suppressedSteps`.
+- Steps inside user code reached through the remaining reflective C
+  machinery — proxy traps other than receiver-level `get`, iterator
+  `.return` during abrupt-completion cleanup, direct `eval` internals,
+  class-field initialization observed via proxy — execute correctly but
+  cannot become snapshots; they are counted per recording as
+  `suppressedSteps` (0 for the entire probe corpus and the engine test
+  suite's full-surface gate program).
 - Inlined tail calls keep the caller's frame: proper-tail-call space
   guarantees are traded for park-anywhere (depth is bounded by the 2 MB
   frame arena, ~18 000 frames).
@@ -206,9 +218,13 @@ the language surface.
 
 On top of that, `tools/test262-stepped.mjs` runs a corpus sample through
 the ENGINE with per-step snapshotting enabled and lets each test's own
-assertions judge: stepping does not alter semantics (the one deliberate
-exception: proper-tail-call *space* guarantees — inlined tail calls keep
-the caller frame, so `tco-*` tests exhaust the frame arena by design).
+assertions judge: stepping does not alter semantics. Current samples:
+`language/statements` 295 pass / 3 fail (decorators and `using` are
+unsupported proposals; `tco-*` is the deliberate proper-tail-call space
+trade — inlined tail calls keep the caller frame), `language/expressions`
+216 pass / 3 fail (dynamic `import` needs a module host). Suppressed
+steps across those ~570 stepped runs: 284, all inside the reflective
+residue listed above — the ordinary language surface records every step.
 
 ```
 node tools/test262-stepped.mjs <path-to-test262-clone> test/language/statements 7
