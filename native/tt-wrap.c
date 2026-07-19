@@ -1,16 +1,20 @@
 /*
  * TimeTravelJS wasm embedder.
  *
- * Exports a small API around a patched QuickJS build. The step hook fires on
- * every source-line boundary; the host decides per step whether to keep
- * running, take a snapshot, or park. Suspension uses Binaryen's Asyncify:
- * the `tt_host_step` import unwinds the entire wasm stack into a fixed
- * buffer in the data segment, so a linear-memory snapshot taken while
- * suspended is a complete, resumable machine state.
+ * Exports a small API around a rewritten (stackless) QuickJS build. The
+ * step hook fires per source line — or per opcode in microscope mode. Two
+ * suspension paths, one invariant (a snapshot IS a resumable machine):
  *
- * While paused, the host talks to the VM through the command loop below —
- * inspection and console evaluation run *inside* the interpreter at the
- * paused position, where every frame is live and valid.
+ *  - park by return: interpreter frames live in a linear-memory arena, so
+ *    when only the dispatch loop is on the C stack the machine suspends by
+ *    returning from the export (tt_eval/tt_resume return 1). Inspection and
+ *    evaluation against a parked machine are plain calls.
+ *
+ *  - Asyncify fallback: steps reached under live C frames (comparators,
+ *    getters, generator bodies, promise jobs) suspend via the asyncified
+ *    `tt_host_step` import, which unwinds the C stack into a fixed buffer
+ *    in the data segment. The host command loop below serves inspection /
+ *    evaluation inside the paused interpreter.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -217,13 +221,33 @@ static void eval_at_pause(JSContext *ctx)
     eval_at_pause_mode(ctx, 0);
 }
 
-/* The step handler: one host round-trip per command; tt_host_step may
-   suspend for as long as the debugger is parked here. */
-static int tt_step_handler(JSContext *ctx, int line, int col, int depth, void *opaque)
+/* Park-by-return bookkeeping: when the interpreter says the machine can
+   suspend by simply returning (stackless path — no C frames below the
+   dispatch loop), we take that route and let the host read the step info
+   from these statics. Deeper activations (sort comparators, getters,
+   generator bodies, promise jobs) still suspend through the asyncified
+   tt_host_step import. */
+static int g_park_line, g_park_col, g_park_depth;
+
+EXPORT("tt_park_line") int tt_park_line(void) { return g_park_line; }
+EXPORT("tt_park_col") int tt_park_col(void) { return g_park_col; }
+EXPORT("tt_park_depth") int tt_park_depth(void) { return g_park_depth; }
+
+/* The step handler: park by return when the interpreter allows it, else one
+   host round-trip per command; tt_host_step may suspend for as long as the
+   debugger is parked here. */
+static int tt_step_handler(JSContext *ctx, int line, int col, int depth,
+                           int parkable, void *opaque)
 {
     (void)opaque;
     if (g_in_hook)
         return 0;
+    if (parkable) {
+        g_park_line = line;
+        g_park_col = col;
+        g_park_depth = depth;
+        return 2;
+    }
     for (;;) {
         int cmd = tt_host_step(line, col, depth);
         switch (cmd) {
@@ -515,18 +539,13 @@ EXPORT("tt_init") int tt_init(void)
     return 0;
 }
 
-/* Run the user program. May suspend at any step. On real completion emits
-   kind=3 with { ok } | { error }. The code buffer must stay valid (and
-   untouched) for the whole run, including across suspensions. */
-EXPORT("tt_eval") void tt_eval(const char *code, int len)
+/* Emit the kind=3 completion envelope for the program value/exception. */
+static void emit_eval_done(JSValue v)
 {
-    JSValue v, env, args[2];
+    JSValue env, args[2];
     const char *cstr;
     size_t slen;
 
-    JS_TTEnableStep(g_rt, 1);
-    v = JS_Eval(g_ctx, code, len, "program.js", JS_EVAL_TYPE_GLOBAL);
-    JS_TTEnableStep(g_rt, 0);
     if (JS_IsException(v)) {
         args[0] = JS_TRUE;
         args[1] = JS_GetException(g_ctx);
@@ -545,6 +564,77 @@ EXPORT("tt_eval") void tt_eval(const char *code, int len)
         tt_host_out(3, "null", 4);
     }
     JS_FreeValue(g_ctx, env);
+}
+
+/* Run the user program. Compiles once, then executes under the park-by-
+   return driver: steps on the stackless path suspend by RETURNING from this
+   export (tt_parked() → 1; continue with tt_resume), steps under live C
+   frames suspend through the asyncified import as before. On completion
+   emits kind=3 with { ok } | { error }. Returns 1 while parked, 0 done. */
+EXPORT("tt_eval") int tt_eval(const char *code, int len)
+{
+    JSValue fn, v;
+    int parked = 0;
+
+    JS_TTEnableStep(g_rt, 1);
+    fn = JS_Eval(g_ctx, code, len, "program.js",
+                 JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(fn)) {
+        JS_TTEnableStep(g_rt, 0);
+        emit_eval_done(fn);
+        return 0;
+    }
+    v = JS_TTCallStart(g_ctx, fn, &parked);
+    if (parked)
+        return 1;
+    JS_TTEnableStep(g_rt, 0);
+    emit_eval_done(v);
+    return 0;
+}
+
+/* Resume a machine parked by return. cmd 0 = continue, 1 = abort. */
+EXPORT("tt_resume") int tt_resume(int cmd)
+{
+    JSValue v;
+    int parked = 0;
+
+    v = JS_TTCallResume(g_ctx, cmd, &parked);
+    if (parked)
+        return 1;
+    JS_TTEnableStep(g_rt, 0);
+    emit_eval_done(v);
+    return 0;
+}
+
+EXPORT("tt_parked") int tt_parked(void)
+{
+    return JS_TTParked(g_ctx);
+}
+
+/* Inspect / evaluate against a return-parked machine: the frame chain is
+   live in linear memory and no rewind is needed at all. */
+EXPORT("tt_inspect_parked") void tt_inspect_parked(void)
+{
+    g_in_hook = 1;
+    JS_TTEnableStep(g_rt, 0);
+    send_inspection(g_ctx);
+    JS_TTEnableStep(g_rt, 1);
+    g_in_hook = 0;
+}
+
+EXPORT("tt_eval_parked") void tt_eval_parked(int write_back)
+{
+    g_in_hook = 1;
+    JS_TTEnableStep(g_rt, 0);
+    eval_at_pause_mode(g_ctx, write_back);
+    JS_TTEnableStep(g_rt, 1);
+    g_in_hook = 0;
+}
+
+/* Step granularity: 0 = source line, 1 = every opcode. */
+EXPORT("tt_set_granularity") void tt_set_granularity(int g)
+{
+    JS_TTSetGranularity(g_ctx, g);
 }
 
 /* Run pending promise jobs (each job is steppable). Emits kind=4 when done. */

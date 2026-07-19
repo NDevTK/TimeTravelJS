@@ -2,15 +2,18 @@
 
 **True suspend/resume time-travel debugging for JavaScript, in your browser.**
 
-A patched QuickJS engine, compiled to WebAssembly, **suspends itself at every
-source line** — its entire machine state (heap, stack, program counter, spilled
-C stack, virtual clock) becomes bytes in linear memory. Each step is captured
-as a **copy-on-write page delta**. Time travel is then just memory: stepping
-backward applies undo pages, stepping forward applies redo pages. The program
-executes **exactly once** — navigation never re-runs a single instruction, so
-there is no replay, no re-execution, and nothing to diverge. And because the
-suspended machine is just bytes, history can **fork**: edit a variable at any
-past moment and let execution continue from there onto a new timeline.
+A **stackless rewrite of the QuickJS interpreter**, compiled to WebAssembly,
+keeps every interpreter frame in linear memory — **no C stack ever spans a
+step**. Suspending the machine is just *returning from a function*; resuming
+is calling one. At every step (each source line, or each VM instruction in
+microscope mode) the complete machine state — heap, frames, program counter,
+virtual clock — is bytes, captured as a **copy-on-write page delta**. Time
+travel is then just memory: stepping backward applies undo pages, stepping
+forward applies redo pages. The program executes **exactly once** —
+navigation never re-runs a single instruction, so there is no replay, no
+re-execution, and nothing to diverge. And because the suspended machine is
+just bytes, history can **fork**: edit a variable at any past moment and let
+execution continue from there onto a new timeline.
 
 ```
 npm start          # serve → http://127.0.0.1:8642/  (static site, no build)
@@ -47,40 +50,58 @@ npm run build      # rebuild dist/quickjs-tt.wasm (clang + wasi-libc + binaryen)
   saved), with per-step dirty-page charts and a heap write heat map.
 - **A real write barrier** — every store instruction in the wasm is
   instrumented to mark its 1 KB page in a dirty map, so each step captures
-  only pages actually written: **~40 000 recorded steps/s**, independent of
+  only pages actually written: **~50 000 recorded steps/s**, independent of
   heap size.
+- **Two step granularities** — one snapshot per source line, or flip to
+  **opcode steps** and scrub between *every two VM instructions*: watch a
+  single expression evaluate sub-term by sub-term.
 
 ## How it works
 
-### 1. The VM pauses itself (no source transformation)
+### 1. A stackless interpreter (no source transformation)
 
-`vendor/quickjs/` contains QuickJS 2026-06-04 with a debugger patch
-(reviewable as `native/quickjs-changes.patch`):
+`vendor/quickjs/` contains QuickJS 2026-06-04 with its execution core
+rewritten (reviewable as `native/quickjs-changes.patch` — at this point it
+is honestly a fork, not a patch):
 
-- a **step hook in the bytecode dispatch loop** that fires whenever execution
-  reaches a new source line — or re-enters one via a backward jump (loop
-  iterations) — with a per-frame pc→line range cache so the check is cheap;
-- **frame introspection**: `JS_TTBacktrace()`, `JS_TTLocals(level)` (reading
-  `vardefs`, argument/variable buffers and closure `var_refs`), and
-  `JS_TTGlobalLexicals()` for script-level `let`/`const`;
+- **all interpreter frames live in a fixed linear-memory arena** — a JS→JS
+  call bump-allocates a frame and the *same* dispatch loop continues into
+  the callee; a return pops it. No C recursion, no `alloca`. The former C
+  parameters (`this`, `new.target`, the argument vector) became per-frame
+  fields. QuickJS itself pointed the way: generators and async functions
+  already ran on heap-allocated frames — the rewrite generalizes their
+  frame model to every call. Recursion depth becomes an exact,
+  snapshot-stable limit (an ordinary catchable `stack overflow` ~18 000
+  frames deep) instead of a C-stack accident;
+- a **step hook in the dispatch loop** that fires per source line — or,
+  at opcode granularity, between every two VM instructions — with a
+  per-frame pc→line range cache so the check is cheap;
+- **frame introspection and editing**: `JS_TTBacktrace()`,
+  `JS_TTLocals(level)`, `JS_TTGlobalLexicals()`, and `JS_TTSetLocal()`
+  (the fork write-back), all reading/writing the live frames;
 - **deterministic time**: `Date.now()`/`new Date()` read a virtual clock that
   advances one unit per step and lives in the data segment — inside every
   snapshot; `Math.random()` gets a fixed seed;
 - a source-filename filter so only user code (`program.js`) produces steps.
 
-### 2. Suspension makes the whole machine a byte array
+### 2. Suspending IS returning (with Asyncify as the fallback)
 
-The build runs Binaryen's **Asyncify** pass over the wasm: when the step
-hook's host import decides to pause, the entire wasm call stack unwinds into
-a **fixed buffer inside the data segment**. While suspended, the complete
-execution state — QuickJS heap, shadow stack, interpreter frames, the
-asyncify spill — is linear memory, plus exactly one wasm global (the shadow
-stack pointer), which the engine records per step. Restoring those bytes and
-rewinding resumes the machine *mid-execution*, at any point in history.
+Because no C stack spans a step on the stackless path, parking the machine
+is just the dispatch loop *returning to the host*, and resuming is a fresh
+call (`JS_TTCallStart`/`JS_TTCallResume`). The suspended machine has **no
+wasm activation at all** — its complete state is linear memory, restorable
+from any snapshot by construction.
 
-The driver (`src/vm.js`) is ~200 lines and owns the whole protocol: one
-suspendable import, entry re-invocation for rewinds, deterministic WASI
-shims. No Emscripten, no handles, no FFI layer.
+Steps reached while native C frames are genuinely live — a `sort`
+comparator, a getter invoked from a C path, generator bodies, promise
+jobs — still suspend through Binaryen's **Asyncify** pass: the C stack
+unwinds into a fixed buffer inside the data segment and the engine records
+the one wasm global (the shadow stack pointer) that a rewind needs. The
+recorder mixes both freely, per step; the test suite pins each path.
+
+The driver (`src/vm.js`) owns both protocols in ~250 lines: park-by-return,
+one suspendable import for the fallback, deterministic WASI shims. No
+Emscripten, no handles, no FFI layer.
 
 ### 3. Copy-on-write history with a hardware-style write barrier
 
@@ -98,12 +119,15 @@ memory after every step to prove the barrier misses nothing.
 
 ### 4. Inspection is a disposable transaction
 
-To inspect position P: restore P's pages, restore its stack pointer, rewind
-the VM into the suspension, and let the wrapper's command loop run the
-inspector — `JS_TTLocals` walks *live* frames — or evaluate a console
-expression with the frame's locals in scope. Then the activation is aborted.
-Whatever the transaction touched is healed from the page store on the next
-navigation. Recorded history is immutable no matter what an evaluation does.
+At a return-parked position it barely deserves the name: restore P's pages
+and *call* the inspector — the restored memory **is** the parked machine,
+its frame chain live and walkable, repeatably, with nothing to rewind. At an
+Asyncify position, inspection is a one-shot transaction: restore the pages
+and the recorded stack pointer, rewind into the suspension, run the
+inspector or a console evaluation inside the live interpreter, abort the
+disposable activation. Either way, whatever the transaction touched is
+healed from the page store afterwards. Recorded history is immutable no
+matter what an evaluation does.
 
 ### 5. Forking is the same machinery, allowed to commit
 
@@ -117,11 +141,11 @@ prefix stays byte-identical. Because time and randomness are virtual, a fork
 can watch.
 
 ```
-record:    ▶──▶──▶──▶──▶──▶──▶──▶──▶──▶     (executes ONCE, suspending each step)
+record:    ▶──▶──▶──▶──▶──▶──▶──▶──▶──▶     (executes ONCE, parking each step)
            □  □  □  □  □  □  □  □  □  □     one COW delta per step
 navigate:  ⟵ apply undo pages · apply redo pages ⟶      (no execution at all)
-inspect:   restore P → rewind → read live frames → abort  (disposable)
-fork:      restore P → rewind → apply edit → CONTINUE ▶──▶──▶  (new future)
+inspect:   restore P → call into the parked machine → heal      (repeatable)
+fork:      restore P → apply edit to live frame → CONTINUE ▶──▶──▶ (new future)
 ```
 
 ## Repository layout
@@ -129,12 +153,12 @@ fork:      restore P → rewind → apply edit → CONTINUE ▶──▶──�
 ```
 index.html, styles.css       the site (static, no build step)
 dist/quickjs-tt.wasm         the VM (committed artifact, ~2.8 MB)
-vendor/quickjs/              QuickJS 2026-06-04 + debugger patches (MIT)
+vendor/quickjs/              QuickJS 2026-06-04, execution core rewritten (MIT)
 native/tt-wrap.c             wasm embedder: exports, command loop, setup runtime
 native/build.mjs             clang → wasm32-wasi, Binaryen asyncify pass
 native/barrier.mjs           wasm bytecode pass: the dirty-page write barrier
 native/quickjs-changes.patch the complete QuickJS diff, for review
-src/vm.js                    loader + asyncify driver + WASI shims
+src/vm.js                    loader + dual park/rewind driver + WASI shims
 src/deltastore.js            per-step COW page store (content-deduplicated)
 src/engine.js                recorder, delta navigation, inspection, forking
 src/ui.js, main.js, samples.js   debugger UI
@@ -149,12 +173,19 @@ site nor the tests require a C toolchain.
 
 ## Honest limitations
 
-- Recording runs at roughly 40 000 steps/s (write-barrier capture is
+- Recording runs at roughly 50 000 steps/s (write-barrier capture is
   O(pages written) per step, and marked-but-unchanged pages cost one
   compare). Recordings are still capped (default 20 000 steps, 256 MB
   retained); the recorded prefix of a truncated run is fully navigable.
-- Step granularity is the source line (QuickJS's pc2line), plus one step per
-  loop iteration via backward-jump detection.
+  Opcode granularity multiplies step counts ~5–15×.
+- Steps under genuinely live C frames (sort comparators, getters reached
+  from C paths, generator bodies, promise jobs, constructors) suspend via
+  the Asyncify fallback rather than by return — same capabilities, plus a
+  one-rewind-per-activation rule for inspections there. Converting those
+  reentry sites to the stackless path is the remaining migration.
+- Inlined tail calls keep the caller's frame: proper-tail-call space
+  guarantees are traded for park-anywhere (depth is bounded by the 2 MB
+  frame arena, ~18 000 frames).
 - `eval`'d / `new Function` code steps only if its filename matches the user
   program (it doesn't), and `setInterval` is not provided (`setTimeout`
   chains are).

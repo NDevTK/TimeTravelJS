@@ -368,6 +368,21 @@ struct JSRuntime {
     int tt_step_enabled;
     /* only fire in functions compiled from this file (0 = fire everywhere) */
     JSAtom tt_step_filename;
+    /* step granularity: 0 = source line (+ backward jumps), 1 = every opcode */
+    int tt_granularity;
+    /* TimeTravelJS stackless interpreter state. All interpreter frames live
+       in this arena (linear memory), so when no native C frame is below the
+       dispatch loop, suspending is just returning to the host and resuming
+       is a fresh call — no stack switching machinery at all. */
+    uint8_t *tt_arena_base;
+    uint8_t *tt_arena_top;
+    uint8_t *tt_arena_limit;
+    int tt_loop_depth;        /* dispatch-loop entries currently on the C stack */
+    BOOL tt_park_ok;          /* the host entry point supports park-by-return */
+    BOOL tt_park_abort;       /* deliver an abort on the next parked resume */
+    BOOL tt_skip_once;        /* swallow the re-check at the resume pc */
+    struct JSStackFrame *tt_parked_frame; /* set while parked-by-return */
+    JSValue tt_exec_fn;       /* callable held alive across a parked script */
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
@@ -434,7 +449,28 @@ typedef struct JSStackFrame {
     uint32_t tt_pc_lo;
     uint32_t tt_pc_hi;
     uint32_t tt_prev_off;
+    /* TimeTravelJS stackless interpreter: frames live in a linear-memory
+       arena and a JS→JS call continues the SAME dispatch loop, so the
+       former C parameters become per-frame state. frame_kind records how
+       the frame was entered — the return path either hands the result to
+       the caller frame in-loop or returns to C. */
+    JSValueConst tt_this;       /* 'this' as passed (borrowed) */
+    JSValueConst tt_new_target; /* new.target as passed (borrowed) */
+    JSValue *tt_orig_argv;      /* args exactly as passed (aliased) */
+    JSValue *tt_frame_base;     /* first arena value slot (free range start) */
+    int tt_orig_argc;
+    uint16_t tt_call_argc;      /* argc at the inlined call site */
+    uint8_t tt_frame_kind;      /* TT_FRAME_* */
 } JSStackFrame;
+
+/* how a frame was entered — decides the return linkage */
+enum {
+    TT_FRAME_ENTRY = 0,     /* entered from C: pop returns to the C caller */
+    TT_FRAME_CALL,          /* inlined OP_call: pop argc+1 caller slots     */
+    TT_FRAME_CALL_METHOD,   /* inlined OP_call_method: pop argc+2           */
+    TT_FRAME_TAIL,          /* inlined OP_tail_call: caller returns too     */
+    TT_FRAME_TAIL_METHOD,
+};
 
 typedef enum {
     JS_GC_OBJ_TYPE_JS_OBJECT,
@@ -2098,6 +2134,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     rt->malloc_ctx.mf = *mf;
     rt->malloc_ctx.malloc_state = ms;
     rt->malloc_gc_threshold = 256 * 1024;
+    rt->tt_exec_fn = JS_UNDEFINED; /* a zeroed JSValue is not undefined */
 
     init_list_head(&rt->context_list);
     init_list_head(&rt->gc_obj_list);
@@ -2429,6 +2466,10 @@ void JS_FreeRuntime(JSRuntime *rt)
     int i;
 
     JS_FreeValueRT(rt, rt->current_exception);
+    if (rt->tt_arena_base) {
+        js_free_rt(rt, rt->tt_arena_base);
+        rt->tt_arena_base = NULL;
+    }
 
     list_for_each_safe(el, el1, &rt->job_list) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
@@ -7605,20 +7646,40 @@ static int tt_find_line(JSFunctionBytecode *b, uint32_t pc_value,
 /* Called from the dispatch loop whenever stepping is enabled. Fires the host
    step handler on line changes and backward jumps (loop iterations).
    Returns nonzero to abort execution like an interrupt. */
+/* Handler return contract: 0 = continue, 1 = abort (throws Interrupted),
+   2 = park by return — legal only when `parkable` was passed as true, i.e.
+   the dispatch loop is the ONLY thing on the C stack and can simply return
+   to the host, to be re-entered later at the saved frame/pc. */
 static no_inline int js_tt_step_check(JSContext *ctx, JSStackFrame *sf,
                                       JSFunctionBytecode *b, const uint8_t *pc)
 {
     JSRuntime *rt = ctx->rt;
     uint32_t off = (uint32_t)(pc - b->byte_code_buf);
-    int col, line, depth;
+    int col, line, depth, parkable;
     JSStackFrame *f;
 
+    if (rt->tt_skip_once) {
+        /* first check after a parked resume re-tests the pc that parked */
+        rt->tt_skip_once = FALSE;
+        return 0;
+    }
     if (!rt->tt_step_handler || !b->has_debug)
         return 0;
     if (rt->tt_step_filename != JS_ATOM_NULL &&
         b->debug.filename != rt->tt_step_filename)
         return 0;
-    if (off >= sf->tt_pc_lo && off < sf->tt_pc_hi && sf->tt_pc_hi != 0) {
+    if (rt->tt_granularity >= 1) {
+        /* opcode granularity: fire between every two VM instructions of
+           user code. The line cache only avoids pc2line lookups. */
+        if (off >= sf->tt_pc_lo && off < sf->tt_pc_hi && sf->tt_pc_hi != 0) {
+            line = sf->tt_last_line;
+            col = 0;
+        } else {
+            line = tt_find_line(b, off, &col, &sf->tt_pc_lo, &sf->tt_pc_hi);
+            if (line <= 0)
+                return 0;
+        }
+    } else if (off >= sf->tt_pc_lo && off < sf->tt_pc_hi && sf->tt_pc_hi != 0) {
         if (off >= sf->tt_prev_off) {
             /* forward progress on the same line */
             sf->tt_prev_off = off;
@@ -7647,7 +7708,9 @@ static no_inline int js_tt_step_check(JSContext *ctx, JSStackFrame *sf,
         depth++;
     if (tt_vtime_enabled)
         tt_vtime += 1;
-    return rt->tt_step_handler(ctx, line, col, depth - 1, rt->tt_step_opaque);
+    parkable = rt->tt_park_ok && rt->tt_loop_depth == 1;
+    return rt->tt_step_handler(ctx, line, col, depth - 1, parkable,
+                               rt->tt_step_opaque);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -17737,6 +17800,46 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
 
 #define JS_CALL_FLAG_COPY_ARGV   (1 << 1)
 #define JS_CALL_FLAG_GENERATOR   (1 << 2)
+/* TimeTravelJS: re-enter the dispatch loop at rt->tt_parked_frame */
+#define JS_CALL_FLAG_TT_RESUME   (1 << 3)
+
+/* TimeTravelJS stackless interpreter: every frame (and its argument copy,
+   variables, operand stack and var-ref slots) is bump-allocated from a
+   fixed arena in linear memory instead of alloca. JS recursion depth
+   becomes an exact, snapshot-stable limit, and a suspended machine is
+   nothing but bytes. */
+#define TT_FRAME_ARENA_SIZE (2 * 1024 * 1024)
+
+static JSStackFrame *tt_arena_push(JSRuntime *rt, size_t val_count,
+                                   size_t ref_count, JSValue **pvals)
+{
+    size_t size;
+    uint8_t *base;
+    JSStackFrame *sf;
+
+    if (unlikely(!rt->tt_arena_base)) {
+        rt->tt_arena_base = js_malloc_rt(rt, TT_FRAME_ARENA_SIZE);
+        if (!rt->tt_arena_base)
+            return NULL;
+        rt->tt_arena_top = rt->tt_arena_base;
+        rt->tt_arena_limit = rt->tt_arena_base + TT_FRAME_ARENA_SIZE;
+    }
+    size = sizeof(JSStackFrame) + sizeof(JSValue) * val_count +
+        sizeof(JSVarRef *) * ref_count;
+    size = (size + 15) & ~(size_t)15;
+    base = rt->tt_arena_top;
+    if (unlikely(size > (size_t)(rt->tt_arena_limit - base)))
+        return NULL;
+    rt->tt_arena_top = base + size;
+    sf = (JSStackFrame *)base;
+    *pvals = (JSValue *)(sf + 1);
+    return sf;
+}
+
+static force_inline void tt_arena_pop(JSRuntime *rt, JSStackFrame *sf)
+{
+    rt->tt_arena_top = (uint8_t *)sf;
+}
 
 static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                                   JSValueConst this_obj,
@@ -17930,22 +18033,57 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSContext *ctx;
     JSObject *p;
     JSFunctionBytecode *b;
-    JSStackFrame sf_s, *sf = &sf_s;
+    JSStackFrame *sf;
     const uint8_t *pc;
-    int opcode, arg_allocated_size, i;
+    int opcode, i;
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
     JSVarRef **var_refs;
-    size_t alloca_size;
+    /* TimeTravelJS stackless: staging for a frame push (entry or inlined
+       call) — see the push_frame block. */
+    JSValueConst pf_func, pf_this, pf_new_target;
+    JSValue *pf_argv;
+    int pf_argc, pf_flags, pf_kind;
 
 /* TimeTravelJS: check the step hook before dispatching the next opcode.
-   `pc` points at the upcoming instruction here (before the opcode fetch). */
+   `pc` points at the upcoming instruction here (before the opcode fetch).
+   Handler verdicts: 1 aborts like an interrupt; 2 parks the machine by
+   RETURNING to the host — legal because at that moment the frame chain,
+   locals and pc all live in linear memory and no C frame below us holds
+   interpreter state. Resuming is a fresh call with JS_CALL_FLAG_TT_RESUME. */
 #define TT_STEP_CHECK() do {                                     \
         if (unlikely(rt->tt_step_enabled)) {                     \
-            if (unlikely(js_tt_step_check(ctx, sf, b, pc))) {    \
+            int tt_r_ = js_tt_step_check(ctx, sf, b, pc);        \
+            if (unlikely(tt_r_)) {                               \
+                if (tt_r_ == 2) {                                \
+                    sf->cur_pc = pc;                             \
+                    sf->cur_sp = sp;                             \
+                    rt->tt_parked_frame = sf;                    \
+                    rt->tt_loop_depth--;                         \
+                    return JS_UNDEFINED;                         \
+                }                                                \
                 JS_ThrowInterrupted(ctx);                        \
                 goto exception;                                  \
             }                                                    \
         }                                                        \
+    } while (0)
+
+/* Reload the dispatch loop's cached state from `sf` (after an inlined
+   return, a parked resume, or a generator re-entry). The former C
+   parameters are reused as the per-frame cache. */
+#define TT_LOAD_FRAME() do {                                     \
+        p = JS_VALUE_GET_OBJ(sf->cur_func);                      \
+        b = p->u.func.function_bytecode;                         \
+        ctx = b->realm;                                          \
+        var_refs = p->u.func.var_refs;                           \
+        local_buf = sf->tt_frame_base;                           \
+        arg_buf = sf->arg_buf;                                   \
+        var_buf = sf->var_buf;                                   \
+        stack_buf = sf->var_buf + b->var_count;                  \
+        func_obj = sf->cur_func;                                 \
+        this_obj = sf->tt_this;                                  \
+        new_target = sf->tt_new_target;                          \
+        argc = sf->tt_orig_argc;                                 \
+        argv = sf->tt_orig_argv;                                 \
     } while (0)
 
 #if !DIRECT_DISPATCH
@@ -17976,19 +18114,34 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
     if (js_poll_interrupts(caller_ctx))
         return JS_EXCEPTION;
+    if (unlikely(flags & JS_CALL_FLAG_TT_RESUME)) {
+        /* TimeTravelJS: resume a machine parked by TT_STEP_CHECK. The frame
+           chain survived in the arena — resuming is just a function call. */
+        sf = rt->tt_parked_frame;
+        if (unlikely(!sf))
+            return JS_ThrowInternalError(caller_ctx, "no parked frame");
+        rt->tt_parked_frame = NULL;
+        rt->tt_loop_depth++;
+        rt->tt_skip_once = TRUE;
+        TT_LOAD_FRAME();
+        sp = sf->cur_sp;
+        sf->cur_sp = NULL;
+        pc = sf->cur_pc;
+        if (rt->tt_park_abort) {
+            rt->tt_park_abort = FALSE;
+            JS_ThrowInterrupted(ctx);
+            goto exception;
+        }
+        goto restart;
+    }
     if (unlikely(JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)) {
         if (flags & JS_CALL_FLAG_GENERATOR) {
             JSAsyncFunctionState *s = JS_VALUE_GET_PTR(func_obj);
             /* func_obj get contains a pointer to JSFuncAsyncState */
-            /* the stack frame is already allocated */
+            /* the stack frame is already allocated (heap, not arena) */
             sf = &s->frame;
-            p = JS_VALUE_GET_OBJ(sf->cur_func);
-            b = p->u.func.function_bytecode;
-            ctx = b->realm;
-            var_refs = p->u.func.var_refs;
-            local_buf = arg_buf = sf->arg_buf;
-            var_buf = sf->var_buf;
-            stack_buf = sf->var_buf + b->var_count;
+            rt->tt_loop_depth++;
+            TT_LOAD_FRAME();
             sp = sf->cur_sp;
             sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
             pc = sf->cur_pc;
@@ -18013,56 +18166,82 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         return call_func(caller_ctx, func_obj, this_obj, argc,
                          (JSValueConst *)argv, flags);
     }
-    b = p->u.func.function_bytecode;
-
-    if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
-        arg_allocated_size = b->arg_count;
-    } else {
-        arg_allocated_size = 0;
-    }
-
-    alloca_size = sizeof(JSValue) * (arg_allocated_size + b->var_count +
-                                     b->stack_size) +
-        sizeof(JSVarRef *) * b->var_ref_count;
-    if (js_check_stack_overflow(rt, alloca_size))
+    /* C nesting (native reentry) still consumes real stack — keep a guard */
+    if (js_check_stack_overflow(rt, 0))
         return JS_ThrowStackOverflow(caller_ctx);
+    pf_func = func_obj;
+    pf_this = this_obj;
+    pf_new_target = new_target;
+    pf_argc = argc;
+    pf_argv = argv;
+    pf_flags = flags;
+    pf_kind = TT_FRAME_ENTRY;
 
-    sf->js_mode = b->js_mode;
-    sf->tt_last_line = 0;
-    sf->tt_pc_lo = 0;
-    sf->tt_pc_hi = 0;
-    sf->tt_prev_off = 0;
-    arg_buf = argv;
-    sf->arg_count = argc;
-    sf->cur_func = (JSValue)func_obj;
-    var_refs = p->u.func.var_refs;
+    /* TimeTravelJS stackless: push an interpreter frame in the arena and
+       (re)enter the dispatch loop. Reached from the C entry above and from
+       the inlined JS→JS call opcodes — no C recursion between JS frames. */
+ push_frame:
+    {
+        JSObject *fp = JS_VALUE_GET_OBJ(pf_func);
+        JSFunctionBytecode *fb = fp->u.func.function_bytecode;
+        int arg_allocated_size;
+        JSValue *vals;
+        JSStackFrame *nsf;
 
-    local_buf = alloca(alloca_size);
-    if (unlikely(arg_allocated_size)) {
-        int n = min_int(argc, b->arg_count);
-        arg_buf = local_buf;
-        for(i = 0; i < n; i++)
-            arg_buf[i] = JS_DupValue(caller_ctx, argv[i]);
-        for(; i < b->arg_count; i++)
-            arg_buf[i] = JS_UNDEFINED;
-        sf->arg_count = b->arg_count;
+        if (unlikely(pf_argc < fb->arg_count || (pf_flags & JS_CALL_FLAG_COPY_ARGV)))
+            arg_allocated_size = fb->arg_count;
+        else
+            arg_allocated_size = 0;
+
+        nsf = tt_arena_push(rt, (size_t)arg_allocated_size + fb->var_count +
+                            fb->stack_size, fb->var_ref_count, &vals);
+        if (unlikely(!nsf)) {
+            JS_ThrowStackOverflow(caller_ctx);
+            if (pf_kind == TT_FRAME_ENTRY)
+                return JS_EXCEPTION;
+            goto exception; /* the caller frame's state is still loaded */
+        }
+        nsf->js_mode = fb->js_mode;
+        nsf->tt_last_line = 0;
+        nsf->tt_pc_lo = 0;
+        nsf->tt_pc_hi = 0;
+        nsf->tt_prev_off = 0;
+        nsf->cur_func = (JSValue)pf_func;
+        nsf->cur_pc = fb->byte_code_buf;
+        nsf->cur_sp = NULL;
+        nsf->tt_frame_kind = pf_kind;
+        nsf->tt_call_argc = (uint16_t)pf_argc;
+        nsf->tt_this = pf_this;
+        nsf->tt_new_target = pf_new_target;
+        nsf->tt_orig_argv = pf_argv;
+        nsf->tt_orig_argc = pf_argc;
+        nsf->tt_frame_base = vals;
+        nsf->arg_buf = pf_argv;
+        nsf->arg_count = pf_argc;
+        if (unlikely(arg_allocated_size)) {
+            int n = min_int(pf_argc, fb->arg_count);
+            nsf->arg_buf = vals;
+            for(i = 0; i < n; i++)
+                nsf->arg_buf[i] = JS_DupValue(caller_ctx, pf_argv[i]);
+            for(; i < fb->arg_count; i++)
+                nsf->arg_buf[i] = JS_UNDEFINED;
+            nsf->arg_count = fb->arg_count;
+        }
+        nsf->var_buf = vals + arg_allocated_size;
+        for(i = 0; i < fb->var_count; i++)
+            nsf->var_buf[i] = JS_UNDEFINED;
+        nsf->var_refs = (JSVarRef **)(nsf->var_buf + fb->var_count + fb->stack_size);
+        for(i = 0; i < fb->var_ref_count; i++)
+            nsf->var_refs[i] = NULL;
+        nsf->prev_frame = rt->current_stack_frame;
+        rt->current_stack_frame = nsf;
+        sf = nsf;
+        TT_LOAD_FRAME();
+        sp = stack_buf;
+        pc = b->byte_code_buf;
+        if (pf_kind == TT_FRAME_ENTRY)
+            rt->tt_loop_depth++;
     }
-    var_buf = local_buf + arg_allocated_size;
-    sf->var_buf = var_buf;
-    sf->arg_buf = arg_buf;
-
-    for(i = 0; i < b->var_count; i++)
-        var_buf[i] = JS_UNDEFINED;
-
-    stack_buf = var_buf + b->var_count;
-    sf->var_refs = (JSVarRef **)(stack_buf + b->stack_size);
-    for(i = 0; i < b->var_ref_count; i++)
-        sf->var_refs[i] = NULL;
-    sp = stack_buf;
-    pc = b->byte_code_buf;
-    sf->prev_frame = rt->current_stack_frame;
-    rt->current_stack_frame = sf;
-    ctx = b->realm; /* set the current realm */
 
  restart:
     for(;;) {
@@ -18382,6 +18561,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             has_call_argc:
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
+                /* TimeTravelJS stackless: a bytecode callee continues in
+                   THIS loop — push a frame instead of recursing. (Inlined
+                   tail calls keep the caller frame: exact-space proper tail
+                   calls are traded for a machine that can park anywhere.) */
+                if (likely(JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
+                           JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_BYTECODE_FUNCTION) &&
+                    !(opcode == OP_tail_call && b->func_kind != JS_FUNC_NORMAL)) {
+                    if (unlikely(js_poll_interrupts(ctx)))
+                        goto exception;
+                    sf->cur_sp = sp;
+                    pf_func = call_argv[-1];
+                    pf_this = JS_UNDEFINED;
+                    pf_new_target = JS_UNDEFINED;
+                    pf_argc = call_argc;
+                    pf_argv = call_argv;
+                    pf_flags = 0;
+                    pf_kind = (opcode == OP_tail_call) ? TT_FRAME_TAIL : TT_FRAME_CALL;
+                    goto push_frame;
+                }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                           JS_UNDEFINED, call_argc, call_argv, 0);
                 if (unlikely(JS_IsException(ret_val)))
@@ -18418,6 +18616,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
+                if (likely(JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
+                           JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_BYTECODE_FUNCTION) &&
+                    !(opcode == OP_tail_call_method && b->func_kind != JS_FUNC_NORMAL)) {
+                    if (unlikely(js_poll_interrupts(ctx)))
+                        goto exception;
+                    sf->cur_sp = sp;
+                    pf_func = call_argv[-1];
+                    pf_this = call_argv[-2];
+                    pf_new_target = JS_UNDEFINED;
+                    pf_argc = call_argc;
+                    pf_argv = call_argv;
+                    pf_flags = 0;
+                    pf_kind = (opcode == OP_tail_call_method) ? TT_FRAME_TAIL_METHOD : TT_FRAME_CALL_METHOD;
+                    goto push_frame;
+                }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                           JS_UNDEFINED, call_argc, call_argv, 0);
                 if (unlikely(JS_IsException(ret_val)))
@@ -20746,8 +20959,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     done_generator:
         sf->cur_pc = pc;
         sf->cur_sp = sp;
-    } else {
-    done:
+        rt->current_stack_frame = sf->prev_frame;
+        rt->tt_loop_depth--; /* generator frames always enter from C */
+        return ret_val;
+    }
+ done:
+    /* TimeTravelJS stackless return: pop this frame. An inlined frame
+       hands ret_val to its caller INSIDE the loop; an entry frame returns
+       to C. Tail-call frames make the caller return the same value (via
+       goto done in the caller's context). */
+    {
+        int kind, cargc;
         if (unlikely(b->var_ref_count != 0)) {
             /* variable references reference the stack: must close them */
             close_var_refs(rt, b, sf);
@@ -20756,9 +20978,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         for(pval = local_buf; pval < sp; pval++) {
             JS_FreeValue(ctx, *pval);
         }
+        rt->current_stack_frame = sf->prev_frame;
+        kind = sf->tt_frame_kind;
+        cargc = sf->tt_call_argc;
+        tt_arena_pop(rt, sf);
+        if (kind == TT_FRAME_ENTRY) {
+            rt->tt_loop_depth--;
+            return ret_val;
+        }
+        sf = rt->current_stack_frame;
+        TT_LOAD_FRAME();
+        sp = sf->cur_sp;
+        sf->cur_sp = NULL;
+        pc = sf->cur_pc;
+        if (unlikely(JS_IsException(ret_val)))
+            goto exception;
+        {
+            JSValue *cav = sp - cargc;
+            int base = (kind == TT_FRAME_CALL || kind == TT_FRAME_TAIL) ? -1 : -2;
+            for(i = base; i < cargc; i++)
+                JS_FreeValue(ctx, cav[i]);
+            sp = cav + base;
+            if (kind == TT_FRAME_TAIL || kind == TT_FRAME_TAIL_METHOD)
+                goto done; /* caller returns ret_val as its own result */
+            *sp++ = ret_val;
+        }
     }
-    rt->current_stack_frame = sf->prev_frame;
-    return ret_val;
+    goto restart;
 }
 
 #ifdef OPCODE_ASM_LABEL
@@ -20971,6 +21217,16 @@ static JSAsyncFunctionState *async_func_init(JSContext *ctx,
     sf->arg_count = arg_buf_len;
     sf->var_buf = sf->arg_buf + arg_buf_len;
     sf->cur_sp = sf->var_buf + b->var_count;
+    /* TimeTravelJS stackless: the loop reads the former C parameters from
+       the frame. Generator frames live on the heap, enter from C, and can
+       never observe a defined new.target. */
+    sf->tt_this = s->this_val;
+    sf->tt_new_target = JS_UNDEFINED;
+    sf->tt_orig_argv = sf->arg_buf;
+    sf->tt_orig_argc = argc;
+    sf->tt_frame_base = sf->arg_buf;
+    sf->tt_frame_kind = TT_FRAME_ENTRY;
+    sf->tt_call_argc = 0;
     sf->var_refs = (JSVarRef **)(sf->cur_sp + b->stack_size);
     for(i = 0; i < b->var_ref_count; i++)
         sf->var_refs[i] = NULL;
@@ -61582,11 +61838,88 @@ JSValue JS_TTGlobalLexicals(JSContext *ctx)
 
 /* Reset runtime-level execution state after the host rewound the heap to a
    mid-execution snapshot and is starting a fresh session: any stack-frame
-   chain recorded in that heap dangles into the (reused) shadow stack. */
+   chain recorded in that heap dangles into abandoned arena/shadow state.
+   Values still referenced from stranded frames are deliberately leaked —
+   their refcount world belongs to a healed-away timeline. */
 void JS_TTResetExecState(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
     rt->current_stack_frame = NULL;
+    rt->tt_parked_frame = NULL;
+    rt->tt_loop_depth = 0;
+    rt->tt_park_ok = FALSE;
+    rt->tt_park_abort = FALSE;
+    rt->tt_skip_once = FALSE;
+    rt->tt_arena_top = rt->tt_arena_base;
+    rt->tt_exec_fn = JS_UNDEFINED; /* do not free: heap may be mid-heal */
+}
+
+/* Step granularity: 0 = source line (+ loop back-jumps), 1 = every opcode. */
+void JS_TTSetGranularity(JSContext *ctx, int granularity)
+{
+    ctx->rt->tt_granularity = granularity;
+}
+
+JS_BOOL JS_TTParked(JSContext *ctx)
+{
+    return ctx->rt->tt_parked_frame != NULL;
+}
+
+/* Run a compiled script/function with park-by-return enabled: while the
+   dispatch loop is the only thing on the C stack, a step can suspend the
+   machine by RETURNING — the complete execution state stays behind in
+   linear memory. Returns with *pparked = 1 when parked (resume with
+   JS_TTCallResume); otherwise the completion value.
+   `fun_obj` is consumed (like JS_EvalFunction). */
+JSValue JS_TTCallStart(JSContext *ctx, JSValue fun_obj, int *pparked)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValue fun, ret;
+
+    *pparked = 0;
+    if (JS_VALUE_GET_TAG(fun_obj) == JS_TAG_FUNCTION_BYTECODE) {
+        fun = js_closure(ctx, fun_obj, NULL, NULL, TRUE);
+        if (JS_IsException(fun))
+            return JS_EXCEPTION;
+    } else {
+        fun = fun_obj;
+    }
+    /* the runtime holds the callable: the parked ENTRY frame borrows it */
+    rt->tt_exec_fn = fun;
+    rt->tt_park_ok = TRUE;
+    ret = JS_CallInternal(ctx, fun, ctx->global_obj, JS_UNDEFINED,
+                          0, NULL, JS_CALL_FLAG_COPY_ARGV);
+    if (rt->tt_parked_frame) {
+        *pparked = 1;
+        return JS_UNDEFINED;
+    }
+    rt->tt_park_ok = FALSE;
+    JS_FreeValue(ctx, rt->tt_exec_fn);
+    rt->tt_exec_fn = JS_UNDEFINED;
+    return ret;
+}
+
+/* Resume a parked machine. cmd 0 continues; cmd 1 aborts the activation
+   (throws an uncatchable-style Interrupted error through the script). */
+JSValue JS_TTCallResume(JSContext *ctx, int cmd, int *pparked)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValue ret;
+
+    *pparked = 0;
+    if (!rt->tt_parked_frame)
+        return JS_ThrowInternalError(ctx, "no parked machine to resume");
+    rt->tt_park_abort = (cmd == 1);
+    ret = JS_CallInternal(ctx, JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED,
+                          0, NULL, JS_CALL_FLAG_TT_RESUME);
+    if (rt->tt_parked_frame) {
+        *pparked = 1;
+        return JS_UNDEFINED;
+    }
+    rt->tt_park_ok = FALSE;
+    JS_FreeValue(ctx, rt->tt_exec_fn);
+    rt->tt_exec_fn = JS_UNDEFINED;
+    return ret;
 }
 
 /* Write a frame local (argument, local variable, or closure capture) at the

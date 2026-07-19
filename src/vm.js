@@ -1,13 +1,17 @@
 // Loader + driver for the TimeTravelJS QuickJS build (dist/quickjs-tt.wasm).
 //
-// This module owns the Asyncify protocol: the wasm's env.tt_host_step import
-// is the single suspendable point. When the driver decides to suspend, the
-// entire wasm call stack spills into a fixed buffer inside linear memory
-// (tt_asyncify_area, in the data segment), the entry export returns, and the
-// VM is a frozen machine whose complete state — heap, stack spill, virtual
-// clock — is bytes. Resuming rewinds into whatever suspension the current
-// memory contents describe, which is exactly what makes restored snapshots
-// come back to life.
+// Two suspension mechanisms, one contract ("the machine is bytes"):
+//
+//  'r' — park by return. The stackless interpreter keeps all frames in a
+//        linear-memory arena; when nothing but the dispatch loop is on the
+//        C stack, suspending IS returning from the export, and resuming is
+//        a fresh call into tt_resume. No spill, no rewind, no wasm stack
+//        state at all.
+//  'a' — Asyncify fallback for steps under live C frames (comparators,
+//        getters, generator bodies, jobs): the env.tt_host_step import
+//        unwinds the whole C stack into a fixed buffer in the data segment;
+//        resuming rewinds into whatever suspension the current memory
+//        contents describe.
 //
 // No handles, no wrappers: strings cross the boundary as UTF-8 bytes, and
 // every JSValue the wrapper holds lives inside the VM image itself.
@@ -109,6 +113,7 @@ export class QuickJSVM {
   constructor(hooks) {
     this.hooks = hooks
     this.suspended = false
+    this.parkKind = null // 'r' = parked by return (stackless), 'a' = asyncify
     this.entry = null // { name, args } of the export invocation that is suspended
     this.pendingCommand = STEP_CONTINUE
     this.stagedArg = null // Uint8Array staged for TT_CMD_EVAL
@@ -160,7 +165,7 @@ export class QuickJSVM {
   }
 
   // ---- entry driving ------------------------------------------------------
-  /** Invoke an entry export; returns { suspended } or { done }. */
+  /** Invoke an entry export; returns { suspended, park: 'r'|'a' } or { done }. */
   drive(name, ...args) {
     if (this.suspended) throw new Error("VM already suspended")
     this.entry = { name, args }
@@ -169,14 +174,24 @@ export class QuickJSVM {
   }
 
   /**
-   * Deliver a command into the paused step hook and let the VM run again:
-   * rewinds into whatever suspension the CURRENT MEMORY CONTENTS describe.
-   * The re-entered hook returns `command` to the wrapper's command loop.
+   * Let the paused VM run again. A return-parked machine ('r') resumes with
+   * a plain call into tt_resume — its complete state is linear memory. An
+   * asyncify suspension ('a') rewinds the spilled C stack and delivers
+   * `command` to the wrapper's command loop.
    */
   resume(command) {
     if (!this.suspended) throw new Error("VM not suspended")
+    if (this.parkKind === "r") {
+      const cmd = command === STEP_ABORT ? 1 : 0
+      this.suspended = false
+      this.parkKind = null
+      this.entry = { name: "tt_resume", args: [cmd] }
+      this.exports.tt_resume(cmd)
+      return this._postEntry()
+    }
     this.pendingCommand = command
     this.suspended = false
+    this.parkKind = null
     this.exports.asyncify_start_rewind(this.asyncifyPtr)
     this.exports[this.entry.name](...this.entry.args)
     return this._postEntry()
@@ -187,7 +202,15 @@ export class QuickJSVM {
       this._suspendRequested = false
       this.exports.asyncify_stop_unwind()
       this.suspended = true
-      return { suspended: true }
+      this.parkKind = "a"
+      return { suspended: true, park: "a" }
+    }
+    if (this.exports.tt_parked()) {
+      // parked by return: no live wasm activation — resume is a fresh call
+      this.suspended = true
+      this.parkKind = "r"
+      this.entry = null
+      return { suspended: true, park: "r" }
     }
     this.entry = null
     return { done: true }
@@ -195,18 +218,21 @@ export class QuickJSVM {
 
   /**
    * Adopt a suspension restored from a snapshot: after the engine rewrites
-   * linear memory with a state that was captured while suspended inside
-   * `entry`, this re-arms the driver to resume it.
+   * linear memory with a state captured while suspended, this re-arms the
+   * driver to resume it. 'a' suspensions need the recorded entry (the export
+   * to re-invoke for the rewind); 'r' parks need nothing but the memory.
    */
-  adoptSuspension(entry) {
+  adoptSuspension(entry, parkKind = "a") {
     this.suspended = true
-    this.entry = entry
+    this.parkKind = parkKind
+    this.entry = parkKind === "r" ? null : entry
     this._suspendRequested = false
   }
 
   /** Forget the current suspension (its memory is being navigated away). */
   abandonSuspension() {
     this.suspended = false
+    this.parkKind = null
     this.entry = null
     this._suspendRequested = false
   }
@@ -221,6 +247,7 @@ export class QuickJSVM {
       this.exports.asyncify_stop_rewind()
     }
     this.suspended = false
+    this.parkKind = null
     this.entry = null
     this._suspendRequested = false
     this.pendingCommand = STEP_CONTINUE

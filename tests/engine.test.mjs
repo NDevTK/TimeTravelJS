@@ -283,6 +283,82 @@ test("timeline fork: edit-and-continue changes the future, prefix stays exact", 
   assert.equal(globalVal(engine.inspect(), "acc").v, 0)
 })
 
+test("stackless core: plain JS suspends by return, C-reentry falls back to asyncify", async () => {
+  await engine.run(`
+function calc(n) { let t = 0; for (let i = 0; i < n; i++) t += i; return t; }
+const a = calc(20);
+const sorted = [3, 1, 2].sort((x, y) => x - y);
+console.log(a, sorted.join(""));
+`)
+  const t = engine.trace
+  const rSteps = t.filter((e) => e.k === "r").length
+  const aSteps = t.filter((e) => e.sp !== undefined).length
+  // mainline + plain calls park by return (no C stack spans the step)…
+  assert.ok(rSteps > 10, `expected return-parked majority, got ${rSteps}`)
+  // …while the sort comparator runs under live C frames → asyncify fallback
+  assert.ok(aSteps >= 1, "comparator steps must use the asyncify fallback")
+  // a return-parked position has no one-shot restriction: inspect it thrice
+  const rPos = t.findIndex((e) => e.k === "r" && e.d > 0)
+  assert.ok(rPos > 0)
+  engine.positionTo(rPos)
+  const one = JSON.stringify(engine.inspect())
+  engine.session.cachedInspect.delete(rPos)
+  const two = JSON.stringify(engine.inspect())
+  engine.session.cachedInspect.delete(rPos)
+  const three = JSON.stringify(engine.inspect())
+  assert.equal(one, two)
+  assert.equal(two, three)
+})
+
+test("opcode granularity: suspend/resume between any two VM instructions", async () => {
+  const PROG = `let q = 0;\nfor (let i = 0; i < 8; i++) q += i * 2;\nconsole.log(q);\n`
+  const line = await engine.run(PROG)
+  const lineSteps = line.steps
+  const op = await engine.run(PROG, { granularity: "opcode" })
+  assert.ok(op.steps > lineSteps * 3, `opcode steps (${op.steps}) ≫ line steps (${lineSteps})`)
+  assert.equal(op.error, null)
+  // mid-expression machine states are real positions
+  engine.positionTo(Math.floor(op.steps / 2))
+  const q = engine.inspect().globals.find(([k]) => k === "q")?.[1]
+  assert.equal(q.t, "num")
+  engine.positionTo(op.steps - 1)
+  assert.equal(engine.consoleEntries.at(-1).parts[0].v, 56)
+})
+
+test("JS recursion depth is an exact arena limit — catchable, session survives", async () => {
+  const summary = await engine.run(`
+let depth = 0;
+function dive() { depth++; return dive(); }
+let caught = "no";
+try { dive(); } catch (e) { caught = "yes"; }
+console.log(caught, depth);
+`, { maxSteps: 200000 })
+  assert.equal(summary.error, null, "overflow is catchable, not fatal")
+  engine.positionTo(engine.trace.length - 1)
+  const g = engine.inspect().globals
+  assert.equal(g.find(([k]) => k === "caught")?.[1]?.v, "yes")
+  assert.ok(g.find(([k]) => k === "depth")?.[1]?.v > 5000, "thousands of frames deep")
+})
+
+test("fork works from an asyncify-parked position too (inside a comparator)", async () => {
+  await engine.run(`
+const xs = [4, 2, 5, 1, 3];
+let cmps = 0;
+xs.sort((p, q) => { cmps++; return p - q; });
+console.log(xs.join(","), cmps);
+`)
+  const stepsBefore = engine.trace.length
+  const aPos = engine.trace.findIndex((e) => e.sp !== undefined && e.d > 0)
+  assert.ok(aPos > 0, "found a comparator step (asyncify kind)")
+  const summary = await engine.forkFrom(aPos)
+  assert.equal(summary.error, null)
+  assert.equal(summary.forkedAt, aPos)
+  // deterministic re-record from inside the C-mediated callback
+  assert.equal(engine.trace.length, stepsBefore)
+  engine.positionTo(engine.trace.length - 1)
+  assert.equal(engine.consoleEntries.at(-1).parts[0].v, "1,2,3,4,5")
+})
+
 test("navigation is orders of magnitude cheaper than execution", async () => {
   await engine.run(`
 const data = [];

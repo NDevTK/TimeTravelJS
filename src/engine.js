@@ -1,19 +1,21 @@
-// TimeTravelJS engine v3 — true suspend/resume time travel.
+// TimeTravelJS engine — true suspend/resume time travel on a stackless VM.
 //
-// The program executes exactly once. At every source-line step the patched
-// QuickJS VM suspends via Asyncify (its whole call stack spills into linear
-// memory) and the engine captures a copy-on-write page delta of the entire
-// machine. Navigation applies deltas backward/forward — pure memory writes,
-// no re-execution, no replay, no determinism requirements.
+// The program executes exactly once. The interpreter keeps every frame in a
+// linear-memory arena, so on the common path no C stack spans a step: the
+// VM suspends by RETURNING to the host ('r' steps — resuming is a plain
+// call), and the engine captures a copy-on-write page delta of the entire
+// machine. Steps reached under live C frames (sort comparators, getters,
+// generator bodies, promise jobs) suspend through Asyncify instead ('a'
+// steps — the C stack spills into linear memory and resuming rewinds it).
+// Navigation applies deltas backward/forward — pure memory writes, no
+// re-execution, no replay, no determinism requirements.
 //
-// Inspection is transactional: to look at position P, the engine restores
-// P's pages, rewinds the VM into that suspension, lets the wrapper's command
-// loop run the inspection (or a console evaluation) inside the live
-// interpreter, then aborts the disposable activation. The delta store keeps
-// P pristine; whatever the transaction perturbed is healed on the next
-// navigation. The VM never suspends twice in one hook activation — the one
-// asyncify pattern that is load-bearing is the one the recorder exercises
-// thousands of times.
+// Inspection at an 'r' position is trivial: restore the pages and walk the
+// live frames with a plain call — repeatable at will. At an 'a' position it
+// is a one-shot transaction: restore, set the shadow stack pointer, rewind,
+// inspect inside the live interpreter, abort the disposable activation.
+// Either way the delta store keeps history pristine; whatever a transaction
+// perturbs is healed from the page store afterwards.
 
 import { QuickJSVM, STEP_CONTINUE, STEP_ABORT, STEP_INSPECT_ABORT, STEP_EVAL_ABORT, STEP_EVAL_CONTINUE } from "./vm.js"
 import { DeltaStore } from "./deltastore.js"
@@ -136,6 +138,9 @@ export class TimeTravelEngine {
     const s = this.session
     if (opts.maxSteps) s.maxSteps = opts.maxSteps
     if (opts.verifyBarrier) s.verifyBarrier = true
+    // granularity: "line" (default) or "opcode" — suspend between every two
+    // VM instructions of user code
+    this.vm.exports.tt_set_granularity(opts.granularity === "opcode" ? 1 : 0)
 
     const { ptr, len } = this.vm.writeString(source)
     s.programPtr = ptr
@@ -204,14 +209,26 @@ export class TimeTravelEngine {
       return origOnStep(line, col, depth)
     }
     try {
-      this.vm.adoptSuspension(entry.entry)
-      this.vm.exports.__stack_pointer.value = entry.sp
       let r
-      if (editSrc != null) {
-        this.vm.stagedArg = new TextEncoder().encode(String(editSrc))
-        r = this.vm.resume(STEP_EVAL_CONTINUE)
-      } else {
+      if (entry.k === "r") {
+        // return-parked fork: the restored memory is the whole machine.
+        // Apply the edit with a plain call, then continue with another.
+        if (editSrc != null) {
+          this.vm.stagedArg = new TextEncoder().encode(String(editSrc))
+          this.vm.exports.tt_eval_parked(1)
+          // the edit's dirty pages stay marked: they belong to pos+1's delta
+        }
+        this.vm.adoptSuspension(null, "r")
         r = this.vm.resume(STEP_CONTINUE)
+      } else {
+        this.vm.adoptSuspension(entry.entry)
+        this.vm.exports.__stack_pointer.value = entry.sp
+        if (editSrc != null) {
+          this.vm.stagedArg = new TextEncoder().encode(String(editSrc))
+          r = this.vm.resume(STEP_EVAL_CONTINUE)
+        } else {
+          r = this.vm.resume(STEP_CONTINUE)
+        }
       }
       const ok = await this._pumpSteps(r, entry.entry)
       await this._drainPhases(ok)
@@ -232,13 +249,27 @@ export class TimeTravelEngine {
   async _pumpSteps(r, entryTag) {
     const s = this.session
     while (r.suspended) {
-      s.trace.push({
-        l: this._lastLine,
-        c: this._lastCol,
-        d: this._lastDepth,
-        entry: entryTag,
-        sp: this.vm.exports.__stack_pointer.value,
-      })
+      const isR = r.park === "r"
+      const e = isR
+        ? {
+            // parked by return: the stackless path — no live wasm activation,
+            // no stack pointer to save; the machine is nothing but memory
+            l: this.vm.exports.tt_park_line(),
+            c: this.vm.exports.tt_park_col(),
+            d: this.vm.exports.tt_park_depth(),
+            entry: this.vm.entry ?? entryTag,
+            k: "r",
+          }
+        : {
+            // asyncify suspension (C frames live): record the activation to
+            // rewind and the shadow stack pointer it must resume from
+            l: this._lastLine,
+            c: this._lastCol,
+            d: this._lastDepth,
+            entry: this.vm.entry ?? entryTag,
+            sp: this.vm.exports.__stack_pointer.value,
+          }
+      s.trace.push(e)
       if (s.trace.length === 1) {
         // base image: full scan (excluding the barrier's own map region)
         this.vm.clearDirtyMap()
@@ -339,7 +370,12 @@ export class TimeTravelEngine {
     try {
       this.positionTo(s.pos)
       this.vm.clearDirtyMap()
-      if (entry.entry) {
+      if (entry.k === "r") {
+        // return-parked position: the restored memory IS the parked machine —
+        // walk its live frames with a plain call. No rewind, no SP, no
+        // one-shot restriction.
+        this.vm.exports.tt_inspect_parked()
+      } else if (entry.entry) {
         this.vm.adoptSuspension(entry.entry)
         this._mode = "transact"
         this.vm.exports.__stack_pointer.value = entry.sp
@@ -388,7 +424,9 @@ export class TimeTravelEngine {
     try {
       this.positionTo(s.pos)
       this.vm.clearDirtyMap()
-      if (entry.entry) {
+      if (entry.k === "r") {
+        this.vm.exports.tt_eval_parked(0)
+      } else if (entry.entry) {
         this.vm.adoptSuspension(entry.entry)
         this._mode = "transact"
         this.vm.exports.__stack_pointer.value = entry.sp

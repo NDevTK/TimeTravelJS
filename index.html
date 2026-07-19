@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>TimeTravelJS — true suspend/resume time travel for JavaScript</title>
-  <meta name="description" content="A time-travel JavaScript debugger in your browser: a patched QuickJS VM on WebAssembly that suspends at every statement, snapshots itself with copy-on-write pages, and navigates history without re-executing anything." />
+  <meta name="description" content="A time-travel JavaScript debugger in your browser: a stackless QuickJS VM on WebAssembly that suspends between any two instructions, snapshots itself with copy-on-write pages, and navigates history without re-executing anything." />
   <link rel="stylesheet" href="./styles.css" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%8F%B3%3C/text%3E%3C/svg%3E" />
 </head>
@@ -13,11 +13,15 @@
     <div class="brand">
       <span class="brand-mark">⏳</span>
       <span class="brand-name">TimeTravel<span class="brand-accent">JS</span></span>
-      <span class="brand-sub">patched QuickJS · Asyncify suspend/resume · per-step COW snapshots</span>
+      <span class="brand-sub">stackless QuickJS · suspend/resume at any depth · per-step COW snapshots</span>
     </div>
     <div class="top-actions">
       <label class="sample-label" for="sample-select">Sample</label>
       <select id="sample-select" class="sample-select"></select>
+      <select id="granularity-select" class="sample-select" title="Step granularity: one snapshot per source line, or one per VM instruction (microscope mode)">
+        <option value="line" selected>line steps</option>
+        <option value="opcode">opcode steps</option>
+      </select>
       <button id="run-btn" class="btn btn-run" title="Run &amp; record (Ctrl+Enter)">
         <span class="btn-run-icon">●</span> Record
       </button>
@@ -100,7 +104,7 @@
   <footer class="footer">
     <span><b>keys</b> — Ctrl+Enter: record · ←/→: step back/into · Alt+←/→: step over · Ctrl+←/→: run to breakpoint</span>
     <span class="footer-right">
-      every step is a suspended machine state — <em>page-level copy-on-write snapshots</em> of a patched QuickJS VM ·
+      every step is a suspended machine state — <em>page-level copy-on-write snapshots</em> of a stackless QuickJS VM ·
       <a href="https://github.com/NDevTK/TimeTravelJS" target="_blank" rel="noreferrer">source</a>
     </span>
   </footer>

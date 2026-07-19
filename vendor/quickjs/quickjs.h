@@ -928,15 +928,28 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
 void JS_SetCanBlock(JSRuntime *rt, JS_BOOL can_block);
 
 /* TimeTravelJS debugger API ---------------------------------------------- */
-/* Statement-level step hook: called when execution reaches a new source line
-   or re-enters one through a backward jump (loop iteration). May be invoked
+/* Step hook: called when execution reaches a new source line or re-enters
+   one through a backward jump (loop iteration) — or, at opcode granularity,
+   between every two VM instructions of user code. May be invoked
    re-entrantly for nested evals only if re-enabled inside the handler.
-   Return 0 to continue, nonzero to abort execution (uncatchable interrupt). */
+   Return 0 to continue, 1 to abort execution (uncatchable interrupt), or —
+   ONLY when `parkable` is true — 2 to park the machine by return: the
+   interpreter (stackless: all frames live in linear memory) simply returns
+   to the host, and JS_TTCallResume re-enters it at the saved frame. */
 typedef int JSTTStepHandler(JSContext *ctx, int line, int col, int depth,
-                            void *opaque);
+                            int parkable, void *opaque);
 void JS_TTSetStepHandler(JSRuntime *rt, JSTTStepHandler *handler, void *opaque);
 void JS_TTEnableStep(JSRuntime *rt, JS_BOOL enable);
 JS_BOOL JS_TTStepEnabled(JSRuntime *rt);
+/* Step granularity: 0 = source line (default), 1 = every opcode. */
+void JS_TTSetGranularity(JSContext *ctx, int granularity);
+/* Park-by-return execution driver. Start consumes fun_obj (a compiled
+   script from JS_Eval(..., JS_EVAL_FLAG_COMPILE_ONLY) or any callable);
+   *pparked = 1 means the machine is suspended in linear memory — resume
+   with cmd 0 (continue) or 1 (abort). */
+JSValue JS_TTCallStart(JSContext *ctx, JSValue fun_obj, int *pparked);
+JSValue JS_TTCallResume(JSContext *ctx, int cmd, int *pparked);
+JS_BOOL JS_TTParked(JSContext *ctx);
 /* Deterministic virtual clock backing Date.now()/new Date(); advances one
    unit per reported step. Enabling it also fixes the Math.random() seed for
    contexts created afterwards. Stored in linear memory (snapshot-visible). */

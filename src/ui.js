@@ -153,6 +153,7 @@ export class DebuggerUI {
 
     this.els = {
       sampleSelect: $("#sample-select"),
+      granularitySelect: $("#granularity-select"),
       runBtn: $("#run-btn"),
       status: $("#status-pill"),
       slider: $("#timeline-slider"),
@@ -195,6 +196,7 @@ export class DebuggerUI {
         this.record()
       }
     })
+    this.els.granularitySelect?.addEventListener("change", () => this.record())
     this.els.code.value = SAMPLES[0].code
   }
 
@@ -419,7 +421,7 @@ export class DebuggerUI {
     try {
       const summary = await this.engine.run(
         this.els.code.value,
-        {},
+        { granularity: this.els.granularitySelect?.value === "opcode" ? "opcode" : "line" },
         (p) => this.setStatus("busy", `recording… ${p.steps} steps · ${p.checkpoints} snapshots`),
       )
       const cow = summary.cow

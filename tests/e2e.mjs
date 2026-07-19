@@ -171,6 +171,21 @@ assert.match(statusCrash, /crash/i)
 const memText = await page.textContent("#mem-stats")
 assert.match(memText, /COW actually keeps/)
 
+// --- opcode granularity: re-record the crash sample at VM-instruction steps
+const lineStepsCrash = await page.evaluate(() => window.__timetravel.ui.summary.steps)
+await page.selectOption("#granularity-select", "opcode")
+await page.waitForFunction(
+  (prev) => {
+    const ui = window.__timetravel.ui
+    return ui.summary && !ui.recording && ui.summary.steps !== prev
+  },
+  lineStepsCrash,
+  { timeout: 120000 },
+)
+const opcodeSteps = await page.evaluate(() => window.__timetravel.ui.summary.steps)
+console.log("granularity: line =", lineStepsCrash, "steps, opcode =", opcodeSteps, "steps")
+assert.ok(opcodeSteps > lineStepsCrash * 2, "opcode granularity records much finer steps")
+
 const fatal = pageErrors.filter((e) => !/favicon/.test(e))
 if (fatal.length) {
   console.error("PAGE ERRORS:", fatal)
