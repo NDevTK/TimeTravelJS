@@ -73,23 +73,19 @@ const mapAddr = rawInstance.exports.tt_dirty_map()
 const mapSize = rawInstance.exports.tt_dirty_map_size()
 console.log(`· dirty map at ${mapAddr} (${mapSize / 1024} KB)`)
 
-console.log("· Binaryen: Asyncify pass + optimize")
+// No Asyncify: the stackless interpreter suspends by returning — the only
+// transform left is optimization ahead of the write-barrier pass.
+console.log("· Binaryen: optimize")
 const binaryen = (await import("binaryen")).default
 binaryen.setDebugInfo(debug)
 const module_ = binaryen.readBinary(rawBytes)
 binaryen.setOptimizeLevel(2)
 binaryen.setShrinkLevel(0)
-binaryen.setPassArgument("asyncify-imports", "env.tt_host_step")
-module_.runPasses(["asyncify"])
 module_.optimize()
-// The shadow stack pointer is a wasm global — invisible to linear-memory
-// snapshots, but a rewind only works from the same SP the unwind left
-// behind. Export it so the engine can save/restore it per suspension.
-module_.addGlobalExport("__stack_pointer", "__stack_pointer")
 if (!module_.validate()) throw new Error("binaryen validation failed")
 const asyncified = module_.emitBinary()
 module_.dispose()
-console.log(`  ${(asyncified.length / 1048576).toFixed(2)} MB asyncified`)
+console.log(`  ${(asyncified.length / 1048576).toFixed(2)} MB optimized`)
 
 console.log("· write-barrier pass (every store marks its 1 KB page)")
 const final = instrumentWriteBarrier(asyncified, mapAddr)

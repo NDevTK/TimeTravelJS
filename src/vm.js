@@ -1,17 +1,10 @@
 // Loader + driver for the TimeTravelJS QuickJS build (dist/quickjs-tt.wasm).
 //
-// Two suspension mechanisms, one contract ("the machine is bytes"):
-//
-//  'r' — park by return. The stackless interpreter keeps all frames in a
-//        linear-memory arena; when nothing but the dispatch loop is on the
-//        C stack, suspending IS returning from the export, and resuming is
-//        a fresh call into tt_resume. No spill, no rewind, no wasm stack
-//        state at all.
-//  'a' — Asyncify fallback for steps under live C frames (comparators,
-//        getters, generator bodies, jobs): the env.tt_host_step import
-//        unwinds the whole C stack into a fixed buffer in the data segment;
-//        resuming rewinds into whatever suspension the current memory
-//        contents describe.
+// One suspension mechanism, one contract: the stackless interpreter keeps
+// every frame in a linear-memory arena, so suspending IS returning from the
+// entry export and resuming is a fresh call into tt_resume. A parked
+// machine has no live wasm activation at all — its complete state is linear
+// memory, restorable from any snapshot by construction.
 //
 // No handles, no wrappers: strings cross the boundary as UTF-8 bytes, and
 // every JSValue the wrapper holds lives inside the VM image itself.
@@ -21,21 +14,11 @@ const te = new TextEncoder()
 
 export const STEP_CONTINUE = 0
 export const STEP_ABORT = 1
-export const STEP_INSPECT = 2
-export const STEP_EVAL = 3
-export const STEP_INSPECT_ABORT = 4
-export const STEP_EVAL_ABORT = 5
-export const STEP_EVAL_CONTINUE = 6
-
-const ASYNCIFY_NORMAL = 0
-const ASYNCIFY_REWINDING = 2
 
 export class QuickJSVM {
   /**
    * @param wasmBytes  BufferSource with dist/quickjs-tt.wasm
    * @param hooks {
-   *   onStep(line, col, depth) → STEP_* | "suspend"  — called on every source
-   *     line the interpreter crosses (and on loop iterations);
    *   onOut(kind, text) — out-of-band channel (console/inspection/results);
    *   onInterrupt() → bool — watchdog for stretches between steps.
    * }
@@ -44,7 +27,6 @@ export class QuickJSVM {
     const vm = new QuickJSVM(hooks)
     const imports = {
       env: {
-        tt_host_step: (line, col, depth) => vm._hostStep(line, col, depth),
         tt_host_out: (kind, ptr, len) => hooks.onOut(kind, vm.readString(ptr, len)),
         tt_host_arg: (dst, cap) => vm._hostArg(dst, cap),
         tt_host_interrupt: () => (hooks.onInterrupt?.() ? 1 : 0),
@@ -54,7 +36,6 @@ export class QuickJSVM {
     const { instance } = await WebAssembly.instantiate(wasmBytes, imports)
     vm.exports = instance.exports
     vm.memory = instance.exports.memory
-    vm._initAsyncifyArea()
     vm.dirtyMapPtr = vm.exports.tt_dirty_map()
     vm.dirtyMapSize = vm.exports.tt_dirty_map_size()
     const rc = vm.exports.tt_init()
@@ -113,11 +94,7 @@ export class QuickJSVM {
   constructor(hooks) {
     this.hooks = hooks
     this.suspended = false
-    this.parkKind = null // 'r' = parked by return (stackless), 'a' = asyncify
-    this.entry = null // { name, args } of the export invocation that is suspended
-    this.pendingCommand = STEP_CONTINUE
-    this.stagedArg = null // Uint8Array staged for TT_CMD_EVAL
-    this._suspendRequested = false
+    this.stagedArg = null // Uint8Array staged for tt_eval_parked / tt_eval_idle
   }
 
   mem() {
@@ -128,33 +105,7 @@ export class QuickJSVM {
     return td.decode(new Uint8Array(this.memory.buffer, ptr, len))
   }
 
-  _initAsyncifyArea() {
-    const ptr = this.exports.tt_asyncify_area()
-    const size = this.exports.tt_asyncify_area_size()
-    const dv = new DataView(this.memory.buffer)
-    dv.setUint32(ptr, ptr + 8, true) // current write position
-    dv.setUint32(ptr + 4, ptr + size, true) // end of buffer
-    this.asyncifyPtr = ptr
-  }
-
   // ---- imports ------------------------------------------------------------
-  _hostStep(line, col, depth) {
-    if (this.exports.asyncify_get_state() === ASYNCIFY_REWINDING) {
-      // arriving back inside the suspension we just resumed
-      this.exports.asyncify_stop_rewind()
-      const cmd = this.pendingCommand
-      this.pendingCommand = STEP_CONTINUE
-      return cmd
-    }
-    const decision = this.hooks.onStep(line, col, depth)
-    if (decision === "suspend") {
-      this._suspendRequested = true
-      this.exports.asyncify_start_unwind(this.asyncifyPtr)
-      return STEP_CONTINUE // ignored during unwind
-    }
-    return decision
-  }
-
   _hostArg(dst, cap) {
     if (!this.stagedArg) return 0
     const n = Math.min(this.stagedArg.length, cap)
@@ -165,92 +116,47 @@ export class QuickJSVM {
   }
 
   // ---- entry driving ------------------------------------------------------
-  /** Invoke an entry export; returns { suspended, park: 'r'|'a' } or { done }. */
+  /** Invoke an entry export; returns { suspended, park: 'r' } or { done }. */
   drive(name, ...args) {
     if (this.suspended) throw new Error("VM already suspended")
-    this.entry = { name, args }
     this.exports[name](...args)
     return this._postEntry()
   }
 
-  /**
-   * Let the paused VM run again. A return-parked machine ('r') resumes with
-   * a plain call into tt_resume — its complete state is linear memory. An
-   * asyncify suspension ('a') rewinds the spilled C stack and delivers
-   * `command` to the wrapper's command loop.
-   */
+  /** Let the parked VM run again — a plain call into tt_resume. */
   resume(command) {
     if (!this.suspended) throw new Error("VM not suspended")
-    if (this.parkKind === "r") {
-      const cmd = command === STEP_ABORT ? 1 : 0
-      this.suspended = false
-      this.parkKind = null
-      this.entry = { name: "tt_resume", args: [cmd] }
-      this.exports.tt_resume(cmd)
-      return this._postEntry()
-    }
-    this.pendingCommand = command
     this.suspended = false
-    this.parkKind = null
-    this.exports.asyncify_start_rewind(this.asyncifyPtr)
-    this.exports[this.entry.name](...this.entry.args)
+    this.exports.tt_resume(command === STEP_ABORT ? 1 : 0)
     return this._postEntry()
   }
 
   _postEntry() {
-    if (this._suspendRequested) {
-      this._suspendRequested = false
-      this.exports.asyncify_stop_unwind()
-      this.suspended = true
-      this.parkKind = "a"
-      return { suspended: true, park: "a" }
-    }
     if (this.exports.tt_parked()) {
-      // parked by return: no live wasm activation — resume is a fresh call
       this.suspended = true
-      this.parkKind = "r"
-      this.entry = null
       return { suspended: true, park: "r" }
     }
-    this.entry = null
     return { done: true }
   }
 
   /**
    * Adopt a suspension restored from a snapshot: after the engine rewrites
-   * linear memory with a state captured while suspended, this re-arms the
-   * driver to resume it. 'a' suspensions need the recorded entry (the export
-   * to re-invoke for the rewind); 'r' parks need nothing but the memory.
+   * linear memory with a state captured while parked, the machine is
+   * resumable by construction — this just re-arms the driver's bookkeeping.
    */
-  adoptSuspension(entry, parkKind = "a") {
+  adoptSuspension() {
     this.suspended = true
-    this.parkKind = parkKind
-    this.entry = parkKind === "r" ? null : entry
-    this._suspendRequested = false
   }
 
   /** Forget the current suspension (its memory is being navigated away). */
   abandonSuspension() {
     this.suspended = false
-    this.parkKind = null
-    this.entry = null
-    this._suspendRequested = false
   }
 
-  /**
-   * After a wasm trap mid-rewind the asyncify state global is stuck and the
-   * spill cursor in memory is half-consumed. Reset the state machine; the
-   * engine's page heal restores the cursor.
-   */
+  /** Reset driver bookkeeping after a failed transaction. */
   normalize() {
-    if (this.exports.asyncify_get_state() !== ASYNCIFY_NORMAL) {
-      this.exports.asyncify_stop_rewind()
-    }
     this.suspended = false
-    this.parkKind = null
-    this.entry = null
-    this._suspendRequested = false
-    this.pendingCommand = STEP_CONTINUE
+    this.stagedArg = null
   }
 
   // ---- helpers ------------------------------------------------------------

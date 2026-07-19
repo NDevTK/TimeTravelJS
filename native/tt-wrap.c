@@ -10,11 +10,10 @@
  *    returning from the export (tt_eval/tt_resume return 1). Inspection and
  *    evaluation against a parked machine are plain calls.
  *
- *  - Asyncify fallback: steps reached under live C frames (comparators,
- *    getters, generator bodies, promise jobs) suspend via the asyncified
- *    `tt_host_step` import, which unwinds the C stack into a fixed buffer
- *    in the data segment. The host command loop below serves inspection /
- *    evaluation inside the paused interpreter.
+ *  - suppressed steps: user code invoked synchronously from inside an
+ *    unconverted C builtin (accessors reached from C paths, proxy traps,
+ *    toPrimitive coercions, async generators) executes normally but cannot
+ *    become a snapshot; such steps are counted (tt_suppressed) instead.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -25,8 +24,6 @@
 #define IMPORT(name) __attribute__((import_module("env"), import_name(name)))
 
 /* host imports ----------------------------------------------------------- */
-/* Asyncified: may suspend the whole VM. Returns the next command. */
-IMPORT("tt_host_step") extern int tt_host_step(int line, int col, int depth);
 /* Synchronous out-of-band channel: kind 0=console 1=inspect 2=eval-result
    3=eval-done 4=jobs-done 5=timer-done */
 IMPORT("tt_host_out") extern void tt_host_out(int kind, const char *ptr, int len);
@@ -35,25 +32,6 @@ IMPORT("tt_host_out") extern void tt_host_out(int kind, const char *ptr, int len
 IMPORT("tt_host_arg") extern int tt_host_arg(char *dst, int cap);
 /* Synchronous watchdog for code running between step points. */
 IMPORT("tt_host_interrupt") extern int tt_host_interrupt(void);
-
-/* step commands ---------------------------------------------------------- */
-enum {
-    TT_CMD_CONTINUE = 0,
-    TT_CMD_ABORT = 1,
-    TT_CMD_INSPECT = 2,       /* inspect, then ask for the next command   */
-    TT_CMD_EVAL = 3,          /* evaluate, then ask for the next command  */
-    TT_CMD_INSPECT_ABORT = 4, /* inspect, then abort this activation      */
-    TT_CMD_EVAL_ABORT = 5,    /* evaluate, then abort this activation     */
-    TT_CMD_EVAL_CONTINUE = 6, /* evaluate, then resume execution (fork)   */
-};
-
-/* fixed asyncify state area — lives in the data segment, so its address is
-   identical in every snapshot and across the whole session */
-#define TT_ASYNCIFY_STACK (512 * 1024)
-static unsigned char g_asyncify_area[8 + TT_ASYNCIFY_STACK];
-
-EXPORT("tt_asyncify_area") unsigned char *tt_asyncify_area(void) { return g_asyncify_area; }
-EXPORT("tt_asyncify_area_size") int tt_asyncify_area_size(void) { return (int)sizeof(g_asyncify_area); }
 
 /* Dirty-page byte map for the write barrier: the build post-processes the
    wasm so every store also sets g_tt_dirty[(addr >> 10)] = 1 (uninstrumented
@@ -232,22 +210,29 @@ static void eval_at_pause(JSContext *ctx)
 /* Park-by-return bookkeeping: when the interpreter says the machine can
    suspend by simply returning (stackless path — no C frames below the
    dispatch loop), we take that route and let the host read the step info
-   from these statics. Deeper activations (sort comparators, getters,
-   generator bodies, promise jobs) still suspend through the asyncified
-   tt_host_step import. */
+   from these statics. */
 static int g_park_line, g_park_col, g_park_depth;
 
 EXPORT("tt_park_line") int tt_park_line(void) { return g_park_line; }
 EXPORT("tt_park_col") int tt_park_col(void) { return g_park_col; }
 EXPORT("tt_park_depth") int tt_park_depth(void) { return g_park_depth; }
 
-/* The step handler: park by return when the interpreter allows it, else one
-   host round-trip per command; tt_host_step may suspend for as long as the
-   debugger is parked here. */
+/* Steps that fire while the machine is not parkable (user code invoked
+   synchronously from inside an unconverted C builtin: accessors reached
+   from C paths, proxy traps, toPrimitive coercions, async generators).
+   With Asyncify gone these cannot become snapshots — they execute
+   normally, tick virtual time, and are counted here for the host. */
+static int g_suppressed;
+
+EXPORT("tt_suppressed") int tt_suppressed(void) { return g_suppressed; }
+
+/* The step handler: park by return when the interpreter allows it;
+   otherwise count the step as suppressed and continue. */
 static int tt_step_handler(JSContext *ctx, int line, int col, int depth,
                            int parkable, void *opaque)
 {
     (void)opaque;
+    (void)ctx;
     if (g_in_hook)
         return 0;
     if (parkable) {
@@ -256,55 +241,11 @@ static int tt_step_handler(JSContext *ctx, int line, int col, int depth,
         g_park_depth = depth;
         return 2;
     }
-    for (;;) {
-        int cmd = tt_host_step(line, col, depth);
-        switch (cmd) {
-        case TT_CMD_CONTINUE:
-            return 0;
-        case TT_CMD_ABORT:
-            return 1;
-        case TT_CMD_INSPECT:
-            g_in_hook = 1;
-            JS_TTEnableStep(g_rt, 0);
-            send_inspection(ctx);
-            JS_TTEnableStep(g_rt, 1);
-            g_in_hook = 0;
-            break;
-        case TT_CMD_EVAL:
-            g_in_hook = 1;
-            JS_TTEnableStep(g_rt, 0);
-            eval_at_pause(ctx);
-            JS_TTEnableStep(g_rt, 1);
-            g_in_hook = 0;
-            break;
-        case TT_CMD_INSPECT_ABORT:
-            /* transactional one-shot: never suspends this activation again */
-            g_in_hook = 1;
-            JS_TTEnableStep(g_rt, 0);
-            send_inspection(ctx);
-            JS_TTEnableStep(g_rt, 1);
-            g_in_hook = 0;
-            return 1;
-        case TT_CMD_EVAL_ABORT:
-            g_in_hook = 1;
-            JS_TTEnableStep(g_rt, 0);
-            eval_at_pause(ctx);
-            JS_TTEnableStep(g_rt, 1);
-            g_in_hook = 0;
-            return 1;
-        case TT_CMD_EVAL_CONTINUE:
-            /* timeline fork: apply the edit (with local write-back), then
-               let execution continue — the next hook suspends normally */
-            g_in_hook = 1;
-            JS_TTEnableStep(g_rt, 0);
-            eval_at_pause_mode(ctx, 1);
-            JS_TTEnableStep(g_rt, 1);
-            g_in_hook = 0;
-            return 0;
-        default:
-            return 0;
-        }
-    }
+    (void)line;
+    (void)col;
+    (void)depth;
+    g_suppressed++;
+    return 0;
 }
 
 static int tt_interrupt_handler(JSRuntime *rt, void *opaque)
@@ -699,16 +640,16 @@ static void emit_eval_done(JSValue v)
 }
 
 /* Run the user program. Compiles once, then executes under the park-by-
-   return driver: steps on the stackless path suspend by RETURNING from this
-   export (tt_parked() → 1; continue with tt_resume), steps under live C
-   frames suspend through the asyncified import as before. On completion
-   emits kind=3 with { ok } | { error }. Returns 1 while parked, 0 done. */
+   return driver: every step suspends by RETURNING from this export
+   (tt_parked() → 1; continue with tt_resume). On completion emits kind=3
+   with { ok } | { error }. Returns 1 while parked, 0 done. */
 EXPORT("tt_eval") int tt_eval(const char *code, int len)
 {
     JSValue fn, v;
     int parked = 0;
 
     g_exec_kind = TT_EXEC_SCRIPT;
+    g_suppressed = 0;
     JS_TTEnableStep(g_rt, 1);
     fn = JS_Eval(g_ctx, code, len, "program.js",
                  JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
