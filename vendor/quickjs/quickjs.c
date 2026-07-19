@@ -398,9 +398,9 @@ struct JSRuntime {
        tt_defer_slot by JS_Get/SetPropertyValue after ToPropertyKey, so the
        coercion itself can never consume the defer */
     JSValue *tt_defer_pending;
-    int tt_defer_kind;  /* armed intent: 1 = accessor sites, 2 = coercion */
-    int tt_defer_which; /* coercion defer: which operand slot (sp-2+which) */
-    int tt_defer_hint;  /* coercion defer: hint | (step << 4) */
+    int tt_defer_kind;  /* armed intent: 1 = accessor sites */
+    void *tt_defer_aux; /* proxy-get handoff: arena block [target, key,
+                           receiver, handler]; set with the deferred trap */
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
@@ -508,6 +508,7 @@ enum {
     TT_FRAME_TOPRIM,        /* OrdinaryToPrimitive method run in-loop        */
     TT_FRAME_HASINST,       /* bytecode Symbol.hasInstance for OP_instanceof */
     TT_FRAME_FOROF_START,   /* bytecode Symbol.iterator for OP_for_of_start  */
+    TT_FRAME_PROXY_GET,     /* bytecode proxy get trap; post = invariant check */
 };
 
 /* how a TT_FRAME_GEN resume returns its value to the caller (tt_aux_i is
@@ -15426,11 +15427,6 @@ static no_inline __exception int js_add_slow(JSContext *ctx, JSValue *sp)
             JS_FreeValue(ctx, op2);
             goto exception;
         }
-        if (unlikely(JS_VALUE_GET_TAG(op1) == JS_TAG_UNINITIALIZED)) {
-            ctx->rt->tt_defer_which = 0; /* sp[-2] untouched */
-            return -2;
-        }
-
         op2 = JS_ToPrimitiveFree(ctx, op2, HINT_NONE);
         if (JS_IsException(op2)) {
             JS_FreeValue(ctx, op1);
@@ -20458,6 +20454,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pf_kind = TT_FRAME_GETTER;                      \
                         pf_ctor_this = tt_dfn;                          \
                         pf_aux_i = keep;                                \
+                        if (unlikely(rt->tt_defer_aux != NULL)) {       \
+                            pf_argv = (JSValue *)rt->tt_defer_aux;      \
+                            pf_this = pf_argv[3];                       \
+                            pf_argc = 3;                                \
+                            pf_kind = TT_FRAME_PROXY_GET;               \
+                            pf_aux = rt->tt_defer_aux;                  \
+                            rt->tt_defer_aux = NULL;                    \
+                        }                                               \
                         goto push_frame;                                \
                     }                                                   \
                 }                                                       \
@@ -20763,6 +20767,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pf_kind = TT_FRAME_GETTER;                      \
                         pf_ctor_this = tt_dfn;                          \
                         pf_aux_i = 2 + keep;                            \
+                        if (unlikely(rt->tt_defer_aux != NULL)) {       \
+                            pf_argv = (JSValue *)rt->tt_defer_aux;      \
+                            pf_this = pf_argv[3];                       \
+                            pf_argc = 3;                                \
+                            pf_kind = TT_FRAME_PROXY_GET;               \
+                            pf_aux = rt->tt_defer_aux;                  \
+                            rt->tt_defer_aux = NULL;                    \
+                        }                                               \
                         goto push_frame;                                \
                     }                                                   \
                 }                                                       \
@@ -21819,6 +21831,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 pf_kind = TT_FRAME_GETTER;
                                 pf_ctor_this = tt_dfn;
                                 pf_aux_i = 0; /* replace sp[-1] */
+                                if (unlikely(rt->tt_defer_aux != NULL)) {
+                                    pf_argv = (JSValue *)rt->tt_defer_aux;
+                                    pf_this = pf_argv[3];
+                                    pf_argc = 3;
+                                    pf_kind = TT_FRAME_PROXY_GET;
+                                    pf_aux = rt->tt_defer_aux;
+                                    rt->tt_defer_aux = NULL;
+                                }
                                 goto push_frame;
                             }
                         }
@@ -21898,6 +21918,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 pf_kind = TT_FRAME_GETTER;
                                 pf_ctor_this = tt_dfn;
                                 pf_aux_i = 1; /* push the value */
+                                if (unlikely(rt->tt_defer_aux != NULL)) {
+                                    pf_argv = (JSValue *)rt->tt_defer_aux;
+                                    pf_this = pf_argv[3];
+                                    pf_argc = 3;
+                                    pf_kind = TT_FRAME_PROXY_GET;
+                                    pf_aux = rt->tt_defer_aux;
+                                    rt->tt_defer_aux = NULL;
+                                }
                                 goto push_frame;
                             }
                         }
@@ -22179,8 +22207,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (kind == TT_FRAME_CTOR || kind == TT_FRAME_ITERCALL ||
                 kind == TT_FRAME_GETTER || kind == TT_FRAME_SETTER ||
                 kind == TT_FRAME_TOPRIM || kind == TT_FRAME_HASINST ||
-                kind == TT_FRAME_FOROF_START)
+                kind == TT_FRAME_FOROF_START || kind == TT_FRAME_PROXY_GET)
                 JS_FreeValue(ctx, ctor_this);
+            if (kind == TT_FRAME_PROXY_GET) {
+                JSValue *pg_blk = (JSValue *)kaux_p;
+                JS_FreeValue(ctx, pg_blk[0]);
+                JS_FreeValue(ctx, pg_blk[1]);
+                JS_FreeValue(ctx, pg_blk[2]);
+                JS_FreeValue(ctx, pg_blk[3]);
+                rt->tt_arena_top = (uint8_t *)pg_blk;
+            }
             if (kind == TT_FRAME_APPLY)
                 free_arg_list(ctx, kaux_p, (uint32_t)kaux);
             if (kind == TT_FRAME_FOROF) {
@@ -22253,6 +22289,73 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             *sp++ = fs_next;
             *sp++ = JS_NewCatchOffset(ctx, 0);
             goto restart;
+        }
+        if (kind == TT_FRAME_PROXY_GET) {
+            /* the trap ran; mirror js_proxy_get's invariant check, then
+               substitute per the accessor site shape in kaux */
+            JSValue *pg_blk = (JSValue *)kaux_p;
+            JSPropertyDescriptor pg_desc;
+            JSAtom pg_atom;
+            int pg_res;
+            JS_FreeValue(ctx, ctor_this);
+            pg_atom = JS_ValueToAtom(ctx, pg_blk[1]);
+            if (unlikely(pg_atom == JS_ATOM_NULL)) {
+                JS_FreeValue(ctx, ret_val);
+                goto proxy_get_blk_fail;
+            }
+            pg_res = JS_GetOwnPropertyInternal(ctx, &pg_desc,
+                                               JS_VALUE_GET_OBJ(pg_blk[0]),
+                                               pg_atom);
+            JS_FreeAtom(ctx, pg_atom);
+            if (pg_res < 0) {
+                JS_FreeValue(ctx, ret_val);
+                goto proxy_get_blk_fail;
+            }
+            if (pg_res) {
+                if ((pg_desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0) {
+                    if (!js_same_value(ctx, pg_desc.value, ret_val))
+                        goto proxy_get_inconsistent;
+                } else if ((pg_desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE)) == JS_PROP_GETSET) {
+                    if (JS_IsUndefined(pg_desc.getter) && !JS_IsUndefined(ret_val)) {
+                    proxy_get_inconsistent:
+                        js_free_desc(ctx, &pg_desc);
+                        JS_FreeValue(ctx, ret_val);
+                        JS_ThrowTypeError(ctx, "proxy: inconsistent get");
+                        goto proxy_get_blk_fail;
+                    }
+                }
+                js_free_desc(ctx, &pg_desc);
+            }
+            JS_FreeValue(ctx, pg_blk[0]);
+            JS_FreeValue(ctx, pg_blk[1]);
+            JS_FreeValue(ctx, pg_blk[2]);
+            JS_FreeValue(ctx, pg_blk[3]);
+            rt->tt_arena_top = (uint8_t *)pg_blk;
+            switch (kaux) {
+            case 0: /* get_field / with_get_var */
+                JS_FreeValue(ctx, sp[-1]);
+                sp[-1] = ret_val;
+                break;
+            case 1: /* get_field2 / with_get_ref */
+                *sp++ = ret_val;
+                break;
+            case 2: /* get_array_el (key slot dead) */
+                JS_FreeValue(ctx, sp[-2]);
+                sp[-2] = ret_val;
+                sp--;
+                break;
+            default: /* get_array_el2 */
+                sp[-1] = ret_val;
+                break;
+            }
+            goto restart;
+        proxy_get_blk_fail:
+            JS_FreeValue(ctx, pg_blk[0]);
+            JS_FreeValue(ctx, pg_blk[1]);
+            JS_FreeValue(ctx, pg_blk[2]);
+            JS_FreeValue(ctx, pg_blk[3]);
+            rt->tt_arena_top = (uint8_t *)pg_blk;
+            goto exception;
         }
         if (kind == TT_FRAME_TOPRIM) {
             int thint = kaux & 0xf;
@@ -52611,8 +52714,15 @@ static JSValue js_proxy_get(JSContext *ctx, JSValueConst obj, JSAtom atom,
     int res;
     JSValueConst args[3];
     JSPropertyDescriptor desc;
+    JSValue *tt_save;
 
+    /* TimeTravelJS: the handler.get read must not consume an armed
+       accessor defer (it is a nested property read, not the accessor
+       the site armed for) */
+    tt_save = ctx->rt->tt_defer_slot;
+    ctx->rt->tt_defer_slot = NULL;
     s = get_proxy_method(ctx, &method, obj, JS_ATOM_get);
+    ctx->rt->tt_defer_slot = tt_save;
     if (!s)
         return JS_EXCEPTION;
     /* Note: recursion is possible thru the prototype of s->target */
@@ -52622,6 +52732,30 @@ static JSValue js_proxy_get(JSContext *ctx, JSValueConst obj, JSAtom atom,
     if (JS_IsException(atom_val)) {
         JS_FreeValue(ctx, method);
         return JS_EXCEPTION;
+    }
+    /* TimeTravelJS: a bytecode get trap at an armed accessor site defers
+       to an in-loop TT_FRAME_PROXY_GET frame (parkable). The trap args
+       plus the handler ride in an arena block; the frame's post runs the
+       invariant check. Revocation during the trap is safe: the block
+       holds dups and revoke never frees target/handler. */
+    if (unlikely(ctx->rt->tt_defer_slot != NULL) &&
+        ctx->rt->tt_defer_kind == 1 &&
+        JS_VALUE_GET_TAG(method) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(method)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+        JSValue *blk = tt_arena_alloc_vals(ctx->rt, 4);
+        if (!blk) {
+            JS_FreeValue(ctx, method);
+            JS_FreeValue(ctx, atom_val);
+            return JS_ThrowStackOverflow(ctx);
+        }
+        blk[0] = JS_DupValue(ctx, s->target);
+        blk[1] = atom_val; /* owned by the block */
+        blk[2] = JS_DupValue(ctx, receiver);
+        blk[3] = JS_DupValue(ctx, s->handler);
+        *ctx->rt->tt_defer_slot = method; /* owned: the trap function */
+        ctx->rt->tt_defer_slot = NULL;
+        ctx->rt->tt_defer_aux = blk;
+        return JS_UNINITIALIZED;
     }
     args[0] = s->target;
     args[1] = atom_val;
@@ -52660,8 +52794,14 @@ static int js_proxy_set(JSContext *ctx, JSValueConst obj, JSAtom atom,
     JSValue method, ret1, atom_val;
     int ret, res;
     JSValueConst args[4];
+    JSValue *tt_save;
 
+    /* TimeTravelJS: keep an armed accessor defer away from the nested
+       handler.set read (see js_proxy_get) */
+    tt_save = ctx->rt->tt_defer_slot;
+    ctx->rt->tt_defer_slot = NULL;
     s = get_proxy_method(ctx, &method, obj, JS_ATOM_set);
+    ctx->rt->tt_defer_slot = tt_save;
     if (!s)
         return -1;
     if (JS_IsUndefined(method)) {
