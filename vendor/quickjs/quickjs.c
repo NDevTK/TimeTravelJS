@@ -389,6 +389,15 @@ struct JSRuntime {
     JSValue tt_job_vals[4];
     void *tt_job_aux;         /* kind 2: JSAsyncFunctionState* */
     JSContext *tt_job_realm;  /* held ref while parked */
+    /* one-shot defer slot: when set, a BYTECODE getter/setter reached by
+       the property machinery is handed back (dup'd into the slot, slot
+       cleared) instead of being invoked from C — the dispatch loop then
+       runs it in-loop. */
+    JSValue *tt_defer_slot;
+    /* staged defer for opcodes whose key must be coerced first: promoted to
+       tt_defer_slot by JS_Get/SetPropertyValue after ToPropertyKey, so the
+       coercion itself can never consume the defer */
+    JSValue *tt_defer_pending;
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
@@ -488,6 +497,8 @@ enum {
     TT_FRAME_FOROF,         /* user iterator next() for OP_for_of_next      */
     TT_FRAME_ITERNEXT,      /* user iterator next() for OP_iterator_next    */
     TT_FRAME_ITERCALL,      /* user iterator throw/return for OP_iterator_call */
+    TT_FRAME_GETTER,        /* deferred bytecode getter (shape in tt_aux_i)  */
+    TT_FRAME_SETTER,        /* deferred bytecode setter (shape in tt_aux_i)  */
 };
 
 /* how a TT_FRAME_GEN resume returns its value to the caller (tt_aux_i is
@@ -8519,6 +8530,14 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                         return JS_UNDEFINED;
                     } else {
                         JSValue func = JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter);
+                        /* TimeTravelJS: hand a bytecode getter back to the
+                           dispatch loop instead of invoking it from C */
+                        if (unlikely(ctx->rt->tt_defer_slot != NULL) &&
+                            pr->u.getset.getter->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+                            *ctx->rt->tt_defer_slot = JS_DupValue(ctx, func);
+                            ctx->rt->tt_defer_slot = NULL;
+                            return JS_UNINITIALIZED;
+                        }
                         /* Note: the field could be removed in the getter */
                         func = JS_DupValue(ctx, func);
                         return JS_CallFree(ctx, func, this_obj, 0, NULL);
@@ -9276,6 +9295,7 @@ static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
 {
     JSAtom atom;
     JSValue ret;
+    JSValue *tt_pending;
 
     if (likely(JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT &&
                JS_VALUE_GET_TAG(prop) == JS_TAG_INT)) {
@@ -9331,6 +9351,9 @@ static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
         }
     } else {
     slow_path:
+        /* the staged defer must not be consumable during key coercion */
+        tt_pending = ctx->rt->tt_defer_pending;
+        ctx->rt->tt_defer_pending = NULL;
         /* ToObject() must be done before ToPropertyKey() */
         if (JS_IsNull(this_obj) || JS_IsUndefined(this_obj)) {
             JS_FreeValue(ctx, prop);
@@ -9340,7 +9363,9 @@ static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
         JS_FreeValue(ctx, prop);
         if (unlikely(atom == JS_ATOM_NULL))
             return JS_EXCEPTION;
+        ctx->rt->tt_defer_slot = tt_pending;
         ret = JS_GetProperty(ctx, this_obj, atom);
+        ctx->rt->tt_defer_slot = NULL;
         JS_FreeAtom(ctx, atom);
         return ret;
     }
@@ -9655,6 +9680,14 @@ static int call_setter(JSContext *ctx, JSObject *setter,
     JSValue ret, func;
     if (likely(setter)) {
         func = JS_MKPTR(JS_TAG_OBJECT, setter);
+        /* TimeTravelJS: hand a bytecode setter back to the dispatch loop
+           (val stays owned by the caller's stack slot) */
+        if (unlikely(ctx->rt->tt_defer_slot != NULL) &&
+            setter->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+            *ctx->rt->tt_defer_slot = JS_DupValue(ctx, func);
+            ctx->rt->tt_defer_slot = NULL;
+            return -2;
+        }
         /* Note: the field could be removed in the setter */
         func = JS_DupValue(ctx, func);
         ret = JS_CallFree(ctx, func, this_obj, 1, (JSValueConst *)&val);
@@ -17955,6 +17988,10 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     JSCFunctionType func;
     JSObject *p;
     JSStackFrame sf_s, *sf = &sf_s, *prev_sf;
+    /* TimeTravelJS: nested native execution must not consume an armed
+       accessor-defer slot (see JS_CallInternal) */
+    if (unlikely(rt->tt_defer_slot != NULL))
+        rt->tt_defer_slot = NULL;
     JSValue ret_val;
     JSValueConst *arg_buf;
     int arg_count, i;
@@ -18151,6 +18188,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValue pf_ctor_this; /* owned legacy `this` for TT_FRAME_CTOR pushes */
     int pf_argc, pf_flags, pf_kind;
     int pf_aux_i; /* continuation data stored into the new frame's tt_aux_i */
+    JSValue tt_dfn; /* deferred accessor landing slot (see rt->tt_defer_slot) */
     int gi_base; /* caller-slot base for gen_init_call (-1 call, -2 method) */
 
 /* TimeTravelJS: check the step hook before dispatching the next opcode.
@@ -18221,6 +18259,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define BREAK           SWITCH(pc)
 #endif
 
+    /* TimeTravelJS: an armed accessor-defer slot belongs to exactly one
+       pending property operation. Any nested JS execution (coercions,
+       exotic handlers) must not consume it — disarm on entry; the nested
+       window's accessors then take the classic C path. */
+    if (unlikely(rt->tt_defer_slot != NULL))
+        rt->tt_defer_slot = NULL;
+    if (unlikely(rt->tt_defer_pending != NULL))
+        rt->tt_defer_pending = NULL;
     if (js_poll_interrupts(caller_ctx))
         return JS_EXCEPTION;
     if (unlikely(flags & JS_CALL_FLAG_TT_RESUME)) {
@@ -19987,9 +20033,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {                                                \
                 name ## _slow_path:                                     \
                     sf->cur_pc = pc;                                    \
+                    rt->tt_defer_slot = &tt_dfn;                        \
                     val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], 0); \
+                    rt->tt_defer_slot = NULL;                           \
                     if (unlikely(JS_IsException(val)))                  \
                         goto exception;                                 \
+                    if (unlikely(JS_VALUE_GET_TAG(val) == JS_TAG_UNINITIALIZED)) { \
+                        sf->cur_sp = sp;                                \
+                        pf_func = tt_dfn;                               \
+                        pf_this = sp[-1];                               \
+                        pf_new_target = JS_UNDEFINED;                   \
+                        pf_argc = 0;                                    \
+                        pf_argv = NULL;                                 \
+                        pf_flags = 0;                                   \
+                        pf_kind = TT_FRAME_GETTER;                      \
+                        pf_ctor_this = tt_dfn;                          \
+                        pf_aux_i = keep;                                \
+                        goto push_frame;                                \
+                    }                                                   \
                 }                                                       \
                 if (keep) {                                             \
                     *sp++ = val;                                        \
@@ -20044,8 +20105,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 put_field_slow_path:
                     sf->cur_pc = pc;
+                    rt->tt_defer_slot = &tt_dfn;
                     ret = JS_SetPropertyInternal(ctx, obj, atom, sp[-1], obj,
                                                  JS_PROP_THROW_STRICT);
+                    rt->tt_defer_slot = NULL;
+                    if (unlikely(ret == -2)) {
+                        /* bytecode setter: run it in-loop */
+                        sf->cur_sp = sp;
+                        pf_func = tt_dfn;
+                        pf_this = sp[-2];
+                        pf_new_target = JS_UNDEFINED;
+                        pf_argc = 1;
+                        pf_argv = sp - 1;
+                        pf_flags = 0;
+                        pf_kind = TT_FRAME_SETTER;
+                        pf_ctor_this = tt_dfn;
+                        pf_aux_i = 0;
+                        goto push_frame;
+                    }
                     JS_FreeValue(ctx, obj);
                     sp -= 2;
                     if (unlikely(ret < 0))
@@ -20253,13 +20330,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {                                                \
                     name ## _slow_path:                                 \
                     sf->cur_pc = pc;                                    \
+                    rt->tt_defer_pending = &tt_dfn;                     \
                     val = JS_GetPropertyValue(ctx, obj, prop);          \
+                    rt->tt_defer_pending = NULL;                        \
                     if (unlikely(JS_IsException(val))) {                \
                         if (keep)                                       \
                             sp[-1] = JS_UNDEFINED;                      \
                         else                                            \
                             sp--;                                       \
                         goto exception;                                 \
+                    }                                                   \
+                    if (unlikely(JS_VALUE_GET_TAG(val) == JS_TAG_UNINITIALIZED)) { \
+                        sp[-1] = JS_UNDEFINED; /* key already consumed */ \
+                        sf->cur_sp = sp;                                \
+                        pf_func = tt_dfn;                               \
+                        pf_this = sp[-2];                               \
+                        pf_new_target = JS_UNDEFINED;                   \
+                        pf_argc = 0;                                    \
+                        pf_argv = NULL;                                 \
+                        pf_flags = 0;                                   \
+                        pf_kind = TT_FRAME_GETTER;                      \
+                        pf_ctor_this = tt_dfn;                          \
+                        pf_aux_i = 2 + keep;                            \
+                        goto push_frame;                                \
                     }                                                   \
                 }                                                       \
                 if (keep) {                                             \
@@ -20424,7 +20517,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 put_array_el_slow_path:
                     sf->cur_pc = pc;
+                    rt->tt_defer_pending = &tt_dfn;
                     ret = JS_SetPropertyValue(ctx, sp[-3], sp[-2], sp[-1], JS_PROP_THROW_STRICT);
+                    rt->tt_defer_pending = NULL;
+                    if (unlikely(ret == -2)) {
+                        /* bytecode setter: run it in-loop (key consumed) */
+                        sp[-2] = JS_UNDEFINED;
+                        sf->cur_sp = sp;
+                        pf_func = tt_dfn;
+                        pf_this = sp[-3];
+                        pf_new_target = JS_UNDEFINED;
+                        pf_argc = 1;
+                        pf_argv = sp - 1;
+                        pf_flags = 0;
+                        pf_kind = TT_FRAME_SETTER;
+                        pf_ctor_this = tt_dfn;
+                        pf_aux_i = 1;
+                        goto push_frame;
+                    }
                     JS_FreeValue(ctx, sp[-3]);
                     sp -= 3;
                     if (unlikely(ret < 0))
@@ -21537,7 +21647,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         sf->cur_sp = NULL;
         pc = sf->cur_pc;
         if (unlikely(JS_IsException(ret_val))) {
-            if (kind == TT_FRAME_CTOR || kind == TT_FRAME_ITERCALL)
+            if (kind == TT_FRAME_CTOR || kind == TT_FRAME_ITERCALL ||
+                kind == TT_FRAME_GETTER || kind == TT_FRAME_SETTER)
                 JS_FreeValue(ctx, ctor_this);
             if (kind == TT_FRAME_FOROF) {
                 /* js_for_of_next error contract: clear the iterator slot */
@@ -21545,6 +21656,41 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sp[-3 - kaux] = JS_UNDEFINED;
             }
             goto exception;
+        }
+        if (kind == TT_FRAME_GETTER) {
+            JS_FreeValue(ctx, ctor_this);
+            switch (kaux) {
+            case 0: /* get_field / get_length */
+                JS_FreeValue(ctx, sp[-1]);
+                sp[-1] = ret_val;
+                break;
+            case 1: /* get_field2 */
+                *sp++ = ret_val;
+                break;
+            case 2: /* get_array_el (key slot dead) */
+                JS_FreeValue(ctx, sp[-2]);
+                sp[-2] = ret_val;
+                sp--;
+                break;
+            default: /* get_array_el2 */
+                sp[-1] = ret_val;
+                break;
+            }
+            goto restart;
+        }
+        if (kind == TT_FRAME_SETTER) {
+            JS_FreeValue(ctx, ctor_this);
+            JS_FreeValue(ctx, ret_val); /* setter return value is discarded */
+            if (kaux == 0) { /* put_field: [obj value] */
+                JS_FreeValue(ctx, sp[-1]);
+                JS_FreeValue(ctx, sp[-2]);
+                sp -= 2;
+            } else { /* put_array_el: [obj key(dead) value] */
+                JS_FreeValue(ctx, sp[-1]);
+                JS_FreeValue(ctx, sp[-3]);
+                sp -= 3;
+            }
+            goto restart;
         }
         if (kind == TT_FRAME_FOROF) {
             int goffset = -3 - kaux;
