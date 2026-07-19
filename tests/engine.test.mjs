@@ -283,20 +283,30 @@ test("timeline fork: edit-and-continue changes the future, prefix stays exact", 
   assert.equal(globalVal(engine.inspect(), "acc").v, 0)
 })
 
-test("stackless core: plain JS suspends by return, C-reentry falls back to asyncify", async () => {
+test("fully stackless: every step of a mixed program parks by return", async () => {
   await engine.run(`
 function calc(n) { let t = 0; for (let i = 0; i < n; i++) t += i; return t; }
 const a = calc(20);
 const sorted = [3, 1, 2].sort((x, y) => x - y);
-console.log(a, sorted.join(""));
+const doubled = sorted.map((v) => v * 10);
+function* gen() { yield a; yield doubled[0]; }
+const seq = [];
+const g = gen();
+seq.push(g.next().value, g.next().value);
+class Box { constructor(v) { this.v = v + 1; } }
+const bx = new Box(41);
+let awaited = 0;
+(async () => { awaited = await Promise.resolve(bx.v); })();
+setTimeout(() => { globalThis.late = awaited; }, 1);
+console.log(a, sorted.join(""), doubled.join(""), seq.join(""), bx.v);
 `)
   const t = engine.trace
-  const rSteps = t.filter((e) => e.k === "r").length
-  const aSteps = t.filter((e) => e.sp !== undefined).length
-  // mainline + plain calls park by return (no C stack spans the step)…
-  assert.ok(rSteps > 10, `expected return-parked majority, got ${rSteps}`)
-  // …while the sort comparator runs under live C frames → asyncify fallback
-  assert.ok(aSteps >= 1, "comparator steps must use the asyncify fallback")
+  const real = t.filter((e) => e.l > 0)
+  const aSteps = real.filter((e) => e.sp !== undefined).length
+  // sync code, comparators, map callbacks, generator creation+bodies,
+  // constructors, await resumptions, timer callbacks: ALL by return
+  assert.equal(aSteps, 0, "no step needed the asyncify fallback")
+  assert.ok(real.filter((e) => e.k === "r").length === real.length)
   // a return-parked position has no one-shot restriction: inspect it thrice
   const rPos = t.findIndex((e) => e.k === "r" && e.d > 0)
   assert.ok(rPos > 0)
@@ -308,6 +318,8 @@ console.log(a, sorted.join(""));
   const three = JSON.stringify(engine.inspect())
   assert.equal(one, two)
   assert.equal(two, three)
+  engine.positionTo(t.length - 1)
+  assert.equal(engine.inspect().globals.find(([k]) => k === "late")?.[1]?.v, 42)
 })
 
 test("opcode granularity: suspend/resume between any two VM instructions", async () => {
@@ -340,7 +352,7 @@ console.log(caught, depth);
   assert.ok(g.find(([k]) => k === "depth")?.[1]?.v > 5000, "thousands of frames deep")
 })
 
-test("fork works from an asyncify-parked position too (inside a comparator)", async () => {
+test("fork from a deep frame: inside a sort comparator, mid-sort", async () => {
   await engine.run(`
 const xs = [4, 2, 5, 1, 3];
 let cmps = 0;
@@ -348,12 +360,12 @@ xs.sort((p, q) => { cmps++; return p - q; });
 console.log(xs.join(","), cmps);
 `)
   const stepsBefore = engine.trace.length
-  const aPos = engine.trace.findIndex((e) => e.sp !== undefined && e.d > 0)
-  assert.ok(aPos > 0, "found a comparator step (asyncify kind)")
-  const summary = await engine.forkFrom(aPos)
+  const dPos = engine.trace.findIndex((e) => e.d > 0)
+  assert.ok(dPos > 0, "found a comparator step")
+  const summary = await engine.forkFrom(dPos)
   assert.equal(summary.error, null)
-  assert.equal(summary.forkedAt, aPos)
-  // deterministic re-record from inside the C-mediated callback
+  assert.equal(summary.forkedAt, dPos)
+  // deterministic re-record from inside the callback
   assert.equal(engine.trace.length, stepsBefore)
   engine.positionTo(engine.trace.length - 1)
   assert.equal(engine.consoleEntries.at(-1).parts[0].v, "1,2,3,4,5")
