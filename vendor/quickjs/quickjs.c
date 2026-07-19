@@ -506,6 +506,8 @@ enum {
     TT_FRAME_BOUND_METHOD,  /* unwrapped bound chain, OP_call_method shape   */
     TT_FRAME_APPLY,         /* f.apply(this, array): owned flattened argv    */
     TT_FRAME_TOPRIM,        /* OrdinaryToPrimitive method run in-loop        */
+    TT_FRAME_HASINST,       /* bytecode Symbol.hasInstance for OP_instanceof */
+    TT_FRAME_FOROF_START,   /* bytecode Symbol.iterator for OP_for_of_start  */
 };
 
 /* how a TT_FRAME_GEN resume returns its value to the caller (tt_aux_i is
@@ -20018,11 +20020,53 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sp += 2;
             BREAK;
         CASE(OP_for_of_start):
-            sf->cur_pc = pc;
-            if (js_for_of_start(ctx, sp, FALSE))
-                goto exception;
-            sp += 1;
-            *sp++ = JS_NewCatchOffset(ctx, 0);
+            {
+                /* TimeTravelJS: JS_GetIterator + js_for_of_start mirrored
+                   in-loop so a bytecode Symbol.iterator method runs as an
+                   inline frame (parkable). C methods (arrays, strings,
+                   generators) still run inline. */
+                JSValue fs_m, fs_iter, fs_next;
+                sf->cur_pc = pc;
+                fs_m = JS_GetProperty(ctx, sp[-1], JS_ATOM_Symbol_iterator);
+                if (JS_IsException(fs_m))
+                    goto exception;
+                if (!JS_IsFunction(ctx, fs_m)) {
+                    JS_FreeValue(ctx, fs_m);
+                    JS_ThrowTypeError(ctx, "value is not iterable");
+                    goto exception;
+                }
+                if (JS_VALUE_GET_TAG(fs_m) == JS_TAG_OBJECT &&
+                    JS_VALUE_GET_OBJ(fs_m)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+                    if (unlikely(js_poll_interrupts(ctx))) {
+                        JS_FreeValue(ctx, fs_m);
+                        goto exception;
+                    }
+                    sf->cur_sp = sp;
+                    pf_func = fs_m;
+                    pf_this = sp[-1];
+                    pf_new_target = JS_UNDEFINED;
+                    pf_argc = 0;
+                    pf_argv = NULL;
+                    pf_flags = 0;
+                    pf_kind = TT_FRAME_FOROF_START;
+                    pf_ctor_this = fs_m;
+                    pf_aux_i = 0;
+                    pf_cargc = 0;
+                    pf_aux = NULL;
+                    goto push_frame;
+                }
+                fs_iter = JS_GetIterator2(ctx, sp[-1], fs_m);
+                JS_FreeValue(ctx, fs_m);
+                if (JS_IsException(fs_iter))
+                    goto exception;
+                JS_FreeValue(ctx, sp[-1]);
+                sp[-1] = fs_iter;
+                fs_next = JS_GetProperty(ctx, fs_iter, JS_ATOM_next);
+                if (JS_IsException(fs_next))
+                    goto exception;
+                *sp++ = fs_next;
+                *sp++ = JS_NewCatchOffset(ctx, 0);
+            }
             BREAK;
         CASE(OP_for_of_next):
             {
@@ -21587,10 +21631,59 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sp--;
             BREAK;
         CASE(OP_instanceof):
-            sf->cur_pc = pc;
-            if (js_operator_instanceof(ctx, sp))
-                goto exception;
-            sp--;
+            {
+                /* TimeTravelJS: JS_IsInstanceOf mirrored in-loop so a
+                   bytecode Symbol.hasInstance runs as an inline frame
+                   (parkable). C methods (the normal Function.prototype
+                   one) still run inline. */
+                int hi_b;
+                JSValue hi_m;
+                sf->cur_pc = pc;
+                if (!JS_IsObject(sp[-1])) {
+                    JS_ThrowTypeError(ctx, "invalid 'instanceof' right operand");
+                    goto exception;
+                }
+                hi_m = JS_GetProperty(ctx, sp[-1], JS_ATOM_Symbol_hasInstance);
+                if (JS_IsException(hi_m))
+                    goto exception;
+                if (!JS_IsNull(hi_m) && !JS_IsUndefined(hi_m)) {
+                    if (JS_VALUE_GET_TAG(hi_m) == JS_TAG_OBJECT &&
+                        JS_VALUE_GET_OBJ(hi_m)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+                        if (unlikely(js_poll_interrupts(ctx))) {
+                            JS_FreeValue(ctx, hi_m);
+                            goto exception;
+                        }
+                        sf->cur_sp = sp;
+                        pf_func = hi_m;
+                        pf_this = sp[-1];
+                        pf_new_target = JS_UNDEFINED;
+                        pf_argc = 1;
+                        pf_argv = &sp[-2]; /* borrowed: the tested value */
+                        pf_flags = 0;
+                        pf_kind = TT_FRAME_HASINST;
+                        pf_ctor_this = hi_m;
+                        pf_aux_i = 0;
+                        pf_cargc = 0;
+                        pf_aux = NULL;
+                        goto push_frame;
+                    }
+                    hi_b = JS_ToBoolFree(ctx, JS_CallFree(ctx, hi_m, sp[-1], 1,
+                                                          (JSValueConst *)&sp[-2]));
+                } else {
+                    /* legacy case */
+                    if (!JS_IsFunction(ctx, sp[-1])) {
+                        JS_ThrowTypeError(ctx, "invalid 'instanceof' right operand");
+                        goto exception;
+                    }
+                    hi_b = JS_OrdinaryIsInstanceOf(ctx, sp[-2], sp[-1]);
+                }
+                if (hi_b < 0)
+                    goto exception;
+                JS_FreeValue(ctx, sp[-2]);
+                JS_FreeValue(ctx, sp[-1]);
+                sp[-2] = JS_NewBool(ctx, hi_b);
+                sp--;
+            }
             BREAK;
         CASE(OP_typeof):
             {
@@ -21705,9 +21798,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             } 
                             val = JS_UNDEFINED;
                         } else {
-                            val = JS_GetProperty(ctx, obj, atom);
+                            /* TimeTravelJS: defer a bytecode getter under
+                               with scope to an in-loop frame (parkable);
+                               resume lands at the taken-branch target. */
+                            rt->tt_defer_kind = 1;
+                            rt->tt_defer_slot = &tt_dfn;
+                            val = JS_GetPropertyInternal(ctx, obj, atom, obj, 0);
+                            rt->tt_defer_slot = NULL;
                             if (unlikely(JS_IsException(val)))
                                 goto exception;
+                            if (unlikely(JS_VALUE_GET_TAG(val) == JS_TAG_UNINITIALIZED)) {
+                                sf->cur_pc = pc + diff - 5;
+                                sf->cur_sp = sp;
+                                pf_func = tt_dfn;
+                                pf_this = sp[-1];
+                                pf_new_target = JS_UNDEFINED;
+                                pf_argc = 0;
+                                pf_argv = NULL;
+                                pf_flags = 0;
+                                pf_kind = TT_FRAME_GETTER;
+                                pf_ctor_this = tt_dfn;
+                                pf_aux_i = 0; /* replace sp[-1] */
+                                goto push_frame;
+                            }
                         }
                         set_value(ctx, &sp[-1], val);
                         break;
@@ -21720,10 +21833,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             if (is_strict_mode(ctx)) {
                                 JS_ThrowReferenceErrorNotDefined(ctx, atom);
                                 goto exception;
-                            } 
+                            }
                         }
+                        rt->tt_defer_kind = 1;
+                        rt->tt_defer_slot = &tt_dfn;
                         ret = JS_SetPropertyInternal(ctx, obj, atom, sp[-2], obj,
                                                      JS_PROP_THROW_STRICT);
+                        rt->tt_defer_slot = NULL;
+                        if (unlikely(ret == -2)) {
+                            /* bytecode setter under with scope: in-loop */
+                            sf->cur_pc = pc + diff - 5;
+                            sf->cur_sp = sp;
+                            pf_func = tt_dfn;
+                            pf_this = sp[-1];
+                            pf_new_target = JS_UNDEFINED;
+                            pf_argc = 1;
+                            pf_argv = sp - 2; /* borrowed: the value */
+                            pf_flags = 0;
+                            pf_kind = TT_FRAME_SETTER;
+                            pf_ctor_this = tt_dfn;
+                            pf_aux_i = 0; /* free both slots, pop 2 */
+                            goto push_frame;
+                        }
                         JS_FreeValue(ctx, sp[-1]);
                         sp -= 2;
                         if (unlikely(ret < 0))
@@ -21749,9 +21880,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (!ret) {
                             val = JS_UNDEFINED;
                         } else {
-                            val = JS_GetProperty(ctx, obj, atom);
+                            rt->tt_defer_kind = 1;
+                            rt->tt_defer_slot = &tt_dfn;
+                            val = JS_GetPropertyInternal(ctx, obj, atom, obj, 0);
+                            rt->tt_defer_slot = NULL;
                             if (unlikely(JS_IsException(val)))
                                 goto exception;
+                            if (unlikely(JS_VALUE_GET_TAG(val) == JS_TAG_UNINITIALIZED)) {
+                                sf->cur_pc = pc + diff - 5;
+                                sf->cur_sp = sp;
+                                pf_func = tt_dfn;
+                                pf_this = sp[-1];
+                                pf_new_target = JS_UNDEFINED;
+                                pf_argc = 0;
+                                pf_argv = NULL;
+                                pf_flags = 0;
+                                pf_kind = TT_FRAME_GETTER;
+                                pf_ctor_this = tt_dfn;
+                                pf_aux_i = 1; /* push the value */
+                                goto push_frame;
+                            }
                         }
                         *sp++ = val;
                         break;
@@ -22030,7 +22178,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         if (unlikely(JS_IsException(ret_val))) {
             if (kind == TT_FRAME_CTOR || kind == TT_FRAME_ITERCALL ||
                 kind == TT_FRAME_GETTER || kind == TT_FRAME_SETTER ||
-                kind == TT_FRAME_TOPRIM)
+                kind == TT_FRAME_TOPRIM || kind == TT_FRAME_HASINST ||
+                kind == TT_FRAME_FOROF_START)
                 JS_FreeValue(ctx, ctor_this);
             if (kind == TT_FRAME_APPLY)
                 free_arg_list(ctx, kaux_p, (uint32_t)kaux);
@@ -22074,6 +22223,35 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, sp[-3]);
                 sp -= 3;
             }
+            goto restart;
+        }
+        if (kind == TT_FRAME_HASINST) {
+            int hi_b;
+            JS_FreeValue(ctx, ctor_this);
+            hi_b = JS_ToBoolFree(ctx, ret_val);
+            if (hi_b < 0)
+                goto exception;
+            JS_FreeValue(ctx, sp[-2]);
+            JS_FreeValue(ctx, sp[-1]);
+            sp[-2] = JS_NewBool(ctx, hi_b);
+            sp--;
+            goto restart;
+        }
+        if (kind == TT_FRAME_FOROF_START) {
+            JSValue fs_next;
+            JS_FreeValue(ctx, ctor_this);
+            if (!JS_IsObject(ret_val)) {
+                JS_FreeValue(ctx, ret_val);
+                JS_ThrowTypeErrorNotAnObject(ctx);
+                goto exception;
+            }
+            JS_FreeValue(ctx, sp[-1]);
+            sp[-1] = ret_val;
+            fs_next = JS_GetProperty(ctx, ret_val, JS_ATOM_next);
+            if (JS_IsException(fs_next))
+                goto exception;
+            *sp++ = fs_next;
+            *sp++ = JS_NewCatchOffset(ctx, 0);
             goto restart;
         }
         if (kind == TT_FRAME_TOPRIM) {
