@@ -499,6 +499,9 @@ enum {
     TT_FRAME_ITERCALL,      /* user iterator throw/return for OP_iterator_call */
     TT_FRAME_GETTER,        /* deferred bytecode getter (shape in tt_aux_i)  */
     TT_FRAME_SETTER,        /* deferred bytecode setter (shape in tt_aux_i)  */
+    TT_FRAME_BOUND_CALL,    /* unwrapped bound chain, OP_call shape          */
+    TT_FRAME_BOUND_METHOD,  /* unwrapped bound chain, OP_call_method shape   */
+    TT_FRAME_APPLY,         /* f.apply(this, array): owned flattened argv    */
 };
 
 /* how a TT_FRAME_GEN resume returns its value to the caller (tt_aux_i is
@@ -17948,6 +17951,28 @@ static force_inline void tt_arena_pop(JSRuntime *rt, JSStackFrame *sf)
     rt->tt_arena_top = (uint8_t *)sf;
 }
 
+/* raw value block from the arena (for synthesized argument vectors); freed
+   by repointing the arena top at it */
+static JSValue *tt_arena_alloc_vals(JSRuntime *rt, size_t n)
+{
+    size_t size;
+    uint8_t *base;
+
+    if (unlikely(!rt->tt_arena_base)) {
+        rt->tt_arena_base = js_malloc_rt(rt, TT_FRAME_ARENA_SIZE);
+        if (!rt->tt_arena_base)
+            return NULL;
+        rt->tt_arena_top = rt->tt_arena_base;
+        rt->tt_arena_limit = rt->tt_arena_base + TT_FRAME_ARENA_SIZE;
+    }
+    size = (sizeof(JSValue) * n + 15) & ~(size_t)15;
+    base = rt->tt_arena_top;
+    if (unlikely(size > (size_t)(rt->tt_arena_limit - base)))
+        return NULL;
+    rt->tt_arena_top = base + size;
+    return (JSValue *)base;
+}
+
 /* stackless in-loop protocol pieces defined later in this file */
 /* XXX: use enum */
 #define GEN_MAGIC_NEXT   0
@@ -17967,6 +17992,10 @@ static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
 static JSValue js_create_iterator_result(JSContext *ctx, JSValue val, BOOL done);
 static JSAsyncFunctionState *tt_generator_func_state(struct JSGeneratorData *s);
 static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor, int class_id);
+static JSValue js_function_call(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv);
+static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv, int magic);
 static struct JSGeneratorData *js_generator_create_pre(JSContext *ctx,
                                                        JSValueConst func_obj,
                                                        JSValueConst this_obj,
@@ -18187,9 +18216,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValue *pf_argv;
     JSValue pf_ctor_this; /* owned legacy `this` for TT_FRAME_CTOR pushes */
     int pf_argc, pf_flags, pf_kind;
+    int pf_cargc; /* caller-stack slots for the pop fixup (call-site argc) */
     int pf_aux_i; /* continuation data stored into the new frame's tt_aux_i */
+    void *pf_aux; /* continuation pointer stored into the new frame's tt_aux */
     JSValue tt_dfn; /* deferred accessor landing slot (see rt->tt_defer_slot) */
     int gi_base; /* caller-slot base for gen_init_call (-1 call, -2 method) */
+    int uw_base; /* caller-slot base for unwrap_bound (-1 call, -2 method) */
+    int call_argc;
+    JSValue *call_argv;
 
 /* TimeTravelJS: check the step hook before dispatching the next opcode.
    `pc` points at the upcoming instruction here (before the opcode fetch).
@@ -18333,6 +18367,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     pf_kind = TT_FRAME_ENTRY;
     pf_ctor_this = JS_UNDEFINED;
     pf_aux_i = 0;
+    pf_cargc = 0;
+    pf_aux = NULL;
 
     /* TimeTravelJS stackless: push an interpreter frame in the arena and
        (re)enter the dispatch loop. Reached from the C entry above and from
@@ -18368,14 +18404,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         nsf->cur_pc = fb->byte_code_buf;
         nsf->cur_sp = NULL;
         nsf->tt_frame_kind = pf_kind;
-        nsf->tt_call_argc = (uint16_t)pf_argc;
+        nsf->tt_call_argc = (uint16_t)pf_cargc;
         nsf->tt_this = pf_this;
         nsf->tt_new_target = pf_new_target;
         nsf->tt_orig_argv = pf_argv;
         nsf->tt_orig_argc = pf_argc;
         nsf->tt_frame_base = vals;
         nsf->tt_ctor_this = pf_ctor_this;
-        nsf->tt_aux = NULL;
+        nsf->tt_aux = pf_aux;
         nsf->tt_aux_i = pf_aux_i;
         nsf->arg_buf = pf_argv;
         nsf->arg_count = pf_argc;
@@ -18406,9 +18442,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
  restart:
     for(;;) {
-        int call_argc;
-        JSValue *call_argv;
-
         SWITCH(pc) {
         CASE(OP_push_i32):
             *sp++ = JS_NewInt32(ctx, get_u32(pc));
@@ -18739,6 +18772,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto async_init_call;
                     goto gen_init_call;
                 }
+                /* stackless: unwrap bound-function chains in-loop */
+                if (opcode != OP_tail_call &&
+                    JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
+                    JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_BOUND_FUNCTION) {
+                    uw_base = -1;
+                    goto unwrap_bound;
+                }
                 /* TimeTravelJS stackless: a bytecode callee continues in
                    THIS loop — push a frame instead of recursing. (Inlined
                    tail calls keep the caller frame: exact-space proper tail
@@ -18758,6 +18798,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     pf_kind = (opcode == OP_tail_call) ? TT_FRAME_TAIL : TT_FRAME_CALL;
                     pf_ctor_this = JS_UNDEFINED;
                     pf_aux_i = 0;
+                    pf_cargc = pf_argc;
+                    pf_aux = NULL;
                     goto push_frame;
                 }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
@@ -18807,6 +18849,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     pf_argv = call_argv;
                     pf_flags = JS_CALL_FLAG_CONSTRUCTOR;
                     pf_aux_i = 0;
+                    pf_cargc = pf_argc;
+                    pf_aux = NULL;
                     goto push_frame;
                 }
                 ret_val = JS_CallConstructorInternal(ctx, call_argv[-2],
@@ -18841,6 +18885,69 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_FUNCTION)
                         goto async_init_call;
                     goto gen_init_call;
+                }
+                /* stackless: bound chains and Function.prototype
+                   call/apply unwrap in-loop */
+                if (opcode == OP_call_method &&
+                    JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT) {
+                    JSObject *cfp = JS_VALUE_GET_OBJ(call_argv[-1]);
+                    if (cfp->class_id == JS_CLASS_BOUND_FUNCTION) {
+                        uw_base = -2;
+                        goto unwrap_bound;
+                    }
+                    if (cfp->class_id == JS_CLASS_C_FUNCTION &&
+                        cfp->u.cfunc.cproto == JS_CFUNC_generic &&
+                        cfp->u.cfunc.c_function.generic == js_function_call &&
+                        cfp->u.cfunc.realm == ctx && /* realm of thrown errors */
+                        JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT &&
+                        JS_VALUE_GET_OBJ(call_argv[-2])->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+                        if (unlikely(js_poll_interrupts(ctx)))
+                            goto exception;
+                        sf->cur_sp = sp;
+                        pf_func = call_argv[-2];
+                        pf_this = call_argc > 0 ? call_argv[0] : JS_UNDEFINED;
+                        pf_new_target = JS_UNDEFINED;
+                        pf_argc = call_argc > 0 ? call_argc - 1 : 0;
+                        pf_argv = call_argc > 0 ? call_argv + 1 : NULL;
+                        pf_flags = 0;
+                        pf_kind = TT_FRAME_CALL_METHOD;
+                        pf_ctor_this = JS_UNDEFINED;
+                        pf_aux_i = 0;
+                        pf_cargc = call_argc; /* pop the ORIGINAL call shape */
+                        pf_aux = NULL;
+                        goto push_frame;
+                    }
+                    if (cfp->class_id == JS_CLASS_C_FUNCTION &&
+                        cfp->u.cfunc.cproto == JS_CFUNC_generic_magic &&
+                        cfp->u.cfunc.c_function.generic_magic == js_function_apply &&
+                        cfp->u.cfunc.magic == 0 &&
+                        cfp->u.cfunc.realm == ctx && /* realm of thrown errors */
+                        JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT &&
+                        JS_VALUE_GET_OBJ(call_argv[-2])->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+                        JSValue *utab = NULL;
+                        uint32_t utablen = 0;
+                        if (unlikely(js_poll_interrupts(ctx)))
+                            goto exception;
+                        if (call_argc > 1 && !JS_IsUndefined(call_argv[1]) &&
+                            !JS_IsNull(call_argv[1])) {
+                            utab = build_arg_list(ctx, &utablen, call_argv[1]);
+                            if (!utab)
+                                goto exception;
+                        }
+                        sf->cur_sp = sp;
+                        pf_func = call_argv[-2];
+                        pf_this = call_argc > 0 ? call_argv[0] : JS_UNDEFINED;
+                        pf_new_target = JS_UNDEFINED;
+                        pf_argc = (int)utablen;
+                        pf_argv = utab;
+                        pf_flags = 0;
+                        pf_kind = TT_FRAME_APPLY;
+                        pf_ctor_this = JS_UNDEFINED;
+                        pf_aux_i = (int)utablen;
+                        pf_cargc = call_argc;
+                        pf_aux = utab;
+                        goto push_frame;
+                    }
                 }
                 /* TimeTravelJS stackless: gen.next/return/throw on a
                    suspended generator runs the BODY in this loop (the
@@ -18914,6 +19021,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     pf_kind = (opcode == OP_tail_call_method) ? TT_FRAME_TAIL_METHOD : TT_FRAME_CALL_METHOD;
                     pf_ctor_this = JS_UNDEFINED;
                     pf_aux_i = 0;
+                    pf_cargc = pf_argc;
+                    pf_aux = NULL;
                     goto push_frame;
                 }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
@@ -19730,6 +19839,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pf_kind = TT_FRAME_FOROF;
                         pf_ctor_this = JS_UNDEFINED;
                         pf_aux_i = offbyte;
+                    pf_cargc = pf_argc;
+                    pf_aux = NULL;
                         goto push_frame;
                     }
                 }
@@ -19859,6 +19970,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pf_kind = TT_FRAME_ITERNEXT;
                         pf_ctor_this = JS_UNDEFINED;
                         pf_aux_i = 0;
+                    pf_cargc = pf_argc;
+                    pf_aux = NULL;
                         goto push_frame;
                     }
                 }
@@ -19953,6 +20066,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             pf_kind = TT_FRAME_ITERCALL;
                             pf_ctor_this = method; /* owned; freed at fixup */
                             pf_aux_i = 0;
+                    pf_cargc = pf_argc;
+                    pf_aux = NULL;
                             goto push_frame;
                         }
                     }
@@ -21622,6 +21737,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        goto done in the caller's context). */
     {
         int kind, cargc, kaux;
+        void *kaux_p;
         JSValue ctor_this;
         if (unlikely(b->var_ref_count != 0)) {
             /* variable references reference the stack: must close them */
@@ -21635,8 +21751,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         kind = sf->tt_frame_kind;
         cargc = sf->tt_call_argc;
         kaux = sf->tt_aux_i;
+        kaux_p = sf->tt_aux;
         ctor_this = sf->tt_ctor_this;
         tt_arena_pop(rt, sf);
+        if (kind == TT_FRAME_BOUND_CALL || kind == TT_FRAME_BOUND_METHOD) {
+            /* release the synthesized (borrowed) argument block */
+            rt->tt_arena_top = (uint8_t *)kaux_p;
+        }
         if (kind == TT_FRAME_ENTRY) {
             rt->tt_loop_depth--;
             return ret_val;
@@ -21650,6 +21771,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (kind == TT_FRAME_CTOR || kind == TT_FRAME_ITERCALL ||
                 kind == TT_FRAME_GETTER || kind == TT_FRAME_SETTER)
                 JS_FreeValue(ctx, ctor_this);
+            if (kind == TT_FRAME_APPLY)
+                free_arg_list(ctx, kaux_p, (uint32_t)kaux);
             if (kind == TT_FRAME_FOROF) {
                 /* js_for_of_next error contract: clear the iterator slot */
                 JS_FreeValue(ctx, sp[-3 - kaux]);
@@ -21720,7 +21843,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
         {
             JSValue *cav = sp - cargc;
-            int base = (kind == TT_FRAME_CALL || kind == TT_FRAME_TAIL) ? -1 : -2;
+            int base = (kind == TT_FRAME_CALL || kind == TT_FRAME_TAIL ||
+                        kind == TT_FRAME_BOUND_CALL) ? -1 : -2;
+            if (kind == TT_FRAME_APPLY)
+                free_arg_list(ctx, kaux_p, (uint32_t)kaux);
             for(i = base; i < cargc; i++)
                 JS_FreeValue(ctx, cav[i]);
             sp = cav + base;
@@ -21767,6 +21893,81 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         sp = sf->cur_sp;
         sf->cur_sp = NULL;
         pc = sf->cur_pc;
+        goto restart;
+    }
+
+    /* stackless bound-function unwrap: resolve the chain, synthesize the
+       argument vector in an arena block (all values borrowed, exactly like
+       js_call_bound_function's alloca buffer), run the target in-loop.
+       Reached only by goto with call_argc/call_argv/uw_base staged. */
+ unwrap_bound:
+    {
+        JSObject *bp = JS_VALUE_GET_OBJ(call_argv[-1]);
+        JSBoundFunction *bf;
+        JSValue *ublock;
+        int total = call_argc, nb, i2;
+
+        while (bp->class_id == JS_CLASS_BOUND_FUNCTION) {
+            bf = bp->u.bound_function;
+            total += bf->argc;
+            if (JS_VALUE_GET_TAG(bf->func_obj) != JS_TAG_OBJECT)
+                break;
+            bp = JS_VALUE_GET_OBJ(bf->func_obj);
+        }
+        if (bp->class_id != JS_CLASS_BYTECODE_FUNCTION ||
+            bp->u.func.function_bytecode->func_kind != JS_FUNC_NORMAL)
+            goto unwrap_bound_slow;
+        if (unlikely(js_poll_interrupts(ctx)))
+            goto exception;
+        ublock = tt_arena_alloc_vals(rt, (size_t)total);
+        if (unlikely(!ublock)) {
+            JS_ThrowStackOverflow(caller_ctx);
+            goto exception;
+        }
+        /* tail = the call-site args; walk outer→inner prepending bound args */
+        nb = total - call_argc;
+        for (i2 = 0; i2 < call_argc; i2++)
+            ublock[nb + i2] = call_argv[i2];
+        bp = JS_VALUE_GET_OBJ(call_argv[-1]);
+        while (bp->class_id == JS_CLASS_BOUND_FUNCTION) {
+            bf = bp->u.bound_function;
+            nb -= bf->argc;
+            for (i2 = 0; i2 < bf->argc; i2++)
+                ublock[nb + bf->argc - 1 - i2] = bf->argv[bf->argc - 1 - i2];
+            bp = JS_VALUE_GET_OBJ(bf->func_obj);
+        }
+        /* deepest bound this wins */
+        {
+            JSObject *tp = JS_VALUE_GET_OBJ(call_argv[-1]);
+            JSValueConst deep_this = JS_UNDEFINED;
+            while (tp->class_id == JS_CLASS_BOUND_FUNCTION) {
+                deep_this = tp->u.bound_function->this_val;
+                tp = JS_VALUE_GET_OBJ(tp->u.bound_function->func_obj);
+            }
+            sf->cur_sp = sp;
+            pf_func = JS_MKPTR(JS_TAG_OBJECT, bp);
+            pf_this = deep_this;
+        }
+        pf_new_target = JS_UNDEFINED;
+        pf_argc = total;
+        pf_argv = ublock;
+        pf_flags = 0;
+        pf_kind = (uw_base == -1) ? TT_FRAME_BOUND_CALL : TT_FRAME_BOUND_METHOD;
+        pf_ctor_this = JS_UNDEFINED;
+        pf_aux_i = 0;
+        pf_cargc = call_argc;
+        pf_aux = ublock;
+        goto push_frame;
+    unwrap_bound_slow:
+        ret_val = JS_CallInternal(ctx, call_argv[-1],
+                                  uw_base == -2 ? call_argv[-2] : JS_UNDEFINED,
+                                  JS_UNDEFINED, call_argc, call_argv, 0);
+        if (unlikely(JS_IsException(ret_val)))
+            goto exception;
+        for(i = uw_base; i < call_argc; i++)
+            JS_FreeValue(ctx, call_argv[i]);
+        sp = call_argv + uw_base;
+        *sp++ = ret_val;
         goto restart;
     }
 
