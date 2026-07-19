@@ -950,6 +950,13 @@ void JS_TTSetGranularity(JSContext *ctx, int granularity);
 JSValue JS_TTCallStart(JSContext *ctx, JSValue fun_obj, int *pparked);
 JSValue JS_TTCallResume(JSContext *ctx, int cmd, int *pparked);
 JS_BOOL JS_TTParked(JSContext *ctx);
+/* Stackless job pump: like JS_ExecutePendingJob but the job's user callback
+   runs under park-by-return; *pparked = 1 means resume via JS_TTCallResume
+   (which then runs the job's post half). */
+int JS_TTPumpJob(JSRuntime *rt, JSContext **pctx, int *pparked);
+/* Park-capable call (host pumps); keep fn/args alive across a park. */
+JSValue JS_TTCallArgs(JSContext *ctx, JSValueConst fn, JSValueConst this_obj,
+                      int argc, JSValueConst *argv, int *pparked);
 /* Deterministic virtual clock backing Date.now()/new Date(); advances one
    unit per reported step. Enabling it also fixes the Math.random() seed for
    contexts created afterwards. Stored in linear memory (snapshot-visible). */

@@ -79,6 +79,14 @@ static JSValue g_rejected_fn;   /* (reason) -> void (console error)       */
 static int g_in_hook;           /* re-entrancy guard for inspect/eval     */
 static char g_arg_buf[65536];
 
+/* What kind of activation is currently parked/being driven — decides what
+   tt_resume does after the parked frame completes. */
+enum { TT_EXEC_SCRIPT = 0, TT_EXEC_JOBS = 1, TT_EXEC_TIMER = 2 };
+static int g_exec_kind;
+static int g_jobs_count;
+static int pump_jobs_loop(void);
+static int timer_finish(JSValue r);
+
 /* ------------------------------------------------------------------------ */
 static void send_json_value(JSContext *ctx, int kind, JSValueConst val)
 {
@@ -576,6 +584,7 @@ EXPORT("tt_eval") int tt_eval(const char *code, int len)
     JSValue fn, v;
     int parked = 0;
 
+    g_exec_kind = TT_EXEC_SCRIPT;
     JS_TTEnableStep(g_rt, 1);
     fn = JS_Eval(g_ctx, code, len, "program.js",
                  JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
@@ -592,7 +601,10 @@ EXPORT("tt_eval") int tt_eval(const char *code, int len)
     return 0;
 }
 
-/* Resume a machine parked by return. cmd 0 = continue, 1 = abort. */
+/* Resume a machine parked by return. cmd 0 = continue, 1 = abort. What
+   happens on completion depends on what was being driven: the script emits
+   its result envelope, the job pump keeps draining, the timer runs its
+   post half. Returns 1 while (still) parked. */
 EXPORT("tt_resume") int tt_resume(int cmd)
 {
     JSValue v;
@@ -601,6 +613,14 @@ EXPORT("tt_resume") int tt_resume(int cmd)
     v = JS_TTCallResume(g_ctx, cmd, &parked);
     if (parked)
         return 1;
+    if (g_exec_kind == TT_EXEC_JOBS) {
+        JS_FreeValue(g_ctx, v); /* job post ran inside JS_TTCallResume */
+        return pump_jobs_loop();
+    }
+    if (g_exec_kind == TT_EXEC_TIMER) {
+        JS_TTEnableStep(g_rt, 0);
+        return timer_finish(v);
+    }
     JS_TTEnableStep(g_rt, 0);
     emit_eval_done(v);
     return 0;
@@ -637,28 +657,40 @@ EXPORT("tt_set_granularity") void tt_set_granularity(int g)
     JS_TTSetGranularity(g_ctx, g);
 }
 
-/* Run pending promise jobs (each job is steppable). Emits kind=4 when done. */
-EXPORT("tt_run_jobs") void tt_run_jobs(void)
+/* Drain the job queue via the stackless pump; returns 1 while parked. */
+static int pump_jobs_loop(void)
 {
-    JSContext *ctx1;
-    int count = 0, err;
+    int parked = 0, err;
     char buf[64];
 
-    JS_TTEnableStep(g_rt, 1);
     for (;;) {
-        err = JS_ExecutePendingJob(g_rt, &ctx1);
-        if (err <= 0) {
-            if (err < 0)
-                JS_FreeValue(ctx1, JS_GetException(ctx1));
-            break;
+        err = JS_TTPumpJob(JS_GetRuntime(g_ctx), NULL, &parked);
+        if (parked) {
+            g_exec_kind = TT_EXEC_JOBS;
+            return 1;
         }
-        count++;
-        if (count > 10000)
+        if (err == 0)
+            break;
+        if (err < 0)
+            JS_FreeValue(g_ctx, JS_GetException(g_ctx));
+        g_jobs_count++;
+        if (g_jobs_count > 10000)
             break;
     }
     JS_TTEnableStep(g_rt, 0);
-    snprintf(buf, sizeof(buf), "{\"jobs\":%d}", count);
+    g_exec_kind = TT_EXEC_SCRIPT;
+    snprintf(buf, sizeof(buf), "{\"jobs\":%d}", g_jobs_count);
     tt_host_out(4, buf, (int)strlen(buf));
+    return 0;
+}
+
+/* Run pending promise jobs (each job steppable, callbacks park by return).
+   Emits kind=4 when the queue is drained. Returns 1 while parked. */
+EXPORT("tt_run_jobs") int tt_run_jobs(void)
+{
+    g_jobs_count = 0;
+    JS_TTEnableStep(g_rt, 1);
+    return pump_jobs_loop();
 }
 
 EXPORT("tt_timer_count") int tt_timer_count(void)
@@ -671,44 +703,17 @@ EXPORT("tt_timer_count") int tt_timer_count(void)
     return n;
 }
 
-/* Fire the next due virtual timer (steppable). Emits kind=5 when done with
-   { line: <registration unknown → 0>, at } or { idle: true }. */
-EXPORT("tt_fire_timer") void tt_fire_timer(void)
+/* parked-timer continuation (statics live in the snapshot) */
+static JSValue g_timer_fn;
+static JSValue g_timer_args[8];
+static int g_timer_alen;
+static double g_timer_at;
+
+static int timer_finish(JSValue r)
 {
-    JSValue tuple, fn, fnargs, atv, r;
-    double at = 0;
-    int64_t i, alen = 0;
-    JSValue argbuf[8];
+    int i;
     char buf[96];
 
-    tuple = JS_Call(g_ctx, g_timer_pop_fn, JS_UNDEFINED, 0, NULL);
-    if (!JS_IsObject(tuple)) {
-        JS_FreeValue(g_ctx, tuple);
-        tt_host_out(5, "{\"idle\":true}", 13);
-        return;
-    }
-    fn = JS_GetPropertyUint32(g_ctx, tuple, 0);
-    fnargs = JS_GetPropertyUint32(g_ctx, tuple, 1);
-    atv = JS_GetPropertyUint32(g_ctx, tuple, 2);
-    JS_ToFloat64(g_ctx, &at, atv);
-    JS_FreeValue(g_ctx, atv);
-    JS_FreeValue(g_ctx, tuple);
-
-    if (at > JS_TTGetVirtualTime())
-        JS_TTSetVirtualTime(at, 1);
-
-    {
-        JSValue lenv = JS_GetPropertyStr(g_ctx, fnargs, "length");
-        JS_ToInt64(g_ctx, &alen, lenv);
-        JS_FreeValue(g_ctx, lenv);
-    }
-    if (alen > 8) alen = 8;
-    for (i = 0; i < alen; i++)
-        argbuf[i] = JS_GetPropertyUint32(g_ctx, fnargs, (uint32_t)i);
-
-    JS_TTEnableStep(g_rt, 1);
-    r = JS_Call(g_ctx, fn, JS_UNDEFINED, (int)alen, (JSValueConst *)argbuf);
-    JS_TTEnableStep(g_rt, 0);
     if (JS_IsException(r)) {
         JSValue exc = JS_GetException(g_ctx);
         JSValue args2[1];
@@ -719,12 +724,62 @@ EXPORT("tt_fire_timer") void tt_fire_timer(void)
         JS_FreeValue(g_ctx, exc);
     }
     JS_FreeValue(g_ctx, r);
-    for (i = 0; i < alen; i++)
-        JS_FreeValue(g_ctx, argbuf[i]);
-    JS_FreeValue(g_ctx, fn);
-    JS_FreeValue(g_ctx, fnargs);
-    snprintf(buf, sizeof(buf), "{\"at\":%.0f}", at);
+    for (i = 0; i < g_timer_alen; i++)
+        JS_FreeValue(g_ctx, g_timer_args[i]);
+    JS_FreeValue(g_ctx, g_timer_fn);
+    g_timer_fn = JS_UNDEFINED;
+    g_timer_alen = 0;
+    g_exec_kind = TT_EXEC_SCRIPT;
+    snprintf(buf, sizeof(buf), "{\"at\":%.0f}", g_timer_at);
     tt_host_out(5, buf, (int)strlen(buf));
+    return 0;
+}
+
+/* Fire the next due virtual timer (steppable; the callback parks by
+   return). Emits kind=5 when done. Returns 1 while parked. */
+EXPORT("tt_fire_timer") int tt_fire_timer(void)
+{
+    JSValue tuple, fnargs, atv, r;
+    int64_t i, alen = 0;
+    int parked = 0;
+
+    tuple = JS_Call(g_ctx, g_timer_pop_fn, JS_UNDEFINED, 0, NULL);
+    if (!JS_IsObject(tuple)) {
+        JS_FreeValue(g_ctx, tuple);
+        tt_host_out(5, "{\"idle\":true}", 13);
+        return 0;
+    }
+    g_timer_at = 0;
+    g_timer_fn = JS_GetPropertyUint32(g_ctx, tuple, 0);
+    fnargs = JS_GetPropertyUint32(g_ctx, tuple, 1);
+    atv = JS_GetPropertyUint32(g_ctx, tuple, 2);
+    JS_ToFloat64(g_ctx, &g_timer_at, atv);
+    JS_FreeValue(g_ctx, atv);
+    JS_FreeValue(g_ctx, tuple);
+
+    if (g_timer_at > JS_TTGetVirtualTime())
+        JS_TTSetVirtualTime(g_timer_at, 1);
+
+    {
+        JSValue lenv = JS_GetPropertyStr(g_ctx, fnargs, "length");
+        JS_ToInt64(g_ctx, &alen, lenv);
+        JS_FreeValue(g_ctx, lenv);
+    }
+    if (alen > 8) alen = 8;
+    for (i = 0; i < alen; i++)
+        g_timer_args[i] = JS_GetPropertyUint32(g_ctx, fnargs, (uint32_t)i);
+    g_timer_alen = (int)alen;
+    JS_FreeValue(g_ctx, fnargs);
+
+    JS_TTEnableStep(g_rt, 1);
+    r = JS_TTCallArgs(g_ctx, g_timer_fn, JS_UNDEFINED, g_timer_alen,
+                      (JSValueConst *)g_timer_args, &parked);
+    if (parked) {
+        g_exec_kind = TT_EXEC_TIMER;
+        return 1;
+    }
+    JS_TTEnableStep(g_rt, 0);
+    return timer_finish(r);
 }
 
 EXPORT("tt_pending_jobs") int tt_pending_jobs(void)
@@ -779,6 +834,9 @@ EXPORT("tt_reset") int tt_reset(void)
     if (!g_ctx)
         return 2;
     JS_TTResetExecState(g_ctx);
+    g_exec_kind = TT_EXEC_SCRIPT;
+    g_timer_fn = JS_UNDEFINED; /* abandoned parked-timer state, if any */
+    g_timer_alen = 0;
     glob = JS_GetGlobalObject(g_ctx);
     natfn = JS_NewCFunction(g_ctx, js_tt_console, "__tt_nat_console", 2);
     JS_SetPropertyStr(g_ctx, glob, "__tt_nat_console", natfn);

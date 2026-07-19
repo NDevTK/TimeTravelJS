@@ -383,6 +383,12 @@ struct JSRuntime {
     BOOL tt_skip_once;        /* swallow the re-check at the resume pc */
     struct JSStackFrame *tt_parked_frame; /* set while parked-by-return */
     JSValue tt_exec_fn;       /* callable held alive across a parked script */
+    /* parked-job continuation (stackless job pump): inputs for the post
+       half of a job whose user callback parked mid-run */
+    int tt_job_kind;          /* 0 none; 1 reaction; 2 reaction-async; 3 thenable */
+    JSValue tt_job_vals[4];
+    void *tt_job_aux;         /* kind 2: JSAsyncFunctionState* */
+    JSContext *tt_job_realm;  /* held ref while parked */
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
@@ -2144,6 +2150,8 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     rt->malloc_ctx.malloc_state = ms;
     rt->malloc_gc_threshold = 256 * 1024;
     rt->tt_exec_fn = JS_UNDEFINED; /* a zeroed JSValue is not undefined */
+    rt->tt_job_vals[0] = rt->tt_job_vals[1] = JS_UNDEFINED;
+    rt->tt_job_vals[2] = rt->tt_job_vals[3] = JS_UNDEFINED;
 
     init_list_head(&rt->context_list);
     init_list_head(&rt->gc_obj_list);
@@ -54127,6 +54135,229 @@ static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
     return res;
 }
 
+/* ---- TimeTravelJS stackless job pump ----------------------------------- */
+/* The tail of promise_reaction_job over owned values (consumes all three). */
+static JSValue tt_job_reaction_post(JSContext *ctx, JSValue res,
+                                    JSValue func0, JSValue func1)
+{
+    JSValue res2;
+    BOOL is_reject = JS_IsException(res);
+    JSValueConst func;
+
+    if (is_reject)
+        res = JS_GetException(ctx);
+    func = is_reject ? func1 : func0;
+    if (!JS_IsUndefined(func)) {
+        res2 = JS_Call(ctx, func, JS_UNDEFINED, 1, (JSValueConst *)&res);
+    } else {
+        res2 = JS_UNDEFINED;
+    }
+    JS_FreeValue(ctx, res);
+    JS_FreeValue(ctx, func0);
+    JS_FreeValue(ctx, func1);
+    return res2;
+}
+
+/* The tail of js_promise_resolve_thenable_job over owned resolving fns. */
+static JSValue tt_job_thenable_post(JSContext *ctx, JSValue res,
+                                    JSValue rfunc0, JSValue rfunc1)
+{
+    if (JS_IsException(res)) {
+        JSValue error = JS_GetException(ctx);
+        res = JS_Call(ctx, rfunc1, JS_UNDEFINED, 1, (JSValueConst *)&error);
+        JS_FreeValue(ctx, error);
+    }
+    JS_FreeValue(ctx, rfunc0);
+    JS_FreeValue(ctx, rfunc1);
+    return res;
+}
+
+/* Finish a job whose user callback parked: body_ret is the callback's
+   completion from JS_TTCallResume. Frees the stashed continuation state. */
+static void tt_job_finish(JSContext *ctx, JSValue body_ret)
+{
+    JSRuntime *rt = ctx->rt;
+    int kind = rt->tt_job_kind;
+    JSValue res;
+
+    rt->tt_job_kind = 0;
+    if (kind == 2) {
+        JSAsyncFunctionState *s = rt->tt_job_aux;
+        rt->tt_job_aux = NULL;
+        body_ret = async_func_finish(ctx, s, body_ret);
+        js_async_function_post(ctx, s, body_ret);
+        JS_FreeValue(ctx, rt->tt_job_vals[2]); /* handler ref kept s alive */
+        res = tt_job_reaction_post(ctx, JS_UNDEFINED,
+                                   rt->tt_job_vals[0], rt->tt_job_vals[1]);
+    } else if (kind == 1) {
+        JS_FreeValue(ctx, rt->tt_job_vals[2]);
+        JS_FreeValue(ctx, rt->tt_job_vals[3]);
+        res = tt_job_reaction_post(ctx, body_ret,
+                                   rt->tt_job_vals[0], rt->tt_job_vals[1]);
+    } else {
+        JS_FreeValue(ctx, rt->tt_job_vals[2]);
+        JS_FreeValue(ctx, rt->tt_job_vals[3]);
+        res = tt_job_thenable_post(ctx, body_ret,
+                                   rt->tt_job_vals[0], rt->tt_job_vals[1]);
+    }
+    rt->tt_job_vals[0] = rt->tt_job_vals[1] = JS_UNDEFINED;
+    rt->tt_job_vals[2] = rt->tt_job_vals[3] = JS_UNDEFINED;
+    if (JS_IsException(res)) {
+        /* job errors are swallowed like the classic pump's caller did */
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    } else {
+        JS_FreeValue(ctx, res);
+    }
+    if (rt->tt_job_realm) {
+        JS_FreeContext(rt->tt_job_realm);
+        rt->tt_job_realm = NULL;
+    }
+}
+
+/* Run one pending job with park-by-return for its user callback. Returns
+   like JS_ExecutePendingJob (0 = none, 1 = ran, -1 = job raised) and sets
+   *pparked = 1 when the machine parked mid-job (JS_TTCallResume finishes
+   the job's post half before returning). */
+int JS_TTPumpJob(JSRuntime *rt, JSContext **pctx, int *pparked)
+{
+    JSContext *ctx;
+    JSJobEntry *e;
+    JSValue res;
+    int i, ret;
+
+    *pparked = 0;
+    if (list_empty(&rt->job_list)) {
+        if (pctx)
+            *pctx = NULL;
+        return 0;
+    }
+    e = list_entry(rt->job_list.next, JSJobEntry, link);
+    list_del(&e->link);
+    ctx = e->realm;
+
+    if (e->job_func == promise_reaction_job) {
+        JSValueConst handler = e->argv[2];
+        JSValueConst arg = e->argv[4];
+        BOOL is_reject = JS_ToBool(ctx, e->argv[3]);
+        JSValue func0 = JS_DupValue(ctx, e->argv[0]);
+        JSValue func1 = JS_DupValue(ctx, e->argv[1]);
+
+        if (JS_IsUndefined(handler)) {
+            if (is_reject)
+                res = JS_Throw(ctx, JS_DupValue(ctx, arg));
+            else
+                res = JS_DupValue(ctx, arg);
+        } else if (JS_VALUE_GET_TAG(handler) == JS_TAG_OBJECT &&
+                   (JS_VALUE_GET_OBJ(handler)->class_id == JS_CLASS_ASYNC_FUNCTION_RESOLVE ||
+                    JS_VALUE_GET_OBJ(handler)->class_id == JS_CLASS_ASYNC_FUNCTION_REJECT)) {
+            /* await continuation: inject the settled value and run the
+               async body under park-by-return */
+            JSObject *hp = JS_VALUE_GET_OBJ(handler);
+            JSAsyncFunctionState *s = hp->u.async_function_data;
+            BOOL rej = (hp->class_id == JS_CLASS_ASYNC_FUNCTION_REJECT);
+            JSValue raw;
+            s->throw_flag = rej;
+            if (rej)
+                JS_Throw(ctx, JS_DupValue(ctx, arg));
+            else
+                s->frame.cur_sp[-1] = JS_DupValue(ctx, arg);
+            rt->tt_park_ok = TRUE;
+            raw = JS_CallInternal(ctx, JS_MKPTR(JS_TAG_INT, s), s->this_val,
+                                  JS_UNDEFINED, s->argc, s->frame.arg_buf,
+                                  JS_CALL_FLAG_GENERATOR);
+            if (rt->tt_parked_frame) {
+                rt->tt_job_kind = 2;
+                rt->tt_job_vals[0] = func0;
+                rt->tt_job_vals[1] = func1;
+                rt->tt_job_vals[2] = JS_DupValue(ctx, handler);
+                rt->tt_job_aux = s;
+                goto parked;
+            }
+            rt->tt_park_ok = FALSE;
+            raw = async_func_finish(ctx, s, raw);
+            js_async_function_post(ctx, s, raw);
+            res = JS_UNDEFINED;
+        } else if (JS_VALUE_GET_TAG(handler) == JS_TAG_OBJECT &&
+                   JS_VALUE_GET_OBJ(handler)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+            JSValue hfn = JS_DupValue(ctx, handler);
+            JSValue harg = JS_DupValue(ctx, arg);
+            rt->tt_park_ok = TRUE;
+            res = JS_CallInternal(ctx, hfn, JS_UNDEFINED, JS_UNDEFINED,
+                                  1, &harg, JS_CALL_FLAG_COPY_ARGV);
+            if (rt->tt_parked_frame) {
+                rt->tt_job_kind = 1;
+                rt->tt_job_vals[0] = func0;
+                rt->tt_job_vals[1] = func1;
+                rt->tt_job_vals[2] = hfn;
+                rt->tt_job_vals[3] = harg;
+                goto parked;
+            }
+            rt->tt_park_ok = FALSE;
+            JS_FreeValue(ctx, hfn);
+            JS_FreeValue(ctx, harg);
+        } else {
+            res = JS_Call(ctx, handler, JS_UNDEFINED, 1, &arg);
+        }
+        res = tt_job_reaction_post(ctx, res, func0, func1);
+    } else if (e->job_func == js_promise_resolve_thenable_job) {
+        JSValue rfuncs[2];
+        if (js_create_resolving_functions(ctx, rfuncs, e->argv[0]) < 0) {
+            res = JS_EXCEPTION;
+        } else if (JS_VALUE_GET_TAG(e->argv[2]) == JS_TAG_OBJECT &&
+                   JS_VALUE_GET_OBJ(e->argv[2])->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+            JSValue then = JS_DupValue(ctx, e->argv[2]);
+            JSValue thenable = JS_DupValue(ctx, e->argv[1]);
+            rt->tt_park_ok = TRUE;
+            res = JS_CallInternal(ctx, then, thenable, JS_UNDEFINED,
+                                  2, rfuncs, JS_CALL_FLAG_COPY_ARGV);
+            if (rt->tt_parked_frame) {
+                rt->tt_job_kind = 3;
+                rt->tt_job_vals[0] = rfuncs[0];
+                rt->tt_job_vals[1] = rfuncs[1];
+                rt->tt_job_vals[2] = then;
+                rt->tt_job_vals[3] = thenable;
+                goto parked;
+            }
+            rt->tt_park_ok = FALSE;
+            JS_FreeValue(ctx, then);
+            JS_FreeValue(ctx, thenable);
+            res = tt_job_thenable_post(ctx, res, rfuncs[0], rfuncs[1]);
+        } else {
+            res = JS_Call(ctx, e->argv[2], e->argv[1], 2, (JSValueConst *)rfuncs);
+            res = tt_job_thenable_post(ctx, res, rfuncs[0], rfuncs[1]);
+        }
+    } else {
+        res = e->job_func(ctx, e->argc, (JSValueConst *)e->argv);
+    }
+    for(i = 0; i < e->argc; i++)
+        JS_FreeValue(ctx, e->argv[i]);
+    if (JS_IsException(res))
+        ret = -1;
+    else
+        ret = 1;
+    JS_FreeValue(ctx, res);
+    js_free(ctx, e);
+    if (pctx) {
+        if (js_rc(ctx)->ref_count > 1)
+            *pctx = ctx;
+        else
+            *pctx = NULL;
+    }
+    JS_FreeContext(ctx);
+    return ret;
+ parked:
+    *pparked = 1;
+    /* the post half owns its dups; drop the entry's own references and
+       transfer the entry's context ref to the parked continuation */
+    for(i = 0; i < e->argc; i++)
+        JS_FreeValue(ctx, e->argv[i]);
+    js_free(ctx, e);
+    rt->tt_job_realm = ctx;
+    if (pctx)
+        *pctx = NULL;
+    return 1;
+}
+
 static void js_promise_resolve_function_free_resolved(JSRuntime *rt,
                                                       JSPromiseFunctionDataResolved *sr)
 {
@@ -62269,6 +62500,11 @@ void JS_TTResetExecState(JSContext *ctx)
     rt->tt_skip_once = FALSE;
     rt->tt_arena_top = rt->tt_arena_base;
     rt->tt_exec_fn = JS_UNDEFINED; /* do not free: heap may be mid-heal */
+    rt->tt_job_kind = 0;           /* abandoned job continuation, if any */
+    rt->tt_job_aux = NULL;
+    rt->tt_job_realm = NULL;
+    rt->tt_job_vals[0] = rt->tt_job_vals[1] = JS_UNDEFINED;
+    rt->tt_job_vals[2] = rt->tt_job_vals[3] = JS_UNDEFINED;
 }
 
 /* Step granularity: 0 = source line (+ loop back-jumps), 1 = every opcode. */
@@ -62316,6 +62552,26 @@ JSValue JS_TTCallStart(JSContext *ctx, JSValue fun_obj, int *pparked)
     return ret;
 }
 
+/* Park-capable call of an arbitrary callable (used by the host's timer
+   pump). The caller must keep fn/args alive across a park. */
+JSValue JS_TTCallArgs(JSContext *ctx, JSValueConst fn, JSValueConst this_obj,
+                      int argc, JSValueConst *argv, int *pparked)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValue ret;
+
+    *pparked = 0;
+    rt->tt_park_ok = TRUE;
+    ret = JS_CallInternal(ctx, fn, this_obj, JS_UNDEFINED,
+                          argc, (JSValue *)argv, JS_CALL_FLAG_COPY_ARGV);
+    if (rt->tt_parked_frame) {
+        *pparked = 1;
+        return JS_UNDEFINED;
+    }
+    rt->tt_park_ok = FALSE;
+    return ret;
+}
+
 /* Resume a parked machine. cmd 0 continues; cmd 1 aborts the activation
    (throws an uncatchable-style Interrupted error through the script). */
 JSValue JS_TTCallResume(JSContext *ctx, int cmd, int *pparked)
@@ -62334,6 +62590,12 @@ JSValue JS_TTCallResume(JSContext *ctx, int cmd, int *pparked)
         return JS_UNDEFINED;
     }
     rt->tt_park_ok = FALSE;
+    if (rt->tt_job_kind) {
+        /* the parked activation was a job's user callback: run the job's
+           post half; the pump's caller keeps draining the queue */
+        tt_job_finish(ctx, ret);
+        return JS_UNDEFINED;
+    }
     JS_FreeValue(ctx, rt->tt_exec_fn);
     rt->tt_exec_fn = JS_UNDEFINED;
     return ret;
