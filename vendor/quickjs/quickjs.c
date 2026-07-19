@@ -398,6 +398,9 @@ struct JSRuntime {
        tt_defer_slot by JS_Get/SetPropertyValue after ToPropertyKey, so the
        coercion itself can never consume the defer */
     JSValue *tt_defer_pending;
+    int tt_defer_kind;  /* armed intent: 1 = accessor sites, 2 = coercion */
+    int tt_defer_which; /* coercion defer: which operand slot (sp-2+which) */
+    int tt_defer_hint;  /* coercion defer: hint | (step << 4) */
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
@@ -502,6 +505,7 @@ enum {
     TT_FRAME_BOUND_CALL,    /* unwrapped bound chain, OP_call shape          */
     TT_FRAME_BOUND_METHOD,  /* unwrapped bound chain, OP_call_method shape   */
     TT_FRAME_APPLY,         /* f.apply(this, array): owned flattened argv    */
+    TT_FRAME_TOPRIM,        /* OrdinaryToPrimitive method run in-loop        */
 };
 
 /* how a TT_FRAME_GEN resume returns its value to the caller (tt_aux_i is
@@ -8536,6 +8540,7 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                         /* TimeTravelJS: hand a bytecode getter back to the
                            dispatch loop instead of invoking it from C */
                         if (unlikely(ctx->rt->tt_defer_slot != NULL) &&
+                            ctx->rt->tt_defer_kind == 1 &&
                             pr->u.getset.getter->class_id == JS_CLASS_BYTECODE_FUNCTION) {
                             *ctx->rt->tt_defer_slot = JS_DupValue(ctx, func);
                             ctx->rt->tt_defer_slot = NULL;
@@ -9686,6 +9691,7 @@ static int call_setter(JSContext *ctx, JSObject *setter,
         /* TimeTravelJS: hand a bytecode setter back to the dispatch loop
            (val stays owned by the caller's stack slot) */
         if (unlikely(ctx->rt->tt_defer_slot != NULL) &&
+            ctx->rt->tt_defer_kind == 1 &&
             setter->class_id == JS_CLASS_BYTECODE_FUNCTION) {
             *ctx->rt->tt_defer_slot = JS_DupValue(ctx, func);
             ctx->rt->tt_defer_slot = NULL;
@@ -15418,6 +15424,10 @@ static no_inline __exception int js_add_slow(JSContext *ctx, JSValue *sp)
             JS_FreeValue(ctx, op2);
             goto exception;
         }
+        if (unlikely(JS_VALUE_GET_TAG(op1) == JS_TAG_UNINITIALIZED)) {
+            ctx->rt->tt_defer_which = 0; /* sp[-2] untouched */
+            return -2;
+        }
 
         op2 = JS_ToPrimitiveFree(ctx, op2, HINT_NONE);
         if (JS_IsException(op2)) {
@@ -17973,6 +17983,34 @@ static JSValue *tt_arena_alloc_vals(JSRuntime *rt, size_t n)
     return (JSValue *)base;
 }
 
+/* Which method would OrdinaryToPrimitive invoke on val, starting at step?
+   Pure property reads — never calls user code. Returns 0 = none callable
+   remain, 1 = *pmethod is bytecode (owned), 2 = *pmethod is a C callable
+   (owned), -1 = exception. *pstep = the step the method was found at. */
+static int tt_toprim_pick(JSContext *ctx, JSValueConst val, int hint, int step,
+                          JSValue *pmethod, int *pstep)
+{
+    int i;
+
+    if (hint != HINT_STRING)
+        hint = HINT_NUMBER;
+    for (i = step; i < 2; i++) {
+        JSAtom name = ((i ^ hint) == 0) ? JS_ATOM_toString : JS_ATOM_valueOf;
+        JSValue m = JS_GetProperty(ctx, val, name);
+        if (JS_IsException(m))
+            return -1;
+        if (JS_IsFunction(ctx, m)) {
+            *pmethod = m;
+            *pstep = i;
+            return (JS_VALUE_GET_TAG(m) == JS_TAG_OBJECT &&
+                    JS_VALUE_GET_OBJ(m)->class_id == JS_CLASS_BYTECODE_FUNCTION)
+                ? 1 : 2;
+        }
+        JS_FreeValue(ctx, m);
+    }
+    return 0;
+}
+
 /* stackless in-loop protocol pieces defined later in this file */
 /* XXX: use enum */
 #define GEN_MAGIC_NEXT   0
@@ -18266,6 +18304,133 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         argc = sf->tt_orig_argc;                                 \
         argv = sf->tt_orig_argv;                                 \
     } while (0)
+
+/* Coerce the operator's object operands to primitives IN-LOOP before the
+   pristine C slow helper runs (which then only ever sees primitives): a
+   present Symbol.toPrimitive is read exactly once and called per spec
+   (bytecode method -> TT_FRAME_TOPRIM frame with the hint string in an
+   arena block; C method -> inline call; object result -> TypeError, no
+   OrdinaryToPrimitive fallback); otherwise valueOf/toString run in
+   OrdinaryToPrimitive order the same two ways. The frame's post
+   substitutes the primitive into the operand slot and re-dispatches this
+   opcode, so the left operand always finishes before the right is even
+   probed. Mirrors JS_ToPrimitiveFree line by line. eqmode 1 restricts
+   coercion to loose-eq's object-vs-primitive rule; eqmode 2 (strict
+   equality: never coerces) compiles the block away. */
+#define TT_COERCE_OPERANDS(hintv, eqmode)                               \
+    if ((eqmode) != 2) {                                                \
+        int cc_w, cc_step, cc_r;                                        \
+        JSValue cc_m, cc_v;                                             \
+        for (cc_w = 0; cc_w < 2; cc_w++) {                              \
+            if (JS_VALUE_GET_TAG(sp[-2 + cc_w]) != JS_TAG_OBJECT)       \
+                continue;                                               \
+            if (eqmode) {                                               \
+                uint32_t cc_ot = JS_VALUE_GET_NORM_TAG(sp[-1 - cc_w]);  \
+                if (!(cc_ot == JS_TAG_INT || cc_ot == JS_TAG_FLOAT64 || \
+                      cc_ot == JS_TAG_BOOL || cc_ot == JS_TAG_STRING || \
+                      cc_ot == JS_TAG_STRING_ROPE ||                    \
+                      cc_ot == JS_TAG_SHORT_BIG_INT ||                  \
+                      cc_ot == JS_TAG_BIG_INT || cc_ot == JS_TAG_SYMBOL)) \
+                    continue;                                           \
+            }                                                           \
+            cc_m = JS_GetProperty(ctx, sp[-2 + cc_w], JS_ATOM_Symbol_toPrimitive); \
+            if (JS_IsException(cc_m))                                   \
+                goto exception;                                         \
+            if (!JS_IsUndefined(cc_m) && !JS_IsNull(cc_m)) {            \
+                JSAtom cc_ha = ((hintv) == HINT_STRING) ? JS_ATOM_string : \
+                               ((hintv) == HINT_NUMBER) ? JS_ATOM_number : \
+                               JS_ATOM_default;                         \
+                if (JS_VALUE_GET_TAG(cc_m) == JS_TAG_OBJECT &&          \
+                    JS_VALUE_GET_OBJ(cc_m)->class_id == JS_CLASS_BYTECODE_FUNCTION) { \
+                    JSValue *cc_blk;                                    \
+                    if (unlikely(js_poll_interrupts(ctx))) {            \
+                        JS_FreeValue(ctx, cc_m);                        \
+                        goto exception;                                 \
+                    }                                                   \
+                    cc_blk = tt_arena_alloc_vals(rt, 1);                \
+                    if (unlikely(!cc_blk)) {                            \
+                        JS_FreeValue(ctx, cc_m);                        \
+                        JS_ThrowStackOverflow(caller_ctx);              \
+                        goto exception;                                 \
+                    }                                                   \
+                    cc_blk[0] = JS_AtomToString(ctx, cc_ha);            \
+                    sf->cur_sp = sp;                                    \
+                    pf_func = cc_m;                                     \
+                    pf_this = sp[-2 + cc_w];                            \
+                    pf_new_target = JS_UNDEFINED;                       \
+                    pf_argc = 1;                                        \
+                    pf_argv = cc_blk;                                   \
+                    pf_flags = 0;                                       \
+                    pf_kind = TT_FRAME_TOPRIM;                          \
+                    pf_ctor_this = cc_m;                                \
+                    pf_aux_i = cc_w | (((hintv) | (0xE << 4)) << 1);    \
+                    pf_cargc = 0;                                       \
+                    pf_aux = cc_blk;                                    \
+                    goto push_frame;                                    \
+                }                                                       \
+                {                                                       \
+                    JSValue cc_hs = JS_AtomToString(ctx, cc_ha);        \
+                    cc_v = JS_CallFree(ctx, cc_m, sp[-2 + cc_w], 1,     \
+                                       (JSValueConst *)&cc_hs);         \
+                    JS_FreeValue(ctx, cc_hs);                           \
+                }                                                       \
+                if (JS_IsException(cc_v))                               \
+                    goto exception;                                     \
+                if (JS_VALUE_GET_TAG(cc_v) != JS_TAG_OBJECT) {          \
+                    JS_FreeValue(ctx, sp[-2 + cc_w]);                   \
+                    sp[-2 + cc_w] = cc_v;                               \
+                    continue;                                           \
+                }                                                       \
+                JS_FreeValue(ctx, cc_v);                                \
+                JS_ThrowTypeError(ctx, "toPrimitive");                  \
+                goto exception;                                         \
+            }                                                           \
+            cc_step = 0;                                                \
+            for (;;) {                                                  \
+                cc_r = tt_toprim_pick(ctx, sp[-2 + cc_w], hintv,        \
+                                      cc_step, &cc_m, &cc_step);        \
+                if (cc_r < 0)                                           \
+                    goto exception;                                     \
+                if (cc_r == 0) {                                        \
+                    JS_ThrowTypeError(ctx, "toPrimitive");              \
+                    goto exception;                                     \
+                }                                                       \
+                if (cc_r == 1) {                                        \
+                    if (unlikely(js_poll_interrupts(ctx))) {            \
+                        JS_FreeValue(ctx, cc_m);                        \
+                        goto exception;                                 \
+                    }                                                   \
+                    sf->cur_sp = sp;                                    \
+                    pf_func = cc_m;                                     \
+                    pf_this = sp[-2 + cc_w];                            \
+                    pf_new_target = JS_UNDEFINED;                       \
+                    pf_argc = 0;                                        \
+                    pf_argv = NULL;                                     \
+                    pf_flags = 0;                                       \
+                    pf_kind = TT_FRAME_TOPRIM;                          \
+                    pf_ctor_this = cc_m;                                \
+                    pf_aux_i = cc_w | (((hintv) | (cc_step << 4)) << 1); \
+                    pf_cargc = 0;                                       \
+                    pf_aux = NULL;                                      \
+                    goto push_frame;                                    \
+                }                                                       \
+                cc_v = JS_CallFree(ctx, cc_m, sp[-2 + cc_w], 0, NULL);  \
+                if (JS_IsException(cc_v))                               \
+                    goto exception;                                     \
+                if (JS_VALUE_GET_TAG(cc_v) != JS_TAG_OBJECT) {          \
+                    JS_FreeValue(ctx, sp[-2 + cc_w]);                   \
+                    sp[-2 + cc_w] = cc_v;                               \
+                    break;                                              \
+                }                                                       \
+                JS_FreeValue(ctx, cc_v);                                \
+                cc_step++;                                              \
+                if (cc_step >= 2) {                                     \
+                    JS_ThrowTypeError(ctx, "toPrimitive");              \
+                    goto exception;                                     \
+                }                                                       \
+            }                                                           \
+        }                                                               \
+    }
 
 #if !DIRECT_DISPATCH
 #define SWITCH(pc)      TT_STEP_CHECK(); switch (opcode = *pc++)
@@ -20148,6 +20313,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {                                                \
                 name ## _slow_path:                                     \
                     sf->cur_pc = pc;                                    \
+                    rt->tt_defer_kind = 1;                              \
                     rt->tt_defer_slot = &tt_dfn;                        \
                     val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], 0); \
                     rt->tt_defer_slot = NULL;                           \
@@ -20220,6 +20386,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 put_field_slow_path:
                     sf->cur_pc = pc;
+                    rt->tt_defer_kind = 1;
                     rt->tt_defer_slot = &tt_dfn;
                     ret = JS_SetPropertyInternal(ctx, obj, atom, sp[-1], obj,
                                                  JS_PROP_THROW_STRICT);
@@ -20445,6 +20612,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {                                                \
                     name ## _slow_path:                                 \
                     sf->cur_pc = pc;                                    \
+                    rt->tt_defer_kind = 1;                              \
                     rt->tt_defer_pending = &tt_dfn;                     \
                     val = JS_GetPropertyValue(ctx, obj, prop);          \
                     rt->tt_defer_pending = NULL;                        \
@@ -20632,6 +20800,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 put_array_el_slow_path:
                     sf->cur_pc = pc;
+                    rt->tt_defer_kind = 1;
                     rt->tt_defer_pending = &tt_dfn;
                     ret = JS_SetPropertyValue(ctx, sp[-3], sp[-2], sp[-1], JS_PROP_THROW_STRICT);
                     rt->tt_defer_pending = NULL;
@@ -20799,6 +20968,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                 add_slow_case:
                     sf->cur_pc = pc;
+                    TT_COERCE_OPERANDS(HINT_NONE, 0)
                     if (js_add_slow(ctx, sp))
                         goto exception;
                     sp--;
@@ -21292,7 +21462,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
 
-#define OP_CMP(opcode, binary_op, slow_call)              \
+#define OP_CMP(opcode, binary_op, slow_call, eq_mode)     \
             CASE(opcode):                                 \
                 {                                         \
                 JSValue op1, op2;                         \
@@ -21303,6 +21473,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp--;                                               \
                 } else {                                                \
                     sf->cur_pc = pc;                                    \
+                    TT_COERCE_OPERANDS(((eq_mode) == 1 ? HINT_NONE : HINT_NUMBER), eq_mode) \
                     if (slow_call)                                      \
                         goto exception;                                 \
                     sp--;                                               \
@@ -21310,14 +21481,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }                                                       \
             BREAK
 
-            OP_CMP(OP_lt, <, js_relational_slow(ctx, sp, opcode));
-            OP_CMP(OP_lte, <=, js_relational_slow(ctx, sp, opcode));
-            OP_CMP(OP_gt, >, js_relational_slow(ctx, sp, opcode));
-            OP_CMP(OP_gte, >=, js_relational_slow(ctx, sp, opcode));
-            OP_CMP(OP_eq, ==, js_eq_slow(ctx, sp, 0));
-            OP_CMP(OP_neq, !=, js_eq_slow(ctx, sp, 1));
-            OP_CMP(OP_strict_eq, ==, js_strict_eq_slow(ctx, sp, 0));
-            OP_CMP(OP_strict_neq, !=, js_strict_eq_slow(ctx, sp, 1));
+            OP_CMP(OP_lt, <, js_relational_slow(ctx, sp, opcode), 0);
+            OP_CMP(OP_lte, <=, js_relational_slow(ctx, sp, opcode), 0);
+            OP_CMP(OP_gt, >, js_relational_slow(ctx, sp, opcode), 0);
+            OP_CMP(OP_gte, >=, js_relational_slow(ctx, sp, opcode), 0);
+            OP_CMP(OP_eq, ==, js_eq_slow(ctx, sp, 0), 1);
+            OP_CMP(OP_neq, !=, js_eq_slow(ctx, sp, 1), 1);
+            OP_CMP(OP_strict_eq, ==, js_strict_eq_slow(ctx, sp, 0), 2);
+            OP_CMP(OP_strict_neq, !=, js_strict_eq_slow(ctx, sp, 1), 2);
 
         CASE(OP_in):
             sf->cur_pc = pc;
@@ -21758,6 +21929,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* release the synthesized (borrowed) argument block */
             rt->tt_arena_top = (uint8_t *)kaux_p;
         }
+        if (kind == TT_FRAME_TOPRIM && kaux_p) {
+            /* exotic @@toPrimitive: hint-string argument block */
+            JS_FreeValue(ctx, ((JSValue *)kaux_p)[0]);
+            rt->tt_arena_top = (uint8_t *)kaux_p;
+        }
         if (kind == TT_FRAME_ENTRY) {
             rt->tt_loop_depth--;
             return ret_val;
@@ -21769,7 +21945,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         pc = sf->cur_pc;
         if (unlikely(JS_IsException(ret_val))) {
             if (kind == TT_FRAME_CTOR || kind == TT_FRAME_ITERCALL ||
-                kind == TT_FRAME_GETTER || kind == TT_FRAME_SETTER)
+                kind == TT_FRAME_GETTER || kind == TT_FRAME_SETTER ||
+                kind == TT_FRAME_TOPRIM)
                 JS_FreeValue(ctx, ctor_this);
             if (kind == TT_FRAME_APPLY)
                 free_arg_list(ctx, kaux_p, (uint32_t)kaux);
@@ -21814,6 +21991,68 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sp -= 3;
             }
             goto restart;
+        }
+        if (kind == TT_FRAME_TOPRIM) {
+            int twhich = kaux & 1;
+            int thint = (kaux >> 1) & 0xf;
+            int tstep = (kaux >> 5) & 0xf;
+            JSValue *slotp = sp - 2 + twhich;
+            if (thint != HINT_STRING)
+                thint = HINT_NUMBER;
+            JS_FreeValue(ctx, ctor_this);
+            if (JS_VALUE_GET_TAG(ret_val) != JS_TAG_OBJECT) {
+                /* primitive: substitute and re-dispatch the operator */
+                JS_FreeValue(ctx, *slotp);
+                *slotp = ret_val;
+                pc = sf->cur_pc - 1; /* all armed operators are 1 byte */
+                goto restart;
+            }
+            JS_FreeValue(ctx, ret_val);
+            if (tstep >= 1) {
+                JS_ThrowTypeError(ctx, "toPrimitive");
+                goto exception;
+            }
+            {
+                /* try the second OrdinaryToPrimitive method */
+                JSAtom mname = ((1 ^ thint) == 0) ? JS_ATOM_toString : JS_ATOM_valueOf;
+                JSValue m2 = JS_GetProperty(ctx, *slotp, mname);
+                if (JS_IsException(m2))
+                    goto exception;
+                if (JS_IsFunction(ctx, m2)) {
+                    if (JS_VALUE_GET_TAG(m2) == JS_TAG_OBJECT &&
+                        JS_VALUE_GET_OBJ(m2)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+                        sf->cur_sp = sp;
+                        pf_func = m2;
+                        pf_this = *slotp;
+                        pf_new_target = JS_UNDEFINED;
+                        pf_argc = 0;
+                        pf_argv = NULL;
+                        pf_flags = 0;
+                        pf_kind = TT_FRAME_TOPRIM;
+                        pf_ctor_this = m2;
+                        pf_aux_i = twhich | ((thint | (1 << 4)) << 1);
+                        pf_cargc = 0;
+                        pf_aux = NULL;
+                        goto push_frame;
+                    }
+                    {
+                        JSValue r2 = JS_CallFree(ctx, m2, *slotp, 0, NULL);
+                        if (JS_IsException(r2))
+                            goto exception;
+                        if (JS_VALUE_GET_TAG(r2) != JS_TAG_OBJECT) {
+                            JS_FreeValue(ctx, *slotp);
+                            *slotp = r2;
+                            pc = sf->cur_pc - 1;
+                            goto restart;
+                        }
+                        JS_FreeValue(ctx, r2);
+                    }
+                }
+                else
+                    JS_FreeValue(ctx, m2);
+                JS_ThrowTypeError(ctx, "toPrimitive");
+                goto exception;
+            }
         }
         if (kind == TT_FRAME_FOROF) {
             int goffset = -3 - kaux;
