@@ -478,6 +478,7 @@ enum {
     TT_FRAME_CTOR_DERIVED,  /* inlined derived-class constructor            */
     TT_FRAME_GEN,           /* generator body resumed in-loop (heap frame)  */
     TT_FRAME_GEN_INIT,      /* generator creation prologue run in-loop      */
+    TT_FRAME_ASYNC,         /* async function first segment run in-loop     */
 };
 
 typedef enum {
@@ -17870,6 +17871,12 @@ static struct JSGeneratorData *js_generator_create_pre(JSContext *ctx,
                                                        int argc, JSValueConst *argv);
 static JSValue js_generator_create_post(JSContext *ctx, struct JSGeneratorData *s,
                                         JSValueConst func_obj, JSValue func_ret);
+static JSAsyncFunctionState *async_func_init(JSContext *ctx,
+                                             JSValueConst func_obj, JSValueConst this_obj,
+                                             int argc, JSValueConst *argv);
+static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s);
+static void js_async_function_post(JSContext *ctx, JSAsyncFunctionState *s,
+                                   JSValue func_ret);
 
 static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                                   JSValueConst this_obj,
@@ -18598,11 +18605,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             has_call_argc:
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
-                /* stackless generator creation: run the prologue (argument
-                   defaults etc., up to OP_initial_yield) in THIS loop */
+                /* stackless generator creation / async first segment: run
+                   in THIS loop (up to initial yield / first await) */
                 if (opcode != OP_tail_call &&
                     JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
-                    JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_GENERATOR_FUNCTION) {
+                    (JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_GENERATOR_FUNCTION ||
+                     JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_FUNCTION)) {
                     if (unlikely(js_poll_interrupts(ctx)))
                         goto exception;
                     pf_func = call_argv[-1];
@@ -18610,6 +18618,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     pf_argc = call_argc;
                     pf_argv = call_argv;
                     gi_base = -1;
+                    if (JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_FUNCTION)
+                        goto async_init_call;
                     goto gen_init_call;
                 }
                 /* TimeTravelJS stackless: a bytecode callee continues in
@@ -18700,7 +18710,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sf->cur_pc = pc;
                 if (opcode == OP_call_method &&
                     JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
-                    JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_GENERATOR_FUNCTION) {
+                    (JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_GENERATOR_FUNCTION ||
+                     JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_FUNCTION)) {
                     if (unlikely(js_poll_interrupts(ctx)))
                         goto exception;
                     pf_func = call_argv[-1];
@@ -18708,6 +18719,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     pf_argc = call_argc;
                     pf_argv = call_argv;
                     gi_base = -2;
+                    if (JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_FUNCTION)
+                        goto async_init_call;
                     goto gen_init_call;
                 }
                 /* TimeTravelJS stackless: gen.next/return/throw on a
@@ -21111,6 +21124,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     done_generator:
         sf->cur_pc = pc;
         sf->cur_sp = sp;
+        if (sf->tt_frame_kind == TT_FRAME_ASYNC) {
+            /* async first segment finished (completed or hit an await):
+               settle/wire via the shared post-half, return the promise */
+            JSAsyncFunctionState *as = sf->tt_aux;
+            int acargc = sf->tt_call_argc;
+            int abase = sf->tt_aux_i;
+            JSValue apromise = sf->tt_ctor_this;
+            rt->current_stack_frame = sf->prev_frame;
+            sf->tt_frame_kind = TT_FRAME_ENTRY; /* job-path resumes */
+            sf->tt_ctor_this = JS_UNDEFINED;
+            ret_val = async_func_finish(ctx, as, ret_val);
+            js_async_function_post(ctx, as, ret_val);
+            async_func_free(rt, as);
+            sf = rt->current_stack_frame;
+            TT_LOAD_FRAME();
+            sp = sf->cur_sp;
+            sf->cur_sp = NULL;
+            pc = sf->cur_pc;
+            {
+                JSValue *cav = sp - acargc;
+                for(i = abase; i < acargc; i++)
+                    JS_FreeValue(ctx, cav[i]);
+                sp = cav + abase;
+                *sp++ = apromise;
+            }
+            goto restart;
+        }
         if (sf->tt_frame_kind == TT_FRAME_GEN_INIT) {
             /* creation prologue finished (initial yield / threw): build the
                generator object with the shared post-half and hand it to the
@@ -21254,6 +21294,42 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         gsf2->prev_frame = rt->current_stack_frame;
         rt->current_stack_frame = gsf2;
         sf = gsf2;
+        TT_LOAD_FRAME();
+        sp = sf->cur_sp;
+        sf->cur_sp = NULL;
+        pc = sf->cur_pc;
+        goto restart;
+    }
+
+    /* TimeTravelJS stackless async call: run the first segment (through
+       parameter defaults to the first await, or to completion) in this
+       loop; the TT_FRAME_ASYNC done path settles/wires the promise with
+       the shared post-half and returns it to the caller frame. */
+ async_init_call:
+    {
+        JSAsyncFunctionState *as2;
+        JSValue apromise;
+        JSStackFrame *asf2;
+        as2 = async_func_init(ctx, pf_func, pf_this, pf_argc,
+                              (JSValueConst *)pf_argv);
+        if (unlikely(!as2))
+            goto exception;
+        apromise = JS_NewPromiseCapability(ctx, as2->resolving_funcs);
+        if (JS_IsException(apromise)) {
+            async_func_free(rt, as2);
+            goto exception;
+        }
+        as2->throw_flag = FALSE;
+        asf2 = &as2->frame;
+        sf->cur_sp = sp;
+        asf2->tt_frame_kind = TT_FRAME_ASYNC;
+        asf2->tt_aux = as2;
+        asf2->tt_aux_i = gi_base;
+        asf2->tt_call_argc = (uint16_t)pf_argc;
+        asf2->tt_ctor_this = apromise; /* owned: the call's result */
+        asf2->prev_frame = rt->current_stack_frame;
+        rt->current_stack_frame = asf2;
+        sf = asf2;
         TT_LOAD_FRAME();
         sp = sf->cur_sp;
         sf->cur_sp = NULL;
