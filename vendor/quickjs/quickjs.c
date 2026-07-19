@@ -509,6 +509,8 @@ enum {
     TT_FRAME_HASINST,       /* bytecode Symbol.hasInstance for OP_instanceof */
     TT_FRAME_FOROF_START,   /* bytecode Symbol.iterator for OP_for_of_start  */
     TT_FRAME_PROXY_GET,     /* bytecode proxy get trap; post = invariant check */
+    TT_FRAME_AGEN,          /* async generator body driven in-loop            */
+    TT_FRAME_AGEN_INIT,     /* async generator creation prologue in-loop      */
 };
 
 /* how a TT_FRAME_GEN resume returns its value to the caller (tt_aux_i is
@@ -18036,6 +18038,28 @@ static JSValue js_string_constructor(JSContext *ctx, JSValueConst new_target,
                                      int argc, JSValueConst *argv);
 static JSValue js_string_concat(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv);
+struct JSAsyncGeneratorData;
+static int js_async_generator_resume_pre(JSContext *ctx,
+                                         struct JSAsyncGeneratorData *s);
+static int js_async_generator_resume_post(JSContext *ctx,
+                                          struct JSAsyncGeneratorData *s,
+                                          JSValue func_ret);
+static JSValue js_async_generator_next_prelude(JSContext *ctx,
+                                               JSValueConst this_val,
+                                               JSValueConst arg, int magic,
+                                               struct JSAsyncGeneratorData **pdrive);
+static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv,
+                                       int magic);
+static JSAsyncFunctionState *tt_agen_func_state(struct JSAsyncGeneratorData *s);
+static struct JSAsyncGeneratorData *js_async_generator_create_pre(JSContext *ctx,
+                                                                  JSValueConst func_obj,
+                                                                  JSValueConst this_obj,
+                                                                  int argc, JSValueConst *argv);
+static JSValue js_async_generator_create_post(JSContext *ctx,
+                                              struct JSAsyncGeneratorData *s,
+                                              JSValueConst func_obj,
+                                              JSValue func_ret);
 static struct JSGeneratorData *js_generator_create_pre(JSContext *ctx,
                                                        JSValueConst func_obj,
                                                        JSValueConst this_obj,
@@ -18953,7 +18977,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (opcode != OP_tail_call &&
                     JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
                     (JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_GENERATOR_FUNCTION ||
-                     JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_FUNCTION)) {
+                     JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_FUNCTION ||
+                     JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION)) {
                     if (unlikely(js_poll_interrupts(ctx)))
                         goto exception;
                     pf_func = call_argv[-1];
@@ -18963,6 +18988,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gi_base = -1;
                     if (JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_FUNCTION)
                         goto async_init_call;
+                    if (JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION)
+                        goto agen_init_call;
                     goto gen_init_call;
                 }
                 /* stackless: unwrap bound-function chains in-loop (not in
@@ -19102,7 +19129,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (opcode == OP_call_method &&
                     JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
                     (JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_GENERATOR_FUNCTION ||
-                     JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_FUNCTION)) {
+                     JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_FUNCTION ||
+                     JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION)) {
                     if (unlikely(js_poll_interrupts(ctx)))
                         goto exception;
                     pf_func = call_argv[-1];
@@ -19112,6 +19140,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     gi_base = -2;
                     if (JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_FUNCTION)
                         goto async_init_call;
+                    if (JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION)
+                        goto agen_init_call;
                     goto gen_init_call;
                 }
                 /* stackless: bound chains and Function.prototype
@@ -19242,6 +19272,53 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto exception;
                         goto restart;
                     }
+                }
+                /* TimeTravelJS: agObj.next/return/throw — enqueue via the
+                   C prelude, hand the promise to the caller, then drive
+                   the async generator body in-loop (parkable). */
+                if (opcode == OP_call_method &&
+                    JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
+                    JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_C_FUNCTION &&
+                    JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.cproto == JS_CFUNC_generic_magic &&
+                    JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.c_function.generic_magic == js_async_generator_next &&
+                    JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.realm == ctx &&
+                    JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT &&
+                    JS_VALUE_GET_OBJ(call_argv[-2])->class_id == JS_CLASS_ASYNC_GENERATOR) {
+                    struct JSAsyncGeneratorData *ags;
+                    JSValue agp, agobj;
+                    int agmagic = JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.magic;
+                    if (unlikely(js_poll_interrupts(ctx)))
+                        goto exception;
+                    agp = js_async_generator_next_prelude(ctx, call_argv[-2],
+                                                          call_argc > 0 ? call_argv[0] : JS_UNDEFINED,
+                                                          agmagic, &ags);
+                    if (JS_IsException(agp))
+                        goto exception;
+                    agobj = JS_DupValue(ctx, call_argv[-2]);
+                    for(i = -2; i < call_argc; i++)
+                        JS_FreeValue(ctx, call_argv[i]);
+                    sp -= call_argc + 2;
+                    *sp++ = agp;
+                    if (ags && js_async_generator_resume_pre(ctx, ags)) {
+                        JSAsyncFunctionState *afs = tt_agen_func_state(ags);
+                        JSStackFrame *gsf = &afs->frame;
+                        sf->cur_sp = sp;
+                        gsf->tt_frame_kind = TT_FRAME_AGEN;
+                        gsf->tt_aux = ags;
+                        gsf->tt_ctor_this = agobj; /* the drive's ref */
+                        gsf->prev_frame = rt->current_stack_frame;
+                        rt->current_stack_frame = gsf;
+                        sf = gsf;
+                        TT_LOAD_FRAME();
+                        sp = sf->cur_sp;
+                        sf->cur_sp = NULL;
+                        pc = sf->cur_pc;
+                        if (afs->throw_flag)
+                            goto exception;
+                        goto restart;
+                    }
+                    JS_FreeValue(ctx, agobj);
+                    BREAK;
                 }
                 /* TimeTravelJS: builtin String.prototype.concat (the
                    compiler's template-literal engine) observably only
@@ -20256,6 +20333,45 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 goto exception;
                             goto restart;
                         }
+                    }
+                    /* async generator .next via iteration (for-await):
+                       run the enqueue prelude, deliver the promise, then
+                       drive the body in-loop (parkable) */
+                    if (nmp->class_id == JS_CLASS_C_FUNCTION &&
+                        nmp->u.cfunc.cproto == JS_CFUNC_generic_magic &&
+                        nmp->u.cfunc.c_function.generic_magic == js_async_generator_next &&
+                        nmp->u.cfunc.realm == ctx &&
+                        JS_VALUE_GET_TAG(sp[-4]) == JS_TAG_OBJECT &&
+                        JS_VALUE_GET_OBJ(sp[-4])->class_id == JS_CLASS_ASYNC_GENERATOR) {
+                        struct JSAsyncGeneratorData *ags;
+                        JSValue agp;
+                        if (unlikely(js_poll_interrupts(ctx)))
+                            goto exception;
+                        agp = js_async_generator_next_prelude(ctx, sp[-4], sp[-1],
+                                                              nmp->u.cfunc.magic, &ags);
+                        if (JS_IsException(agp))
+                            goto exception;
+                        JS_FreeValue(ctx, sp[-1]);
+                        sp[-1] = agp;
+                        if (ags && js_async_generator_resume_pre(ctx, ags)) {
+                            JSAsyncFunctionState *afs = tt_agen_func_state(ags);
+                            JSStackFrame *gsf = &afs->frame;
+                            sf->cur_sp = sp;
+                            gsf->tt_frame_kind = TT_FRAME_AGEN;
+                            gsf->tt_aux = ags;
+                            gsf->tt_ctor_this = JS_DupValue(ctx, sp[-4]);
+                            gsf->prev_frame = rt->current_stack_frame;
+                            rt->current_stack_frame = gsf;
+                            sf = gsf;
+                            TT_LOAD_FRAME();
+                            sp = sf->cur_sp;
+                            sf->cur_sp = NULL;
+                            pc = sf->cur_pc;
+                            if (afs->throw_flag)
+                                goto exception;
+                            goto restart;
+                        }
+                        BREAK;
                     }
                     if (nmp->class_id == JS_CLASS_BYTECODE_FUNCTION) {
                         if (unlikely(js_poll_interrupts(ctx)))
@@ -22059,6 +22175,44 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     done_generator:
         sf->cur_pc = pc;
         sf->cur_sp = sp;
+        if (sf->tt_frame_kind == TT_FRAME_AGEN) {
+            /* async generator body ran inline: shared post half, then
+               keep driving the request queue with further in-loop body
+               runs until an await is armed or the queue goes idle */
+            struct JSAsyncGeneratorData *ags = sf->tt_aux;
+            JSValue agref = sf->tt_ctor_this;
+            int agstop;
+            rt->current_stack_frame = sf->prev_frame;
+            sf->tt_frame_kind = TT_FRAME_ENTRY; /* pump-path resumes */
+            sf->tt_ctor_this = JS_UNDEFINED;
+            ret_val = async_func_finish(ctx, tt_agen_func_state(ags), ret_val);
+            agstop = js_async_generator_resume_post(ctx, ags, ret_val);
+            if (!agstop && js_async_generator_resume_pre(ctx, ags)) {
+                JSAsyncFunctionState *afs = tt_agen_func_state(ags);
+                JSStackFrame *gsf = &afs->frame;
+                gsf->tt_frame_kind = TT_FRAME_AGEN;
+                gsf->tt_aux = ags;
+                gsf->tt_ctor_this = agref; /* carry the drive's ref */
+                gsf->prev_frame = rt->current_stack_frame;
+                rt->current_stack_frame = gsf;
+                sf = gsf;
+                TT_LOAD_FRAME();
+                sp = sf->cur_sp;
+                sf->cur_sp = NULL;
+                pc = sf->cur_pc;
+                if (afs->throw_flag)
+                    goto exception;
+                goto restart;
+            }
+            /* drive idle: release the generator ref, continue the caller */
+            JS_FreeValue(ctx, agref);
+            sf = rt->current_stack_frame;
+            TT_LOAD_FRAME();
+            sp = sf->cur_sp;
+            sf->cur_sp = NULL;
+            pc = sf->cur_pc;
+            goto restart;
+        }
         if (sf->tt_frame_kind == TT_FRAME_ASYNC) {
             /* async first segment finished (completed or hit an await):
                settle/wire via the shared post-half, return the promise */
@@ -22083,6 +22237,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_FreeValue(ctx, cav[i]);
                 sp = cav + abase;
                 *sp++ = apromise;
+            }
+            goto restart;
+        }
+        if (sf->tt_frame_kind == TT_FRAME_AGEN_INIT) {
+            /* async generator creation prologue finished: build the
+               generator object with the shared post half */
+            struct JSAsyncGeneratorData *ags = sf->tt_aux;
+            int gcargc = sf->tt_call_argc;
+            int gbase = sf->tt_aux_i;
+            JSValueConst gfv = sf->cur_func;
+            rt->current_stack_frame = sf->prev_frame;
+            sf->tt_frame_kind = TT_FRAME_ENTRY;
+            ret_val = async_func_finish(ctx, tt_agen_func_state(ags), ret_val);
+            ret_val = js_async_generator_create_post(ctx, ags, gfv, ret_val);
+            sf = rt->current_stack_frame;
+            TT_LOAD_FRAME();
+            sp = sf->cur_sp;
+            sf->cur_sp = NULL;
+            pc = sf->cur_pc;
+            if (unlikely(JS_IsException(ret_val)))
+                goto exception;
+            {
+                JSValue *cav = sp - gcargc;
+                for(i = gbase; i < gcargc; i++)
+                    JS_FreeValue(ctx, cav[i]);
+                sp = cav + gbase;
+                *sp++ = ret_val;
             }
             goto restart;
         }
@@ -22496,6 +22677,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        (parameter defaults etc.) in this loop up to OP_initial_yield; the
        TT_FRAME_GEN_INIT done path builds the generator object. Reached only
        by goto with pf_func/pf_this/pf_argc/pf_argv/gi_base staged. */
+ agen_init_call:
+    {
+        struct JSAsyncGeneratorData *ags2 =
+            js_async_generator_create_pre(ctx, pf_func, pf_this, pf_argc,
+                                          (JSValueConst *)pf_argv);
+        JSAsyncFunctionState *afs2;
+        JSStackFrame *agsf2;
+        if (unlikely(!ags2))
+            goto exception;
+        afs2 = tt_agen_func_state(ags2);
+        agsf2 = &afs2->frame;
+        sf->cur_sp = sp;
+        agsf2->tt_frame_kind = TT_FRAME_AGEN_INIT;
+        agsf2->tt_aux = ags2;
+        agsf2->tt_aux_i = gi_base;
+        agsf2->tt_call_argc = (uint16_t)pf_argc;
+        agsf2->prev_frame = rt->current_stack_frame;
+        rt->current_stack_frame = agsf2;
+        sf = agsf2;
+        TT_LOAD_FRAME();
+        sp = sf->cur_sp;
+        sf->cur_sp = NULL;
+        pc = sf->cur_pc;
+        goto restart;
+    }
+
  gen_init_call:
     {
         struct JSGeneratorData *gs2 =
@@ -23580,25 +23787,38 @@ static int js_async_generator_completed_return(JSContext *ctx,
     return res;
 }
 
-static void js_async_generator_resume_next(JSContext *ctx,
-                                           JSAsyncGeneratorData *s)
+/* TimeTravelJS: js_async_generator_resume_next split into the pre half
+   (advance the state machine until a body run is staged: 1 = run the
+   body, 0 = nothing runnable) and the post half (absorb one body run's
+   completion: 1 = an await was armed, stop driving). The classic
+   resume_next below is exactly pre/run/post in a loop, so the in-loop
+   and job-pump drivers share every observable step with the C path. */
+static JSAsyncFunctionState *tt_agen_func_state(struct JSAsyncGeneratorData *s)
+{
+    return s->func_state;
+}
+
+static int js_async_generator_resume_pre(JSContext *ctx,
+                                         JSAsyncGeneratorData *s)
 {
     JSAsyncGeneratorRequest *next;
-    JSValue func_ret, value;
+    JSValue value;
 
     for(;;) {
         if (list_empty(&s->queue))
-            break;
+            return 0;
         next = list_entry(s->queue.next, JSAsyncGeneratorRequest, link);
         switch(s->state) {
         case JS_ASYNC_GENERATOR_STATE_EXECUTING:
             /* only happens when restarting execution after await() */
-            goto resume_exec;
+            return 1;
         case JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN:
-            goto done;
+            return 0;
         case JS_ASYNC_GENERATOR_STATE_SUSPENDED_START:
             if (next->completion_type == GEN_MAGIC_NEXT) {
-                goto exec_no_arg;
+                s->func_state->throw_flag = FALSE;
+                s->state = JS_ASYNC_GENERATOR_STATE_EXECUTING;
+                return 1;
             } else {
                 js_async_generator_complete(ctx, s);
             }
@@ -23612,7 +23832,7 @@ static void js_async_generator_resume_next(JSContext *ctx,
             } else {
                 js_async_generator_reject(ctx, s, next->result);
             }
-            goto done;
+            return 0;
         case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD:
         case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
             value = JS_DupValue(ctx, next->result);
@@ -23627,59 +23847,78 @@ static void js_async_generator_resume_next(JSContext *ctx,
                 s->func_state->frame.cur_sp[0] =
                     JS_NewInt32(ctx, next->completion_type);
                 s->func_state->frame.cur_sp++;
-            exec_no_arg:
                 s->func_state->throw_flag = FALSE;
             }
             s->state = JS_ASYNC_GENERATOR_STATE_EXECUTING;
-        resume_exec:
-            func_ret = async_func_resume(ctx, s->func_state);
-            if (s->func_state->is_completed) {
-                if (JS_IsException(func_ret)) {
-                    value = JS_GetException(ctx);
-                    js_async_generator_complete(ctx, s);
-                    js_async_generator_reject(ctx, s, value);
-                    JS_FreeValue(ctx, value);
-                } else {
-                    /* end of function */
-                    js_async_generator_complete(ctx, s);
-                    js_async_generator_resolve(ctx, s, func_ret, TRUE);
-                    JS_FreeValue(ctx, func_ret);
-                }
-            } else {
-                int func_ret_code, ret;
-                assert(JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT);
-                func_ret_code = JS_VALUE_GET_INT(func_ret);
-                value = s->func_state->frame.cur_sp[-1];
-                s->func_state->frame.cur_sp[-1] = JS_UNDEFINED;
-                switch(func_ret_code) {
-                case FUNC_RET_YIELD:
-                case FUNC_RET_YIELD_STAR:
-                    if (func_ret_code == FUNC_RET_YIELD_STAR)
-                        s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR;
-                    else
-                        s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD;
-                    js_async_generator_resolve(ctx, s, value, FALSE);
-                    JS_FreeValue(ctx, value);
-                    break;
-                case FUNC_RET_AWAIT:
-                    ret = js_async_generator_await(ctx, s, value);
-                    JS_FreeValue(ctx, value);
-                    if (ret < 0) {
-                        /* exception: throw it */
-                        s->func_state->throw_flag = TRUE;
-                        goto resume_exec;
-                    }
-                    goto done;
-                default:
-                    abort();
-                }
-            }
-            break;
+            return 1;
         default:
             abort();
         }
     }
- done: ;
+}
+
+static int js_async_generator_resume_post(JSContext *ctx,
+                                          JSAsyncGeneratorData *s,
+                                          JSValue func_ret)
+{
+    JSValue value;
+
+    if (s->func_state->is_completed) {
+        if (JS_IsException(func_ret)) {
+            value = JS_GetException(ctx);
+            js_async_generator_complete(ctx, s);
+            js_async_generator_reject(ctx, s, value);
+            JS_FreeValue(ctx, value);
+        } else {
+            /* end of function */
+            js_async_generator_complete(ctx, s);
+            js_async_generator_resolve(ctx, s, func_ret, TRUE);
+            JS_FreeValue(ctx, func_ret);
+        }
+        return 0;
+    } else {
+        int func_ret_code, ret;
+        assert(JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT);
+        func_ret_code = JS_VALUE_GET_INT(func_ret);
+        value = s->func_state->frame.cur_sp[-1];
+        s->func_state->frame.cur_sp[-1] = JS_UNDEFINED;
+        switch(func_ret_code) {
+        case FUNC_RET_YIELD:
+        case FUNC_RET_YIELD_STAR:
+            if (func_ret_code == FUNC_RET_YIELD_STAR)
+                s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR;
+            else
+                s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD;
+            js_async_generator_resolve(ctx, s, value, FALSE);
+            JS_FreeValue(ctx, value);
+            return 0;
+        case FUNC_RET_AWAIT:
+            ret = js_async_generator_await(ctx, s, value);
+            JS_FreeValue(ctx, value);
+            if (ret < 0) {
+                /* exception: throw it (the request is still queued and
+                   the state is EXECUTING, so the next pre() reruns the
+                   body — the classic `goto resume_exec`) */
+                s->func_state->throw_flag = TRUE;
+                return 0;
+            }
+            return 1;
+        default:
+            abort();
+        }
+    }
+}
+
+static void js_async_generator_resume_next(JSContext *ctx,
+                                           JSAsyncGeneratorData *s)
+{
+    JSValue func_ret;
+
+    while (js_async_generator_resume_pre(ctx, s)) {
+        func_ret = async_func_resume(ctx, s->func_state);
+        if (js_async_generator_resume_post(ctx, s, func_ret))
+            break;
+    }
 }
 
 static JSValue js_async_generator_resolve_function(JSContext *ctx,
@@ -23718,14 +23957,19 @@ static JSValue js_async_generator_resolve_function(JSContext *ctx,
 }
 
 /* magic = GEN_MAGIC_x */
-static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val,
-                                       int argc, JSValueConst *argv,
-                                       int magic)
+/* TimeTravelJS: everything js_async_generator_next does BEFORE resuming
+   the body (capability + enqueue). *pdrive is set when the caller must
+   then drive the state machine (classically or in-loop). */
+static JSValue js_async_generator_next_prelude(JSContext *ctx,
+                                               JSValueConst this_val,
+                                               JSValueConst arg, int magic,
+                                               struct JSAsyncGeneratorData **pdrive)
 {
     JSAsyncGeneratorData *s = JS_GetOpaque(this_val, JS_CLASS_ASYNC_GENERATOR);
     JSValue promise, resolving_funcs[2];
     JSAsyncGeneratorRequest *req;
 
+    *pdrive = NULL;
     promise = JS_NewPromiseCapability(ctx, resolving_funcs);
     if (JS_IsException(promise))
         return JS_EXCEPTION;
@@ -23745,14 +23989,13 @@ static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val,
     if (!req)
         goto fail;
     req->completion_type = magic;
-    req->result = JS_DupValue(ctx, argv[0]);
+    req->result = JS_DupValue(ctx, arg);
     req->promise = JS_DupValue(ctx, promise);
     req->resolving_funcs[0] = resolving_funcs[0];
     req->resolving_funcs[1] = resolving_funcs[1];
     list_add_tail(&req->link, &s->queue);
-    if (s->state != JS_ASYNC_GENERATOR_STATE_EXECUTING) {
-        js_async_generator_resume_next(ctx, s);
-    }
+    if (s->state != JS_ASYNC_GENERATOR_STATE_EXECUTING)
+        *pdrive = s;
     return promise;
  fail:
     JS_FreeValue(ctx, resolving_funcs[0]);
@@ -23761,29 +24004,54 @@ static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
-static JSValue js_async_generator_function_call(JSContext *ctx, JSValueConst func_obj,
-                                                JSValueConst this_obj,
-                                                int argc, JSValueConst *argv,
-                                                int flags)
+static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv,
+                                       int magic)
 {
-    JSValue obj, func_ret;
+    JSAsyncGeneratorData *drive;
+    JSValue promise;
+
+    promise = js_async_generator_next_prelude(ctx, this_val, argv[0], magic,
+                                              &drive);
+    if (drive)
+        js_async_generator_resume_next(ctx, drive);
+    return promise;
+}
+
+/* TimeTravelJS: creation split into the pre half (allocate + bind the
+   frame; no user code) and the post half (wrap the prologue's completion
+   into the generator object), shared by the classic path below and the
+   in-loop TT_FRAME_AGEN_INIT frame. */
+static JSAsyncGeneratorData *js_async_generator_create_pre(JSContext *ctx,
+                                                           JSValueConst func_obj,
+                                                           JSValueConst this_obj,
+                                                           int argc, JSValueConst *argv)
+{
     JSAsyncGeneratorData *s;
 
     s = js_mallocz(ctx, sizeof(*s));
     if (!s)
-        return JS_EXCEPTION;
+        return NULL;
     s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_START;
     init_list_head(&s->queue);
     s->func_state = async_func_init(ctx, func_obj, this_obj, argc, argv);
-    if (!s->func_state)
-        goto fail;
-    /* execute the function up to 'OP_initial_yield' (no yield nor
-       await are possible) */
-    func_ret = async_func_resume(ctx, s->func_state);
+    if (!s->func_state) {
+        js_async_generator_free(ctx->rt, s);
+        return NULL;
+    }
+    return s;
+}
+
+static JSValue js_async_generator_create_post(JSContext *ctx,
+                                              JSAsyncGeneratorData *s,
+                                              JSValueConst func_obj,
+                                              JSValue func_ret)
+{
+    JSValue obj;
+
     if (JS_IsException(func_ret))
         goto fail;
     JS_FreeValue(ctx, func_ret);
-
     obj = js_create_from_ctor(ctx, func_obj, JS_CLASS_ASYNC_GENERATOR);
     if (JS_IsException(obj))
         goto fail;
@@ -23793,6 +24061,22 @@ static JSValue js_async_generator_function_call(JSContext *ctx, JSValueConst fun
  fail:
     js_async_generator_free(ctx->rt, s);
     return JS_EXCEPTION;
+}
+
+static JSValue js_async_generator_function_call(JSContext *ctx, JSValueConst func_obj,
+                                                JSValueConst this_obj,
+                                                int argc, JSValueConst *argv,
+                                                int flags)
+{
+    JSAsyncGeneratorData *s;
+
+    s = js_async_generator_create_pre(ctx, func_obj, this_obj, argc, argv);
+    if (!s)
+        return JS_EXCEPTION;
+    /* execute the function up to 'OP_initial_yield' (no yield nor
+       await are possible) */
+    return js_async_generator_create_post(ctx, s, func_obj,
+                                          async_func_resume(ctx, s->func_state));
 }
 
 /* JS parser */
@@ -55457,6 +55741,24 @@ static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
 
 /* ---- TimeTravelJS stackless job pump ----------------------------------- */
 /* The tail of promise_reaction_job over owned values (consumes all three). */
+/* the async-generator await continuation this reaction handler resumes,
+   or NULL when it isn't one (or has nothing runnable) */
+static struct JSAsyncGeneratorData *tt_pump_agen_target(JSContext *ctx,
+                                                        JSValueConst handler)
+{
+    JSCFunctionDataRecord *fdr = JS_GetOpaque(handler, JS_CLASS_C_FUNCTION_DATA);
+    JSAsyncGeneratorData *ags;
+
+    if (!fdr || fdr->func != js_async_generator_resolve_function ||
+        fdr->magic >= 2)
+        return NULL;
+    ags = JS_GetOpaque(fdr->data[0], JS_CLASS_ASYNC_GENERATOR);
+    if (!ags || ags->state != JS_ASYNC_GENERATOR_STATE_EXECUTING ||
+        !ags->func_state)
+        return NULL;
+    return ags;
+}
+
 static JSValue tt_job_reaction_post(JSContext *ctx, JSValue res,
                                     JSValue func0, JSValue func1)
 {
@@ -55493,8 +55795,10 @@ static JSValue tt_job_thenable_post(JSContext *ctx, JSValue res,
 }
 
 /* Finish a job whose user callback parked: body_ret is the callback's
-   completion from JS_TTCallResume. Frees the stashed continuation state. */
-static void tt_job_finish(JSContext *ctx, JSValue body_ret)
+   completion from JS_TTCallResume. Frees the stashed continuation state.
+   Returns 1 when the finish itself re-parked (an async generator drive
+   needed another body run that parked) — the stash stays armed. */
+static int tt_job_finish(JSContext *ctx, JSValue body_ret)
 {
     JSRuntime *rt = ctx->rt;
     int kind = rt->tt_job_kind;
@@ -55507,6 +55811,36 @@ static void tt_job_finish(JSContext *ctx, JSValue body_ret)
         body_ret = async_func_finish(ctx, s, body_ret);
         js_async_function_post(ctx, s, body_ret);
         JS_FreeValue(ctx, rt->tt_job_vals[2]); /* handler ref kept s alive */
+        res = tt_job_reaction_post(ctx, JS_UNDEFINED,
+                                   rt->tt_job_vals[0], rt->tt_job_vals[1]);
+    } else if (kind == 4) {
+        struct JSAsyncGeneratorData *ags = rt->tt_job_aux;
+        JSAsyncFunctionState *afs;
+        JSValue raw;
+        rt->tt_job_aux = NULL;
+        body_ret = async_func_finish(ctx, tt_agen_func_state(ags), body_ret);
+        if (!js_async_generator_resume_post(ctx, ags, body_ret)) {
+            for (;;) {
+                if (!js_async_generator_resume_pre(ctx, ags))
+                    break;
+                afs = tt_agen_func_state(ags);
+                rt->tt_park_ok = TRUE;
+                raw = JS_CallInternal(ctx, JS_MKPTR(JS_TAG_INT, afs),
+                                      afs->this_val, JS_UNDEFINED, afs->argc,
+                                      afs->frame.arg_buf, JS_CALL_FLAG_GENERATOR);
+                if (rt->tt_parked_frame) {
+                    /* re-parked: vals[0..2] stay stashed for the next round */
+                    rt->tt_job_kind = 4;
+                    rt->tt_job_aux = ags;
+                    return 1;
+                }
+                rt->tt_park_ok = FALSE;
+                raw = async_func_finish(ctx, tt_agen_func_state(ags), raw);
+                if (js_async_generator_resume_post(ctx, ags, raw))
+                    break;
+            }
+        }
+        JS_FreeValue(ctx, rt->tt_job_vals[2]); /* handler ref kept ags alive */
         res = tt_job_reaction_post(ctx, JS_UNDEFINED,
                                    rt->tt_job_vals[0], rt->tt_job_vals[1]);
     } else if (kind == 1) {
@@ -55532,6 +55866,7 @@ static void tt_job_finish(JSContext *ctx, JSValue body_ret)
         JS_FreeContext(rt->tt_job_realm);
         rt->tt_job_realm = NULL;
     }
+    return 0;
 }
 
 /* Run one pending job with park-by-return for its user callback. Returns
@@ -55597,6 +55932,43 @@ int JS_TTPumpJob(JSRuntime *rt, JSContext **pctx, int *pparked)
             raw = async_func_finish(ctx, s, raw);
             js_async_function_post(ctx, s, raw);
             res = JS_UNDEFINED;
+        } else if (JS_VALUE_GET_TAG(handler) == JS_TAG_OBJECT &&
+                   JS_VALUE_GET_OBJ(handler)->class_id == JS_CLASS_C_FUNCTION_DATA &&
+                   tt_pump_agen_target(ctx, handler) != NULL) {
+            /* await continuation of an async generator: inject the settled
+               value and drive the body runs under park-by-return */
+            struct JSAsyncGeneratorData *ags = tt_pump_agen_target(ctx, handler);
+            JSAsyncFunctionState *afs = tt_agen_func_state(ags);
+            JSCFunctionDataRecord *fdr = JS_GetOpaque(handler, JS_CLASS_C_FUNCTION_DATA);
+            BOOL rej = fdr->magic & 1;
+            JSValue raw;
+            afs->throw_flag = rej;
+            if (rej)
+                JS_Throw(ctx, JS_DupValue(ctx, arg));
+            else
+                afs->frame.cur_sp[-1] = JS_DupValue(ctx, arg);
+            res = JS_UNDEFINED;
+            for (;;) {
+                if (!js_async_generator_resume_pre(ctx, ags))
+                    break;
+                afs = tt_agen_func_state(ags);
+                rt->tt_park_ok = TRUE;
+                raw = JS_CallInternal(ctx, JS_MKPTR(JS_TAG_INT, afs),
+                                      afs->this_val, JS_UNDEFINED, afs->argc,
+                                      afs->frame.arg_buf, JS_CALL_FLAG_GENERATOR);
+                if (rt->tt_parked_frame) {
+                    rt->tt_job_kind = 4;
+                    rt->tt_job_vals[0] = func0;
+                    rt->tt_job_vals[1] = func1;
+                    rt->tt_job_vals[2] = JS_DupValue(ctx, handler);
+                    rt->tt_job_aux = ags;
+                    goto parked;
+                }
+                rt->tt_park_ok = FALSE;
+                raw = async_func_finish(ctx, afs, raw);
+                if (js_async_generator_resume_post(ctx, ags, raw))
+                    break;
+            }
         } else if (JS_VALUE_GET_TAG(handler) == JS_TAG_OBJECT &&
                    JS_VALUE_GET_OBJ(handler)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
             JSValue hfn = JS_DupValue(ctx, handler);
@@ -63912,8 +64284,10 @@ JSValue JS_TTCallResume(JSContext *ctx, int cmd, int *pparked)
     rt->tt_park_ok = FALSE;
     if (rt->tt_job_kind) {
         /* the parked activation was a job's user callback: run the job's
-           post half; the pump's caller keeps draining the queue */
-        tt_job_finish(ctx, ret);
+           post half; the pump's caller keeps draining the queue. The
+           finish may itself re-park (async generator drives). */
+        if (tt_job_finish(ctx, ret))
+            *pparked = 1;
         return JS_UNDEFINED;
     }
     JS_FreeValue(ctx, rt->tt_exec_fn);
