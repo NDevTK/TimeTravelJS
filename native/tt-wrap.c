@@ -33,6 +33,12 @@ IMPORT("tt_host_arg") extern int tt_host_arg(char *dst, int cap);
 /* Synchronous watchdog for code running between step points. */
 IMPORT("tt_host_interrupt") extern int tt_host_interrupt(void);
 
+/* tt-dom.c: the Lexbor layer (same linear memory, so the DOM time-travels
+   through the ordinary COW snapshots) */
+void tt_dom_register(JSContext *ctx);
+int tt_dom_load_html(const char *html, size_t len);
+void tt_dom_destroy(void);
+
 /* Dirty-page byte map for the write barrier: the build post-processes the
    wasm so every store also sets g_tt_dirty[(addr >> 10)] = 1 (uninstrumented
    itself). One byte per 1 KB page, sized for the 512 MB memory maximum.
@@ -53,7 +59,8 @@ static JSValue g_envelope_fn;   /* (isError, value) -> JSON string        */
 static JSValue g_globals_fn;    /* () -> plain object of user globals     */
 static JSValue g_timer_pop_fn;  /* () -> [fn, argsArray, at] | null       */
 static JSValue g_timer_count_fn;/* () -> int                              */
-static JSValue g_rejected_fn;   /* (reason) -> void (console error)       */
+static JSValue g_rejected_fn;
+static JSValue g_dom_build_fn;   /* (reason) -> void (console error)       */
 static int g_in_hook;           /* re-entrancy guard for inspect/eval     */
 static char g_arg_buf[65536];
 
@@ -309,6 +316,10 @@ static const char SETUP_SRC[] =
 "  function ser(v, depth, seen) {\n"
 "    const t = typeof v;\n"
 "    if (v === null) return { t: 'null' };\n"
+"    if (DomNode && v instanceof DomNode) {\n"
+"      let h = ''; try { h = DOM.serialize(v.__p, 0); } catch (e) {}\n"
+"      return { t: 'dom', name: String(DOM.nodeName(v.__p)), html: h.length > 160 ? h.slice(0, 160) + '\u2026' : h };\n"
+"    }\n"
 "    if (t === 'undefined') return { t: 'undef' };\n"
 "    if (t === 'number') {\n"
 "      if (v !== v) return { t: 'nan' };\n"
@@ -368,6 +379,7 @@ static const char SETUP_SRC[] =
 "  function serTop(value) {\n"
 "    if (value && value.__ttInspect) {\n"
 "      const out = { stack: value.stack, frames: [], globals: [] };\n"
+"      if (DOM && DOM.hasDoc()) out.dom = DOM.serialize(DOM.doc(), 0);\n"
 "      for (const frame of value.frames) {\n"
 "        const locals = [];\n"
 "        const tdz = frame['<uninitialized>'] || [];\n"
@@ -796,7 +808,286 @@ static const char SETUP_SRC[] =
 "    return JSON.stringify(isError ? { error: ser(value, MAXD, []) } : { ok: ser(value, MAXD, []) });\n"
 "  }\n"
 "  function rejected(reason) { consoleOut(3, ['Unhandled promise rejection:', reason]); }\n"
-"  return { serTop: serTop, envelope: envelope, userGlobals: userGlobals, timerCount: timerCount, timerPop: timerPop, rejected: rejected };\n"
+"  /* ---- DOM self-host over the __dom leaf primitives (Lexbor) ----------\n"
+"     Everything here is bytecode: user event handlers, callbacks touching\n"
+"     the DOM, style reads — all park like any other code. The C layer only\n"
+"     walks/mutates the tree between steps. */\n"
+"  const DOM = G.__dom;\n"
+"  delete G.__dom;\n"
+"  let DomNode = null;\n"
+"  function buildDOM() {\n"
+"    if (!DOM || !DOM.hasDoc()) return;\n"
+"    const wraps = new Map();\n"
+"    const listeners = new Map();\n"
+"    const kebab = (s) => s.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());\n"
+"    const parseStyle = (txt) => {\n"
+"      const m = new Map();\n"
+"      if (!txt) return m;\n"
+"      for (const part of txt.split(';')) {\n"
+"        const i = part.indexOf(':');\n"
+"        if (i < 0) continue;\n"
+"        const k = part.slice(0, i).trim(), v = part.slice(i + 1).trim();\n"
+"        if (k) m.set(k, v);\n"
+"      }\n"
+"      return m;\n"
+"    };\n"
+"    const styleText = (m) => Array.from(m).map((e) => e[0] + ': ' + e[1]).join('; ');\n"
+"    function wrap(p) {\n"
+"      if (!p) return null;\n"
+"      let w = wraps.get(p);\n"
+"      if (w) return w;\n"
+"      const t = DOM.nodeType(p);\n"
+"      w = t === 1 ? new Element(p) : t === 3 ? new Text(p)\n"
+"        : t === 8 ? new Comment(p) : t === 9 ? new Document(p) : new Node(p);\n"
+"      wraps.set(p, w);\n"
+"      return w;\n"
+"    }\n"
+"    class Node {\n"
+"      constructor(p) { this.__p = p; }\n"
+"      get nodeType() { return DOM.nodeType(this.__p); }\n"
+"      get nodeName() { return DOM.nodeName(this.__p); }\n"
+"      get parentNode() { return wrap(DOM.parent(this.__p)); }\n"
+"      get parentElement() { const n = wrap(DOM.parent(this.__p)); return n && n.nodeType === 1 ? n : null; }\n"
+"      get firstChild() { return wrap(DOM.firstChild(this.__p)); }\n"
+"      get lastChild() { return wrap(DOM.lastChild(this.__p)); }\n"
+"      get nextSibling() { return wrap(DOM.next(this.__p)); }\n"
+"      get previousSibling() { return wrap(DOM.prev(this.__p)); }\n"
+"      get childNodes() {\n"
+"        const out = [];\n"
+"        let c = DOM.firstChild(this.__p);\n"
+"        while (c) { out.push(wrap(c)); c = DOM.next(c); }\n"
+"        return out;\n"
+"      }\n"
+"      get textContent() { return DOM.textGet(this.__p); }\n"
+"      set textContent(v) { DOM.textSet(this.__p, String(v)); }\n"
+"      get ownerDocument() { return G.document; }\n"
+"      get isConnected() {\n"
+"        let n = this.__p;\n"
+"        while (n) { if (DOM.nodeType(n) === 9) return true; n = DOM.parent(n); }\n"
+"        return false;\n"
+"      }\n"
+"      appendChild(n) { DOM.append(this.__p, n.__p); return n; }\n"
+"      insertBefore(n, ref) {\n"
+"        if (ref == null) return this.appendChild(n);\n"
+"        DOM.insertBefore(ref.__p, n.__p);\n"
+"        return n;\n"
+"      }\n"
+"      removeChild(n) { DOM.remove(n.__p); return n; }\n"
+"      replaceChild(n, old) { DOM.insertBefore(old.__p, n.__p); DOM.remove(old.__p); return old; }\n"
+"      remove() { DOM.remove(this.__p); }\n"
+"      cloneNode(deep) { return wrap(DOM.clone(this.__p, !!deep)); }\n"
+"      contains(n) {\n"
+"        let c = n && n.__p;\n"
+"        while (c) { if (c === this.__p) return true; c = DOM.parent(c); }\n"
+"        return false;\n"
+"      }\n"
+"      hasChildNodes() { return DOM.firstChild(this.__p) !== 0; }\n"
+"      addEventListener(type, fn, opts) {\n"
+"        if (typeof fn !== 'function') return;\n"
+"        const cap = !!(opts === true || (opts && opts.capture));\n"
+"        const once = !!(opts && opts.once);\n"
+"        let per = listeners.get(this.__p);\n"
+"        if (!per) { per = new Map(); listeners.set(this.__p, per); }\n"
+"        let arr = per.get(String(type));\n"
+"        if (!arr) { arr = []; per.set(String(type), arr); }\n"
+"        for (const l of arr) if (l.fn === fn && l.cap === cap) return;\n"
+"        arr.push({ fn: fn, cap: cap, once: once });\n"
+"      }\n"
+"      removeEventListener(type, fn, opts) {\n"
+"        const cap = !!(opts === true || (opts && opts.capture));\n"
+"        const per = listeners.get(this.__p);\n"
+"        const arr = per && per.get(String(type));\n"
+"        if (!arr) return;\n"
+"        for (let i = 0; i < arr.length; i++)\n"
+"          if (arr[i].fn === fn && arr[i].cap === cap) { arr.splice(i, 1); return; }\n"
+"      }\n"
+"      dispatchEvent(ev) {\n"
+"        ev.__target = this;\n"
+"        const path = [];\n"
+"        let a = DOM.parent(this.__p);\n"
+"        while (a) { path.push(wrap(a)); a = DOM.parent(a); }\n"
+"        const fire = (node, phase) => {\n"
+"          const per = listeners.get(node.__p);\n"
+"          const arr = per && per.get(ev.type);\n"
+"          if (!arr) return;\n"
+"          for (const l of arr.slice()) {\n"
+"            if (ev.__stopNow) return;\n"
+"            if (phase === 1 && !l.cap) continue;\n"
+"            if (phase === 3 && l.cap) continue;\n"
+"            if (l.once) { const k = arr.indexOf(l); if (k >= 0) arr.splice(k, 1); }\n"
+"            ev.__phase = phase; ev.__current = node;\n"
+"            try { l.fn.call(node, ev); }\n"
+"            catch (e) { consoleOut(3, [e]); }\n"
+"          }\n"
+"        };\n"
+"        for (let i = path.length - 1; i >= 0; i--) { if (ev.__stop) break; fire(path[i], 1); }\n"
+"        if (!ev.__stop) fire(this, 2);\n"
+"        if (ev.bubbles) for (let i = 0; i < path.length; i++) { if (ev.__stop) break; fire(path[i], 3); }\n"
+"        ev.__phase = 0; ev.__current = null;\n"
+"        return !ev.defaultPrevented;\n"
+"      }\n"
+"    }\n"
+"    class Element extends Node {\n"
+"      get tagName() { return DOM.nodeName(this.__p); }\n"
+"      get id() { return DOM.attrGet(this.__p, 'id') || ''; }\n"
+"      set id(v) { DOM.attrSet(this.__p, 'id', String(v)); }\n"
+"      get className() { return DOM.attrGet(this.__p, 'class') || ''; }\n"
+"      set className(v) { DOM.attrSet(this.__p, 'class', String(v)); }\n"
+"      get classList() {\n"
+"        const el = this;\n"
+"        return {\n"
+"          get length() { return el.className.split(/\\s+/).filter(Boolean).length; },\n"
+"          contains(c) { return el.className.split(/\\s+/).filter(Boolean).indexOf(String(c)) >= 0; },\n"
+"          add(...cs) {\n"
+"            const s = el.className.split(/\\s+/).filter(Boolean);\n"
+"            for (const c of cs) if (s.indexOf(String(c)) < 0) s.push(String(c));\n"
+"            el.className = s.join(' ');\n"
+"          },\n"
+"          remove(...cs) {\n"
+"            let s = el.className.split(/\\s+/).filter(Boolean);\n"
+"            for (const c of cs) s = s.filter((x) => x !== String(c));\n"
+"            el.className = s.join(' ');\n"
+"          },\n"
+"          toggle(c, force) {\n"
+"            const has = this.contains(c);\n"
+"            const want = force === undefined ? !has : !!force;\n"
+"            if (want && !has) this.add(c);\n"
+"            else if (!want && has) this.remove(c);\n"
+"            return want;\n"
+"          },\n"
+"          toString() { return el.className; },\n"
+"        };\n"
+"      }\n"
+"      get children() { return this.childNodes.filter((n) => n.nodeType === 1); }\n"
+"      get firstElementChild() { return this.children[0] || null; }\n"
+"      get lastElementChild() { const c = this.children; return c[c.length - 1] || null; }\n"
+"      getAttribute(n) { return DOM.attrGet(this.__p, String(n)); }\n"
+"      setAttribute(n, v) { DOM.attrSet(this.__p, String(n), String(v)); }\n"
+"      removeAttribute(n) { DOM.attrDel(this.__p, String(n)); }\n"
+"      hasAttribute(n) { return DOM.attrGet(this.__p, String(n)) !== null; }\n"
+"      getAttributeNames() { return DOM.attrNames(this.__p); }\n"
+"      get innerHTML() { return DOM.serialize(this.__p, 1); }\n"
+"      set innerHTML(v) { DOM.innerSet(this.__p, String(v)); }\n"
+"      get outerHTML() { return DOM.serialize(this.__p, 0); }\n"
+"      querySelector(sel) { const r = DOM.qsa(this.__p, String(sel)); return r.length ? wrap(r[0]) : null; }\n"
+"      querySelectorAll(sel) { return DOM.qsa(this.__p, String(sel)).map(wrap); }\n"
+"      matches(sel) { return DOM.matches(this.__p, String(sel)); }\n"
+"      closest(sel) {\n"
+"        let n = this;\n"
+"        while (n && n.nodeType === 1) { if (n.matches(sel)) return n; n = n.parentNode; }\n"
+"        return null;\n"
+"      }\n"
+"      getElementsByTagName(t) { return this.querySelectorAll(String(t)); }\n"
+"      getElementsByClassName(c) {\n"
+"        return this.querySelectorAll('.' + String(c).trim().split(/\\s+/).join('.'));\n"
+"      }\n"
+"      get style() {\n"
+"        let f = wrapsStyle.get(this.__p);\n"
+"        if (f) return f;\n"
+"        const el = this;\n"
+"        f = new Proxy({}, {\n"
+"          get(t, k) {\n"
+"            if (k === 'cssText') return DOM.attrGet(el.__p, 'style') || '';\n"
+"            if (k === 'setProperty') return (n, v) => {\n"
+"              const m = parseStyle(DOM.attrGet(el.__p, 'style'));\n"
+"              m.set(String(n), String(v));\n"
+"              DOM.attrSet(el.__p, 'style', styleText(m));\n"
+"            };\n"
+"            if (k === 'getPropertyValue') return (n) => parseStyle(DOM.attrGet(el.__p, 'style')).get(String(n)) || '';\n"
+"            if (k === 'removeProperty') return (n) => {\n"
+"              const m = parseStyle(DOM.attrGet(el.__p, 'style'));\n"
+"              const old = m.get(String(n)) || '';\n"
+"              m.delete(String(n));\n"
+"              DOM.attrSet(el.__p, 'style', styleText(m));\n"
+"              return old;\n"
+"            };\n"
+"            if (typeof k !== 'string') return undefined;\n"
+"            return parseStyle(DOM.attrGet(el.__p, 'style')).get(kebab(k)) || '';\n"
+"          },\n"
+"          set(t, k, v) {\n"
+"            if (k === 'cssText') { DOM.attrSet(el.__p, 'style', String(v)); return true; }\n"
+"            const m = parseStyle(DOM.attrGet(el.__p, 'style'));\n"
+"            if (v === '' || v == null) m.delete(kebab(String(k)));\n"
+"            else m.set(kebab(String(k)), String(v));\n"
+"            DOM.attrSet(el.__p, 'style', styleText(m));\n"
+"            return true;\n"
+"          },\n"
+"        });\n"
+"        wrapsStyle.set(this.__p, f);\n"
+"        return f;\n"
+"      }\n"
+"    }\n"
+"    const wrapsStyle = new Map();\n"
+"    class CharacterData extends Node {\n"
+"      get data() { return DOM.dataGet(this.__p); }\n"
+"      set data(v) { DOM.textSet(this.__p, String(v)); }\n"
+"      get nodeValue() { return this.data; }\n"
+"      set nodeValue(v) { this.data = v; }\n"
+"      get length() { return this.data.length; }\n"
+"    }\n"
+"    class Text extends CharacterData {}\n"
+"    class Comment extends CharacterData {}\n"
+"    class Document extends Node {\n"
+"      get body() { return wrap(DOM.body()); }\n"
+"      get head() { return wrap(DOM.head()); }\n"
+"      get documentElement() { return wrap(DOM.docElement()); }\n"
+"      createElement(n) { return wrap(DOM.createElement(String(n))); }\n"
+"      createTextNode(s) { return wrap(DOM.createText(String(s))); }\n"
+"      createComment(s) { return wrap(DOM.createComment(String(s))); }\n"
+"      getElementById(id) { return wrap(DOM.byAttr(DOM.docElement(), 'id', String(id))); }\n"
+"      querySelector(sel) { const r = DOM.qsa(this.__p, String(sel)); return r.length ? wrap(r[0]) : null; }\n"
+"      querySelectorAll(sel) { return DOM.qsa(this.__p, String(sel)).map(wrap); }\n"
+"      getElementsByTagName(t) { return this.querySelectorAll(String(t)); }\n"
+"      getElementsByClassName(c) {\n"
+"        return this.querySelectorAll('.' + String(c).trim().split(/\\s+/).join('.'));\n"
+"      }\n"
+"      addStyleSheet(css) { DOM.addCss(String(css)); }\n"
+"    }\n"
+"    class Event {\n"
+"      constructor(type, init) {\n"
+"        init = init || {};\n"
+"        this.type = String(type);\n"
+"        this.bubbles = !!init.bubbles;\n"
+"        this.cancelable = !!init.cancelable;\n"
+"        this.defaultPrevented = false;\n"
+"        this.__stop = false; this.__stopNow = false;\n"
+"        this.__phase = 0; this.__current = null; this.__target = null;\n"
+"        this.timeStamp = Date.now();\n"
+"        this.isTrusted = false;\n"
+"      }\n"
+"      get target() { return this.__target; }\n"
+"      get currentTarget() { return this.__current; }\n"
+"      get eventPhase() { return this.__phase; }\n"
+"      stopPropagation() { this.__stop = true; }\n"
+"      stopImmediatePropagation() { this.__stop = true; this.__stopNow = true; }\n"
+"      preventDefault() { if (this.cancelable) this.defaultPrevented = true; }\n"
+"    }\n"
+"    class CustomEvent extends Event {\n"
+"      constructor(type, init) {\n"
+"        super(type, init);\n"
+"        this.detail = init && init.detail !== undefined ? init.detail : null;\n"
+"      }\n"
+"    }\n"
+"    DomNode = Node;\n"
+"    G.Node = Node; G.Element = Element; G.Text = Text; G.Comment = Comment;\n"
+"    G.CharacterData = CharacterData; G.Document = Document;\n"
+"    G.Event = Event; G.CustomEvent = CustomEvent;\n"
+"    G.document = wrap(DOM.doc());\n"
+"    G.getComputedStyle = (el) => {\n"
+"      const out = {};\n"
+"      for (const d of DOM.computed(el.__p)) {\n"
+"        const i = d.indexOf(':');\n"
+"        if (i < 0) continue;\n"
+"        out[d.slice(0, i).trim()] = d.slice(i + 1).trim();\n"
+"      }\n"
+"      for (const [k, v] of parseStyle(DOM.attrGet(el.__p, 'style'))) out[k] = v;\n"
+"      Object.defineProperty(out, 'getPropertyValue', {\n"
+"        value: (n) => out[String(n)] || '', enumerable: false,\n"
+"      });\n"
+"      return out;\n"
+"    };\n"
+"  }\n"
+"  return { serTop: serTop, envelope: envelope, userGlobals: userGlobals, timerCount: timerCount, timerPop: timerPop, rejected: rejected, buildDOM: buildDOM };\n"
 "})()\n";
 
 /* ------------------------------------------------------------------------ */
@@ -818,6 +1109,7 @@ EXPORT("tt_init") int tt_init(void)
     natfn = JS_NewCFunction(g_ctx, js_tt_console, "__tt_nat_console", 2);
     JS_SetPropertyStr(g_ctx, glob, "__tt_nat_console", natfn);
     JS_FreeValue(g_ctx, glob);
+    tt_dom_register(g_ctx);
 
     setup = JS_Eval(g_ctx, SETUP_SRC, sizeof(SETUP_SRC) - 1, "tt-setup.js", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(setup))
@@ -828,6 +1120,7 @@ EXPORT("tt_init") int tt_init(void)
     g_timer_count_fn = JS_GetPropertyStr(g_ctx, setup, "timerCount");
     g_timer_pop_fn = JS_GetPropertyStr(g_ctx, setup, "timerPop");
     g_rejected_fn = JS_GetPropertyStr(g_ctx, setup, "rejected");
+    g_dom_build_fn = JS_GetPropertyStr(g_ctx, setup, "buildDOM");
     JS_FreeValue(g_ctx, setup);
 
     JS_TTSetStepHandler(g_rt, tt_step_handler, NULL);
@@ -1118,6 +1411,8 @@ EXPORT("tt_reset") int tt_reset(void)
     JS_FreeValue(g_ctx, g_timer_count_fn);
     JS_FreeValue(g_ctx, g_timer_pop_fn);
     JS_FreeValue(g_ctx, g_rejected_fn);
+    JS_FreeValue(g_ctx, g_dom_build_fn);
+    tt_dom_destroy();
     JS_FreeContext(g_ctx);
     JS_TTSetVirtualTime(0, 1);
     g_ctx = JS_NewContext(g_rt);
@@ -1131,6 +1426,7 @@ EXPORT("tt_reset") int tt_reset(void)
     natfn = JS_NewCFunction(g_ctx, js_tt_console, "__tt_nat_console", 2);
     JS_SetPropertyStr(g_ctx, glob, "__tt_nat_console", natfn);
     JS_FreeValue(g_ctx, glob);
+    tt_dom_register(g_ctx);
     setup = JS_Eval(g_ctx, SETUP_SRC, sizeof(SETUP_SRC) - 1, "tt-setup.js", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(setup))
         return 3;
@@ -1140,6 +1436,7 @@ EXPORT("tt_reset") int tt_reset(void)
     g_timer_count_fn = JS_GetPropertyStr(g_ctx, setup, "timerCount");
     g_timer_pop_fn = JS_GetPropertyStr(g_ctx, setup, "timerPop");
     g_rejected_fn = JS_GetPropertyStr(g_ctx, setup, "rejected");
+    g_dom_build_fn = JS_GetPropertyStr(g_ctx, setup, "buildDOM");
     JS_FreeValue(g_ctx, setup);
     JS_TTSetStepFilename(g_ctx, "program.js");
     return 0;
@@ -1147,3 +1444,21 @@ EXPORT("tt_reset") int tt_reset(void)
 
 EXPORT("tt_alloc") void *tt_alloc(int n) { return malloc((size_t)n); }
 EXPORT("tt_free") void tt_free(void *p) { free(p); }
+
+/* Load an HTML document for this session (call after tt_init/tt_reset,
+   before tt_eval). Parses via Lexbor into THIS linear memory and builds
+   the self-hosted DOM API. Returns 0 on success. */
+EXPORT("tt_dom_load") int tt_dom_load(const char *html, int len)
+{
+    JSValue r;
+    int rc = tt_dom_load_html(html, (size_t)len);
+    if (rc)
+        return rc;
+    r = JS_Call(g_ctx, g_dom_build_fn, JS_UNDEFINED, 0, NULL);
+    if (JS_IsException(r)) {
+        JS_FreeValue(g_ctx, JS_GetException(g_ctx));
+        return 100;
+    }
+    JS_FreeValue(g_ctx, r);
+    return 0;
+}

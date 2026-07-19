@@ -29,6 +29,22 @@ const finalWasm = join(out, "quickjs-tt.wasm")
 
 const sources = ["quickjs.c", "cutils.c", "libregexp.c", "libunicode.c", "dtoa.c"].map((f) => join(qjs, f))
 sources.push(join(root, "native/tt-wrap.c"))
+sources.push(join(root, "native/tt-dom.c"))
+
+// Lexbor: the DOM/CSS engine shares this linear memory, so the document
+// time-travels through the ordinary COW snapshots
+import { readdirSync } from "node:fs"
+const lexborRoot = join(root, "vendor/lexbor")
+const lexborWalk = (dir) => {
+  for (const name of readdirSync(dir, { withFileTypes: true })) {
+    const p = join(dir, name.name)
+    if (name.isDirectory()) lexborWalk(p)
+    else if (name.name.endsWith(".c")) sources.push(p)
+  }
+}
+for (const mod of ["core", "dom", "html", "css", "selectors", "style", "tag", "ns"])
+  lexborWalk(join(lexborRoot, "lexbor", mod))
+lexborWalk(join(lexborRoot, "lexbor/ports/posix"))
 
 const args = [
   "--target=wasm32-wasi",
@@ -51,6 +67,8 @@ const args = [
   "-Wl,--max-memory=536870912",
   "-Wl,--export-table",
   "-I", qjs,
+  "-I", lexborRoot,
+  "-DLEXBOR_STATIC",
   ...sources,
   "-lm",
   "-o", rawWasm,

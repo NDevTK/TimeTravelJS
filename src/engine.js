@@ -131,6 +131,16 @@ export class TimeTravelEngine {
     // VM instructions of user code
     this.vm.exports.tt_set_granularity(opts.granularity === "opcode" ? 1 : 0)
 
+    // optional HTML document: parsed by the embedded Lexbor into the SAME
+    // linear memory, so the DOM+CSSOM time-travels through the ordinary
+    // per-step COW snapshots (and forks fork the document)
+    if (opts.html != null) {
+      const h = this.vm.writeString(String(opts.html))
+      const rc = this.vm.exports.tt_dom_load(h.ptr, h.len)
+      this.vm.exports.tt_free(h.ptr)
+      if (rc !== 0) throw new Error(`tt_dom_load failed: ${rc}`)
+    }
+
     const { ptr, len } = this.vm.writeString(source)
     s.programPtr = ptr
     this._mode = "record"
