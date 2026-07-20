@@ -353,14 +353,16 @@ how many constraints they did satisfy — are combined pairwise.
 ```
 index.html, styles.css       the site (static, no build step)
 dist/quickjs-tt.wasm         the VM (committed artifact, ~2.5 MB)
-vendor/quickjs/              QuickJS 2026-06-04, execution core rewritten (MIT)
+vendor/quickjs/              QuickJS 2026-06-04, execution core rewritten (MIT);
+                             the wasm host interface lives inside quickjs.c
+                             (a __wasi__-guarded section — native builds skip it)
 vendor/lexbor/               Lexbor HTML/CSS engine subset (Apache-2.0)
-native/tt-wrap.c             wasm embedder: exports, command loop, setup runtime
 native/tt-dom.c              Lexbor binding: DOM/CSS leaf primitives for the VM
 native/build.mjs             clang → wasm32-wasi → Binaryen optimize
 native/barrier.mjs           wasm bytecode pass: the dirty-page write barrier
 native/quickjs-changes.patch the complete QuickJS diff, for review
 src/vm.js                    loader + dual park/rewind driver + WASI shims
+src/vm/tt-setup.js           interim in-VM substrate (being ported to native C)
 src/deltastore.js            per-step COW page store (content-deduplicated)
 src/engine.js                recorder, delta navigation, inspection, forking
 src/ui.js, main.js, samples.js   debugger UI

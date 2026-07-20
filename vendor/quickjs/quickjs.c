@@ -533,6 +533,7 @@ enum {
     TT_FRAME_PROXY_SET,     /* bytecode proxy set trap; post = invariant check */
     TT_FRAME_PROXY_DEFINE,  /* bytecode proxy defineProperty trap (field init) */
     TT_FRAME_ITER_CLOSE,    /* bytecode .return for OP_iterator_close          */
+    TT_FRAME_INIT_CTOR,     /* implicit derived ctor's parent call (OP_init_ctor) */
 };
 
 /* how a TT_FRAME_GEN resume returns its value to the caller (tt_aux_i is
@@ -869,6 +870,8 @@ typedef struct JSForInIterator {
     uint32_t atom_count;
     uint8_t in_prototype_chain;
     uint8_t is_array;
+    uint8_t is_tt;            /* TimeTravelJS: obj is a delegate-held iteration
+                                 state object; steps run via TT_DELEG_FORIN_STEP */
     JSPropertyEnum *tab_atom; /* is_array = FALSE */
 } JSForInIterator;
 
@@ -16758,6 +16761,7 @@ static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
         return JS_EXCEPTION;
     }
     it->is_array = FALSE;
+    it->is_tt = FALSE;
     it->obj = obj;
     it->idx = 0;
     it->tab_atom = NULL;
@@ -18260,6 +18264,8 @@ static JSValue js_string_constructor(JSContext *ctx, JSValueConst new_target,
                                      int argc, JSValueConst *argv);
 static JSValue js_string_concat(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv);
+static JSValue js_function_hasInstance(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv);
 struct JSAsyncGeneratorData;
 static int js_async_generator_resume_pre(JSContext *ctx,
                                          struct JSAsyncGeneratorData *s);
@@ -19668,6 +19674,53 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 super = JS_GetPrototype(ctx, func_obj);
                 if (JS_IsException(super))
                     goto exception;
+                /* TimeTravelJS stackless: the implicit derived ctor's parent
+                   call runs in THIS loop when the parent is a bytecode
+                   constructor — parity with the explicit super(...) path
+                   (OP_call_constructor). args/new_target are borrowed from
+                   this frame (which outlives the callee); `super` is owned
+                   and parked in a one-slot arena block until the pop. */
+                if (JS_VALUE_GET_TAG(super) == JS_TAG_OBJECT &&
+                    JS_VALUE_GET_OBJ(super)->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+                    JS_VALUE_GET_OBJ(super)->is_constructor) {
+                    JSFunctionBytecode *icb = JS_VALUE_GET_OBJ(super)->u.func.function_bytecode;
+                    JSValue *ic_blk;
+                    if (unlikely(js_poll_interrupts(ctx))) {
+                        JS_FreeValue(ctx, super);
+                        goto exception;
+                    }
+                    if (icb->is_derived_class_constructor) {
+                        pf_this = JS_UNDEFINED;
+                        pf_ctor_this = JS_UNDEFINED;
+                    } else {
+                        JSValue icobj = js_create_from_ctor(ctx, new_target, JS_CLASS_OBJECT);
+                        if (JS_IsException(icobj)) {
+                            JS_FreeValue(ctx, super);
+                            goto exception;
+                        }
+                        pf_this = icobj;
+                        pf_ctor_this = icobj; /* owned by the new frame */
+                    }
+                    ic_blk = tt_arena_alloc_vals(rt, 1);
+                    if (unlikely(!ic_blk)) {
+                        JS_FreeValue(ctx, pf_ctor_this);
+                        JS_FreeValue(ctx, super);
+                        JS_ThrowStackOverflow(caller_ctx);
+                        goto exception;
+                    }
+                    ic_blk[0] = super;
+                    sf->cur_sp = sp;
+                    pf_func = super;
+                    pf_new_target = new_target;
+                    pf_argc = argc;
+                    pf_argv = argv;
+                    pf_flags = JS_CALL_FLAG_CONSTRUCTOR | JS_CALL_FLAG_COPY_ARGV;
+                    pf_kind = TT_FRAME_INIT_CTOR;
+                    pf_aux_i = 0;
+                    pf_cargc = 0;
+                    pf_aux = ic_blk;
+                    goto push_frame;
+                }
                 ret = JS_CallConstructor2(ctx, super, new_target, argc, (JSValueConst *)argv);
                 JS_FreeValue(ctx, super);
                 if (JS_IsException(ret))
@@ -22968,6 +23021,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_FreeValue(ctx, pt_eb[pt_i]);
                 rt->tt_arena_top = (uint8_t *)pt_eb;
             }
+            if (kind == TT_FRAME_INIT_CTOR) {
+                JSValue *ic_eb = (JSValue *)kaux_p;
+                JS_FreeValue(ctx, ctor_this);
+                JS_FreeValue(ctx, ic_eb[0]); /* super */
+                rt->tt_arena_top = (uint8_t *)ic_eb;
+            }
             if (kind == TT_FRAME_APPLY)
                 free_arg_list(ctx, kaux_p, (uint32_t)kaux);
             if (kind == TT_FRAME_FOROF) {
@@ -23408,6 +23467,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, sp[-1]);
             sp[-1] = ret_val;
             *sp++ = JS_FALSE;
+            goto restart;
+        }
+        if (kind == TT_FRAME_INIT_CTOR) {
+            /* implicit derived ctor's parent call: nothing of the call
+               lives on the caller's stack. A derived parent always yields
+               an object (ctor_this is undefined); a legacy parent applies
+               the object-result-wins-else-`this` rule. */
+            JSValue *ic_blk = (JSValue *)kaux_p;
+            JS_FreeValue(ctx, ic_blk[0]); /* super */
+            rt->tt_arena_top = (uint8_t *)ic_blk;
+            if (JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) {
+                JS_FreeValue(ctx, ctor_this);
+            } else {
+                JS_FreeValue(ctx, ret_val);
+                ret_val = ctor_this;
+            }
+            *sp++ = ret_val;
             goto restart;
         }
         {
@@ -65358,3 +65434,788 @@ JS_BOOL JS_TTSetLocal(JSContext *ctx, int level, JSAtom name, JSValueConst value
     }
     return FALSE;
 }
+
+/* ===================== TimeTravelJS __wasi__ host interface ==========
+   The wasm embedding of this fork: exports, pumps, and the step-park
+   policy. Compiled only for the wasm target -- native builds (e.g. the
+   test262 runner) see none of it. The setup layer arrives at runtime
+   as real JavaScript files (src/vm/tt-setup.js, src/vm/tt-delegates.js)
+   via tt_load_setup; the Lexbor DOM bridge stays in native/tt-dom.c. */
+#if defined(__wasi__)
+/* the host layer talks to libc directly (its buffers are not part of the
+   JS heap accounting) — lift the engine's raw-alloc poisoning here */
+#undef malloc
+#undef free
+#undef realloc
+/*
+ * TimeTravelJS wasm embedder.
+ *
+ * Exports a small API around a rewritten (stackless) QuickJS build. The
+ * step hook fires per source line — or per opcode in microscope mode. Two
+ * suspension paths, one invariant (a snapshot IS a resumable machine):
+ *
+ *  - park by return: interpreter frames live in a linear-memory arena, so
+ *    when only the dispatch loop is on the C stack the machine suspends by
+ *    returning from the export (tt_eval/tt_resume return 1). Inspection and
+ *    evaluation against a parked machine are plain calls.
+ *
+ *  - suppressed steps: user code invoked synchronously from inside an
+ *    unconverted C builtin (accessors reached from C paths, proxy traps,
+ *    toPrimitive coercions, async generators) executes normally but cannot
+ *    become a snapshot; such steps are counted (tt_suppressed) instead.
+ */
+
+#define EXPORT(name) __attribute__((export_name(name), used))
+#define IMPORT(name) __attribute__((import_module("env"), import_name(name)))
+
+/* host imports ----------------------------------------------------------- */
+/* Synchronous out-of-band channel: kind 0=console 1=inspect 2=eval-result
+   3=eval-done 4=jobs-done 5=timer-done */
+IMPORT("tt_host_out") extern void tt_host_out(int kind, const char *ptr, int len);
+/* Synchronous: copy the staged command payload (eval source) into dst,
+   returns its UTF-8 length (or 0). */
+IMPORT("tt_host_arg") extern int tt_host_arg(char *dst, int cap);
+/* Synchronous watchdog for code running between step points. */
+IMPORT("tt_host_interrupt") extern int tt_host_interrupt(void);
+
+/* tt-dom.c: the Lexbor layer (same linear memory, so the DOM time-travels
+   through the ordinary COW snapshots) */
+void tt_dom_register(JSContext *ctx);
+int tt_dom_load_html(const char *html, size_t len);
+void tt_dom_destroy(void);
+
+/* Dirty-page byte map for the write barrier: the build post-processes the
+   wasm so every store also sets g_tt_dirty[(addr >> 10)] = 1 (uninstrumented
+   itself). One byte per 1 KB page, sized for the 512 MB memory maximum.
+   Zero-initialized BSS — costs nothing in the binary. The host reads and
+   clears it; barrier writes bypass instrumentation, so the map region never
+   marks itself and stays out of the recorded history. */
+#define TT_DIRTY_PAGES (512 * 1024)
+static unsigned char g_tt_dirty[TT_DIRTY_PAGES] __attribute__((aligned(1024)));
+
+EXPORT("tt_dirty_map") unsigned char *tt_dirty_map(void) { return g_tt_dirty; }
+EXPORT("tt_dirty_map_size") int tt_dirty_map_size(void) { return TT_DIRTY_PAGES; }
+
+/* state ------------------------------------------------------------------ */
+static JSRuntime *g_rt;
+static JSContext *g_ctx;
+static JSValue g_ser_fn;        /* (value, kind) -> JSON string           */
+static JSValue g_envelope_fn;   /* (isError, value) -> JSON string        */
+static JSValue g_globals_fn;    /* () -> plain object of user globals     */
+static JSValue g_timer_pop_fn;  /* () -> [fn, argsArray, at] | null       */
+static JSValue g_timer_count_fn;/* () -> int                              */
+static JSValue g_rejected_fn;
+static JSValue g_dom_build_fn;   /* (reason) -> void (console error)       */
+static JSValue g_set_url_fn;     /* (href) -> void — session location init */
+static int g_in_hook;           /* re-entrancy guard for inspect/eval     */
+static char g_arg_buf[65536];
+
+/* What kind of activation is currently parked/being driven — decides what
+   tt_resume does after the parked frame completes. */
+enum { TT_EXEC_SCRIPT = 0, TT_EXEC_JOBS = 1, TT_EXEC_TIMER = 2 };
+static int g_exec_kind;
+static int g_jobs_count;
+static int pump_jobs_loop(void);
+static int timer_finish(JSValue r);
+
+/* ------------------------------------------------------------------------ */
+static void send_json_value(JSContext *ctx, int kind, JSValueConst val)
+{
+    JSValue args[1];
+    JSValue s;
+    const char *cstr;
+    size_t len;
+
+    args[0] = (JSValue)val;
+    s = JS_Call(ctx, g_ser_fn, JS_UNDEFINED, 1, (JSValueConst *)args);
+    if (JS_IsException(s)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        tt_host_out(kind, "null", 4);
+        return;
+    }
+    cstr = JS_ToCStringLen(ctx, &len, s);
+    if (cstr) {
+        tt_host_out(kind, cstr, (int)len);
+        JS_FreeCString(ctx, cstr);
+    } else {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        tt_host_out(kind, "null", 4);
+    }
+    JS_FreeValue(ctx, s);
+}
+
+/* Send { stack, frames: [locals…], globals } for the paused position. */
+static void send_inspection(JSContext *ctx)
+{
+    JSValue obj = JS_NewObject(ctx);
+    JSValue stack = JS_TTBacktrace(ctx);
+    JSValue frames = JS_NewArray(ctx);
+    JSValue globals;
+    int level;
+    int64_t nframes = 0;
+
+    JS_DefinePropertyValueStr(ctx, obj, "stack", stack, JS_PROP_C_W_E);
+    {
+        JSValue lenv = JS_GetPropertyStr(ctx, stack, "length");
+        JS_ToInt64(ctx, &nframes, lenv);
+        JS_FreeValue(ctx, lenv);
+    }
+    if (nframes > 32) nframes = 32;
+    for (level = 0; level < (int)nframes; level++) {
+        JS_DefinePropertyValueUint32(ctx, frames, level, JS_TTLocals(ctx, level), JS_PROP_C_W_E);
+    }
+    JS_DefinePropertyValueStr(ctx, obj, "frames", frames, JS_PROP_C_W_E);
+    globals = JS_Call(ctx, g_globals_fn, JS_UNDEFINED, 0, NULL);
+    if (JS_IsException(globals)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        globals = JS_NewObject(ctx);
+    }
+    JS_DefinePropertyValueStr(ctx, obj, "globals", globals, JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "lexicals", JS_TTGlobalLexicals(ctx), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "__ttInspect", JS_TRUE, 0);
+    send_json_value(ctx, 1, obj);
+    JS_FreeValue(ctx, obj);
+}
+
+/* Evaluate a console expression at the paused position. The innermost
+   frame's locals are made visible through a sloppy-mode `with` around a
+   direct eval; the step hook is disabled so the evaluation is atomic. */
+static const char EVAL_WRAPPER_SRC[] =
+    "(function (__ttL, __ttSrc) { with (__ttL) { return eval(__ttSrc); } })";
+
+static void eval_at_pause_mode(JSContext *ctx, int write_back)
+{
+    int len = tt_host_arg(g_arg_buf, (int)sizeof(g_arg_buf) - 1);
+    JSValue v, env, args[2];
+    const char *cstr;
+    size_t slen;
+
+    if (len <= 0 || len >= (int)sizeof(g_arg_buf)) {
+        tt_host_out(2, "null", 4);
+        return;
+    }
+    g_arg_buf[len] = 0;
+    {
+        JSValue wrapper = JS_Eval(ctx, EVAL_WRAPPER_SRC, sizeof(EVAL_WRAPPER_SRC) - 1,
+                                  "<console-scope>", JS_EVAL_TYPE_GLOBAL);
+        if (JS_IsException(wrapper)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            v = JS_Eval(ctx, g_arg_buf, len, "<console>", JS_EVAL_TYPE_GLOBAL);
+        } else {
+            JSValue callArgs[2];
+            callArgs[0] = JS_TTLocals(ctx, 0);
+            callArgs[1] = JS_NewStringLen(ctx, g_arg_buf, len);
+            v = JS_Call(ctx, wrapper, JS_UNDEFINED, 2, (JSValueConst *)callArgs);
+            if (write_back && !JS_IsException(v)) {
+                /* rebindings made by the edit live on the scope object —
+                   push them into the real frame slots */
+                JSPropertyEnum *tab;
+                uint32_t n, i;
+                if (!JS_GetOwnPropertyNames(ctx, &tab, &n, callArgs[0],
+                                            JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
+                    for (i = 0; i < n; i++) {
+                        JSValue pv = JS_GetProperty(ctx, callArgs[0], tab[i].atom);
+                        if (!JS_IsException(pv)) {
+                            JS_TTSetLocal(ctx, 0, tab[i].atom, pv);
+                            JS_FreeValue(ctx, pv);
+                        } else {
+                            JS_FreeValue(ctx, JS_GetException(ctx));
+                        }
+                    }
+                    JS_FreePropertyEnum(ctx, tab, n);
+                }
+            }
+            JS_FreeValue(ctx, callArgs[0]);
+            JS_FreeValue(ctx, callArgs[1]);
+            JS_FreeValue(ctx, wrapper);
+        }
+    }
+    if (JS_IsException(v)) {
+        args[0] = JS_TRUE;
+        args[1] = JS_GetException(ctx);
+    } else {
+        args[0] = JS_FALSE;
+        args[1] = v;
+    }
+    env = JS_Call(ctx, g_envelope_fn, JS_UNDEFINED, 2, (JSValueConst *)args);
+    JS_FreeValue(ctx, args[1]);
+    if (JS_IsException(env)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        tt_host_out(2, "null", 4);
+        return;
+    }
+    cstr = JS_ToCStringLen(ctx, &slen, env);
+    if (cstr) {
+        tt_host_out(2, cstr, (int)slen);
+        JS_FreeCString(ctx, cstr);
+    } else {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        tt_host_out(2, "null", 4);
+    }
+    JS_FreeValue(ctx, env);
+}
+
+static void eval_at_pause(JSContext *ctx)
+{
+    eval_at_pause_mode(ctx, 0);
+}
+
+/* Park-by-return bookkeeping: when the interpreter says the machine can
+   suspend by simply returning (stackless path — no C frames below the
+   dispatch loop), we take that route and let the host read the step info
+   from these statics. */
+static int g_park_line, g_park_col, g_park_depth;
+
+EXPORT("tt_park_line") int tt_park_line(void) { return g_park_line; }
+EXPORT("tt_park_col") int tt_park_col(void) { return g_park_col; }
+EXPORT("tt_park_depth") int tt_park_depth(void) { return g_park_depth; }
+
+/* Steps that fire while the machine is not parkable (user code invoked
+   synchronously from inside an unconverted C builtin: accessors reached
+   from C paths, proxy traps, toPrimitive coercions, async generators).
+   With Asyncify gone these cannot become snapshots — they execute
+   normally, tick virtual time, and are counted here for the host. */
+static int g_suppressed;
+
+EXPORT("tt_suppressed") int tt_suppressed(void) { return g_suppressed; }
+
+/* The step handler: park by return when the interpreter allows it;
+   otherwise count the step as suppressed and continue. */
+static int tt_host_step_handler(JSContext *ctx, int line, int col, int depth,
+                           int parkable, void *opaque)
+{
+    (void)opaque;
+    (void)ctx;
+    if (g_in_hook)
+        return 0;
+    if (parkable) {
+        g_park_line = line;
+        g_park_col = col;
+        g_park_depth = depth;
+        return 2;
+    }
+    (void)line;
+    (void)col;
+    (void)depth;
+    g_suppressed++;
+    return 0;
+}
+
+static int tt_interrupt_handler(JSRuntime *rt, void *opaque)
+{
+    (void)rt;
+    (void)opaque;
+    return tt_host_interrupt();
+}
+
+static void tt_rejection_tracker(JSContext *ctx, JSValueConst promise,
+                                 JSValueConst reason, JS_BOOL is_handled, void *opaque)
+{
+    JSValue args[1];
+    JSValue r;
+    (void)promise;
+    (void)opaque;
+    if (is_handled)
+        return;
+    args[0] = (JSValue)reason;
+    r = JS_Call(ctx, g_rejected_fn, JS_UNDEFINED, 1, (JSValueConst *)args);
+    if (JS_IsException(r))
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    JS_FreeValue(ctx, r);
+}
+
+/* console bridge: level + pre-serialized JSON parts from the setup script */
+static JSValue js_tt_console(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv)
+{
+    int32_t level = 0;
+    const char *json;
+    size_t len;
+    (void)this_val;
+    if (argc < 2)
+        return JS_UNDEFINED;
+    JS_ToInt32(ctx, &level, argv[0]);
+    json = JS_ToCStringLen(ctx, &len, argv[1]);
+    if (json) {
+        tt_host_out(0, json, (int)len);
+        JS_FreeCString(ctx, json);
+    }
+    return JS_UNDEFINED;
+}
+
+/* ------------------------------------------------------------------------ */
+/* INTERIM setup loader (being retired): the remaining JS substrate
+   (src/vm/tt-setup.js) is delivered by the host after tt_init and cached
+   so tt_reset can re-evaluate it. Every block it still carries is being
+   ported to native C in this section — the end state injects NO JavaScript
+   into the debugged realm. */
+static char *g_setup_src[1];
+static int g_setup_len[1];
+
+static int eval_setup_slot(int slot)
+{
+    JSValue setup;
+
+    if (!g_setup_src[slot])
+        return 1;
+    setup = JS_Eval(g_ctx, g_setup_src[slot], (size_t)g_setup_len[slot],
+                    "tt-setup.js", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(setup)) {
+        JS_FreeValue(g_ctx, JS_GetException(g_ctx));
+        return 1;
+    }
+    g_ser_fn = JS_GetPropertyStr(g_ctx, setup, "serTop");
+    g_envelope_fn = JS_GetPropertyStr(g_ctx, setup, "envelope");
+    g_globals_fn = JS_GetPropertyStr(g_ctx, setup, "userGlobals");
+    g_timer_count_fn = JS_GetPropertyStr(g_ctx, setup, "timerCount");
+    g_timer_pop_fn = JS_GetPropertyStr(g_ctx, setup, "timerPop");
+    g_rejected_fn = JS_GetPropertyStr(g_ctx, setup, "rejected");
+    g_dom_build_fn = JS_GetPropertyStr(g_ctx, setup, "buildDOM");
+    g_set_url_fn = JS_GetPropertyStr(g_ctx, setup, "setURL");
+    JS_FreeValue(g_ctx, setup);
+    return 0;
+}
+
+/* Host hands over one setup source; evaluated immediately and cached for
+   tt_reset. Returns 0 on success. */
+EXPORT("tt_load_setup") int tt_load_setup(int slot, const char *src, int len)
+{
+    char *copy;
+
+    if (slot != 0 || !src || len <= 0)
+        return 1;
+    copy = malloc((size_t)len + 1);
+    if (!copy)
+        return 1;
+    memcpy(copy, src, (size_t)len);
+    copy[len] = 0;
+    free(g_setup_src[slot]);
+    g_setup_src[slot] = copy;
+    g_setup_len[slot] = len;
+    return eval_setup_slot(slot);
+}
+
+/* ------------------------------------------------------------------------ */
+EXPORT("tt_init") int tt_init(void)
+{
+    JSValue glob, natfn;
+
+    JS_TTSetVirtualTime(0, 1); /* must precede context creation (random seed) */
+    g_rt = JS_NewRuntime();
+    if (!g_rt)
+        return 1;
+    JS_SetMemoryLimit(g_rt, 192 * 1024 * 1024);
+    JS_SetMaxStackSize(g_rt, 384 * 1024);
+    g_ctx = JS_NewContext(g_rt);
+    if (!g_ctx)
+        return 2;
+
+    g_ser_fn = g_envelope_fn = g_globals_fn = JS_UNDEFINED;
+    g_timer_count_fn = g_timer_pop_fn = g_rejected_fn = JS_UNDEFINED;
+    g_dom_build_fn = g_set_url_fn = JS_UNDEFINED;
+    glob = JS_GetGlobalObject(g_ctx);
+    natfn = JS_NewCFunction(g_ctx, js_tt_console, "__tt_nat_console", 2);
+    JS_SetPropertyStr(g_ctx, glob, "__tt_nat_console", natfn);
+    JS_FreeValue(g_ctx, glob);
+    tt_dom_register(g_ctx);
+
+    /* the host now delivers src/vm/tt-setup.js and src/vm/tt-delegates.js
+       through tt_load_setup before the first evaluation */
+    JS_TTSetStepHandler(g_rt, tt_host_step_handler, NULL);
+    JS_TTSetStepFilename(g_ctx, "program.js");
+    JS_SetInterruptHandler(g_rt, tt_interrupt_handler, NULL);
+    JS_SetHostPromiseRejectionTracker(g_rt, tt_rejection_tracker, NULL);
+    return 0;
+}
+
+/* Emit the kind=3 completion envelope for the program value/exception. */
+static void emit_eval_done(JSValue v)
+{
+    JSValue env, args[2];
+    const char *cstr;
+    size_t slen;
+
+    if (JS_IsException(v)) {
+        args[0] = JS_TRUE;
+        args[1] = JS_GetException(g_ctx);
+    } else {
+        args[0] = JS_FALSE;
+        args[1] = v;
+    }
+    env = JS_Call(g_ctx, g_envelope_fn, JS_UNDEFINED, 2, (JSValueConst *)args);
+    JS_FreeValue(g_ctx, args[1]);
+    cstr = JS_ToCStringLen(g_ctx, &slen, env);
+    if (cstr) {
+        tt_host_out(3, cstr, (int)slen);
+        JS_FreeCString(g_ctx, cstr);
+    } else {
+        JS_FreeValue(g_ctx, JS_GetException(g_ctx));
+        tt_host_out(3, "null", 4);
+    }
+    JS_FreeValue(g_ctx, env);
+}
+
+/* Run the user program. Compiles once, then executes under the park-by-
+   return driver: every step suspends by RETURNING from this export
+   (tt_parked() → 1; continue with tt_resume). On completion emits kind=3
+   with { ok } | { error }. Returns 1 while parked, 0 done. */
+EXPORT("tt_eval") int tt_eval(const char *code, int len)
+{
+    JSValue fn, v;
+    int parked = 0;
+
+    g_exec_kind = TT_EXEC_SCRIPT;
+    g_suppressed = 0;
+    JS_TTCmpClear(g_rt); /* fresh comparison journal per recording */
+    JS_TTEnableStep(g_rt, 1);
+    fn = JS_Eval(g_ctx, code, len, "program.js",
+                 JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(fn)) {
+        JS_TTEnableStep(g_rt, 0);
+        emit_eval_done(fn);
+        return 0;
+    }
+    v = JS_TTCallStart(g_ctx, fn, &parked);
+    if (parked)
+        return 1;
+    JS_TTEnableStep(g_rt, 0);
+    emit_eval_done(v);
+    return 0;
+}
+
+/* Resume a machine parked by return. cmd 0 = continue, 1 = abort. What
+   happens on completion depends on what was being driven: the script emits
+   its result envelope, the job pump keeps draining, the timer runs its
+   post half. Returns 1 while (still) parked. */
+EXPORT("tt_resume") int tt_resume(int cmd)
+{
+    JSValue v;
+    int parked = 0;
+
+    v = JS_TTCallResume(g_ctx, cmd, &parked);
+    if (parked)
+        return 1;
+    if (g_exec_kind == TT_EXEC_JOBS) {
+        JS_FreeValue(g_ctx, v); /* job post ran inside JS_TTCallResume */
+        return pump_jobs_loop();
+    }
+    if (g_exec_kind == TT_EXEC_TIMER) {
+        JS_TTEnableStep(g_rt, 0);
+        return timer_finish(v);
+    }
+    JS_TTEnableStep(g_rt, 0);
+    emit_eval_done(v);
+    return 0;
+}
+
+EXPORT("tt_parked") int tt_parked(void)
+{
+    return JS_TTParked(g_ctx);
+}
+
+/* Inspect / evaluate against a return-parked machine: the frame chain is
+   live in linear memory and no rewind is needed at all. */
+EXPORT("tt_inspect_parked") void tt_inspect_parked(void)
+{
+    g_in_hook = 1;
+    JS_TTEnableStep(g_rt, 0);
+    send_inspection(g_ctx);
+    JS_TTEnableStep(g_rt, 1);
+    g_in_hook = 0;
+}
+
+EXPORT("tt_eval_parked") void tt_eval_parked(int write_back)
+{
+    g_in_hook = 1;
+    JS_TTEnableStep(g_rt, 0);
+    eval_at_pause_mode(g_ctx, write_back);
+    JS_TTEnableStep(g_rt, 1);
+    g_in_hook = 0;
+}
+
+/* Step granularity: 0 = source line, 1 = every opcode. */
+EXPORT("tt_set_granularity") void tt_set_granularity(int g)
+{
+    JS_TTSetGranularity(g_ctx, g);
+}
+
+/* Drain the job queue via the stackless pump; returns 1 while parked. */
+static int pump_jobs_loop(void)
+{
+    int parked = 0, err;
+    char buf[64];
+
+    for (;;) {
+        err = JS_TTPumpJob(JS_GetRuntime(g_ctx), NULL, &parked);
+        if (parked) {
+            g_exec_kind = TT_EXEC_JOBS;
+            return 1;
+        }
+        if (err == 0)
+            break;
+        if (err < 0)
+            JS_FreeValue(g_ctx, JS_GetException(g_ctx));
+        g_jobs_count++;
+        if (g_jobs_count > 10000)
+            break;
+    }
+    JS_TTEnableStep(g_rt, 0);
+    g_exec_kind = TT_EXEC_SCRIPT;
+    snprintf(buf, sizeof(buf), "{\"jobs\":%d}", g_jobs_count);
+    tt_host_out(4, buf, (int)strlen(buf));
+    return 0;
+}
+
+/* Run pending promise jobs (each job steppable, callbacks park by return).
+   Emits kind=4 when the queue is drained. Returns 1 while parked. */
+EXPORT("tt_run_jobs") int tt_run_jobs(void)
+{
+    g_jobs_count = 0;
+    JS_TTEnableStep(g_rt, 1);
+    return pump_jobs_loop();
+}
+
+EXPORT("tt_timer_count") int tt_timer_count(void)
+{
+    JSValue v;
+    int32_t n = 0;
+    v = JS_Call(g_ctx, g_timer_count_fn, JS_UNDEFINED, 0, NULL);
+    JS_ToInt32(g_ctx, &n, v);
+    JS_FreeValue(g_ctx, v);
+    return n;
+}
+
+/* parked-timer continuation (statics live in the snapshot) */
+static JSValue g_timer_fn;
+static JSValue g_timer_args[8];
+static int g_timer_alen;
+static double g_timer_at;
+
+static int timer_finish(JSValue r)
+{
+    int i;
+    char buf[96];
+
+    if (JS_IsException(r)) {
+        JSValue exc = JS_GetException(g_ctx);
+        JSValue args2[1];
+        JSValue rr;
+        args2[0] = exc;
+        rr = JS_Call(g_ctx, g_rejected_fn, JS_UNDEFINED, 1, (JSValueConst *)args2);
+        JS_FreeValue(g_ctx, rr);
+        JS_FreeValue(g_ctx, exc);
+    }
+    JS_FreeValue(g_ctx, r);
+    for (i = 0; i < g_timer_alen; i++)
+        JS_FreeValue(g_ctx, g_timer_args[i]);
+    JS_FreeValue(g_ctx, g_timer_fn);
+    g_timer_fn = JS_UNDEFINED;
+    g_timer_alen = 0;
+    g_exec_kind = TT_EXEC_SCRIPT;
+    snprintf(buf, sizeof(buf), "{\"at\":%.0f}", g_timer_at);
+    tt_host_out(5, buf, (int)strlen(buf));
+    return 0;
+}
+
+/* Fire the next due virtual timer (steppable; the callback parks by
+   return). Emits kind=5 when done. Returns 1 while parked. */
+EXPORT("tt_fire_timer") int tt_fire_timer(void)
+{
+    JSValue tuple, fnargs, atv, r;
+    int64_t i, alen = 0;
+    int parked = 0;
+
+    tuple = JS_Call(g_ctx, g_timer_pop_fn, JS_UNDEFINED, 0, NULL);
+    if (!JS_IsObject(tuple)) {
+        JS_FreeValue(g_ctx, tuple);
+        tt_host_out(5, "{\"idle\":true}", 13);
+        return 0;
+    }
+    g_timer_at = 0;
+    g_timer_fn = JS_GetPropertyUint32(g_ctx, tuple, 0);
+    fnargs = JS_GetPropertyUint32(g_ctx, tuple, 1);
+    atv = JS_GetPropertyUint32(g_ctx, tuple, 2);
+    JS_ToFloat64(g_ctx, &g_timer_at, atv);
+    JS_FreeValue(g_ctx, atv);
+    JS_FreeValue(g_ctx, tuple);
+
+    if (g_timer_at > JS_TTGetVirtualTime())
+        JS_TTSetVirtualTime(g_timer_at, 1);
+
+    {
+        JSValue lenv = JS_GetPropertyStr(g_ctx, fnargs, "length");
+        JS_ToInt64(g_ctx, &alen, lenv);
+        JS_FreeValue(g_ctx, lenv);
+    }
+    if (alen > 8) alen = 8;
+    for (i = 0; i < alen; i++)
+        g_timer_args[i] = JS_GetPropertyUint32(g_ctx, fnargs, (uint32_t)i);
+    g_timer_alen = (int)alen;
+    JS_FreeValue(g_ctx, fnargs);
+
+    JS_TTEnableStep(g_rt, 1);
+    r = JS_TTCallArgs(g_ctx, g_timer_fn, JS_UNDEFINED, g_timer_alen,
+                      (JSValueConst *)g_timer_args, &parked);
+    if (parked) {
+        g_exec_kind = TT_EXEC_TIMER;
+        return 1;
+    }
+    JS_TTEnableStep(g_rt, 0);
+    return timer_finish(r);
+}
+
+EXPORT("tt_pending_jobs") int tt_pending_jobs(void)
+{
+    return JS_IsJobPending(g_rt);
+}
+
+EXPORT("tt_vtime") double tt_vtime_get(void)
+{
+    return JS_TTGetVirtualTime();
+}
+
+/* Inspection for the idle (finished) position: globals only, no frames. */
+EXPORT("tt_inspect_idle") void tt_inspect_idle(void)
+{
+    JSValue obj = JS_NewObject(g_ctx);
+    JSValue globals;
+    JS_DefinePropertyValueStr(g_ctx, obj, "stack", JS_NewArray(g_ctx), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(g_ctx, obj, "frames", JS_NewArray(g_ctx), JS_PROP_C_W_E);
+    globals = JS_Call(g_ctx, g_globals_fn, JS_UNDEFINED, 0, NULL);
+    if (JS_IsException(globals)) {
+        JS_FreeValue(g_ctx, JS_GetException(g_ctx));
+        globals = JS_NewObject(g_ctx);
+    }
+    JS_DefinePropertyValueStr(g_ctx, obj, "globals", globals, JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(g_ctx, obj, "lexicals", JS_TTGlobalLexicals(g_ctx), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(g_ctx, obj, "__ttInspect", JS_TRUE, 0);
+    send_json_value(g_ctx, 1, obj);
+    JS_FreeValue(g_ctx, obj);
+}
+
+/* Console evaluation against the idle (finished) state. */
+EXPORT("tt_eval_idle") void tt_eval_idle(void)
+{
+    eval_at_pause(g_ctx);
+}
+
+/* Fresh context for a new debugging session (the runtime survives). */
+EXPORT("tt_reset") int tt_reset(void)
+{
+    JSValue glob, natfn;
+
+    JS_FreeValue(g_ctx, g_ser_fn);
+    JS_FreeValue(g_ctx, g_envelope_fn);
+    JS_FreeValue(g_ctx, g_globals_fn);
+    JS_FreeValue(g_ctx, g_timer_count_fn);
+    JS_FreeValue(g_ctx, g_timer_pop_fn);
+    JS_FreeValue(g_ctx, g_rejected_fn);
+    JS_FreeValue(g_ctx, g_dom_build_fn);
+    JS_FreeValue(g_ctx, g_set_url_fn);
+    JS_TTCmpClear(g_rt);
+    tt_dom_destroy();
+    JS_FreeContext(g_ctx);
+    JS_TTSetVirtualTime(0, 1);
+    g_ctx = JS_NewContext(g_rt);
+    if (!g_ctx)
+        return 2;
+    JS_TTResetExecState(g_ctx);
+    g_exec_kind = TT_EXEC_SCRIPT;
+    g_timer_fn = JS_UNDEFINED; /* abandoned parked-timer state, if any */
+    g_timer_alen = 0;
+    g_ser_fn = g_envelope_fn = g_globals_fn = JS_UNDEFINED;
+    g_timer_count_fn = g_timer_pop_fn = g_rejected_fn = JS_UNDEFINED;
+    g_dom_build_fn = g_set_url_fn = JS_UNDEFINED;
+    glob = JS_GetGlobalObject(g_ctx);
+    natfn = JS_NewCFunction(g_ctx, js_tt_console, "__tt_nat_console", 2);
+    JS_SetPropertyStr(g_ctx, glob, "__tt_nat_console", natfn);
+    JS_FreeValue(g_ctx, glob);
+    tt_dom_register(g_ctx);
+    if (eval_setup_slot(0))
+        return 3;
+    JS_TTSetStepFilename(g_ctx, "program.js");
+    return 0;
+}
+
+EXPORT("tt_alloc") void *tt_alloc(int n) { return malloc((size_t)n); }
+EXPORT("tt_free") void tt_free(void *p) { free(p); }
+
+/* Load an HTML document for this session (call after tt_init/tt_reset,
+   before tt_eval). Parses via Lexbor into THIS linear memory and builds
+   the self-hosted DOM API. Returns 0 on success. */
+static char *tt_json_str(char *w, const char *s)
+{
+    *w++ = '"';
+    for (; *s; s++) {
+        if (*s == '"' || *s == '\\')
+            *w++ = '\\';
+        *w++ = *s;
+    }
+    *w++ = '"';
+    return w;
+}
+
+/* The comparison journal OF THE CURRENT MACHINE STATE as JSON:
+   [[op, lhs, rhs], ...] with op 0 eq / 1 includes / 2 startsWith /
+   3 endsWith / 4 indexOf. Position the memory first — each timeline
+   reads back its own comparisons. malloc'd; caller tt_free's. */
+EXPORT("tt_cmp_json") char *tt_cmp_json(void)
+{
+    int n = JS_TTCmpCount(g_rt), i, op;
+    const char *a, *b;
+    char *out, *w;
+
+    out = malloc((size_t)n * 300 + 8);
+    if (!out)
+        return NULL;
+    w = out;
+    *w++ = '[';
+    for (i = 0; i < n; i++) {
+        if (JS_TTCmpGet(g_rt, i, &op, &a, &b))
+            break;
+        if (i)
+            *w++ = ',';
+        *w++ = '[';
+        *w++ = (char)('0' + op);
+        *w++ = ',';
+        w = tt_json_str(w, a);
+        *w++ = ',';
+        w = tt_json_str(w, b);
+        *w++ = ']';
+    }
+    *w++ = ']';
+    *w = 0;
+    return out;
+}
+
+/* Set the session's location BEFORE tt_eval — the program reads its URL
+   parameters off this. Returns 0 on success, 1 for an unparsable URL. */
+EXPORT("tt_set_url") int tt_set_url(const char *href, int len)
+{
+    JSValue s, r;
+    s = JS_NewStringLen(g_ctx, href, (size_t)len);
+    r = JS_Call(g_ctx, g_set_url_fn, JS_UNDEFINED, 1, &s);
+    JS_FreeValue(g_ctx, s);
+    if (JS_IsException(r)) {
+        JS_FreeValue(g_ctx, JS_GetException(g_ctx));
+        return 1;
+    }
+    JS_FreeValue(g_ctx, r);
+    return 0;
+}
+
+EXPORT("tt_dom_load") int tt_dom_load(const char *html, int len)
+{
+    JSValue r;
+    int rc = tt_dom_load_html(html, (size_t)len);
+    if (rc)
+        return rc;
+    r = JS_Call(g_ctx, g_dom_build_fn, JS_UNDEFINED, 0, NULL);
+    if (JS_IsException(r)) {
+        JS_FreeValue(g_ctx, JS_GetException(g_ctx));
+        return 100;
+    }
+    JS_FreeValue(g_ctx, r);
+    return 0;
+}
+#endif /* __wasi__ */

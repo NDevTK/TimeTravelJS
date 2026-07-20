@@ -37,6 +37,20 @@ const OUT_TIMER_DONE = 5
 
 const LEVELS = ["log", "info", "warn", "error"]
 
+// Interim: the shrinking JS substrate file, delivered into the VM by vm.js
+// until its remaining blocks finish moving to native C inside the engine.
+async function defaultSetupSrc() {
+  const url = new URL("./vm/tt-setup.js", import.meta.url)
+  if (url.protocol !== "file:" && typeof fetch === "function") {
+    const r = await fetch(url)
+    if (!r.ok) throw new Error(`failed to load tt-setup.js: ${r.status}`)
+    return await r.text()
+  }
+  const { readFileSync } = await import("node:fs")
+  const { fileURLToPath } = await import("node:url")
+  return readFileSync(fileURLToPath(url), "utf8")
+}
+
 /**
  * Goal specs: a bare expression, a list (all must hold), or
  * {all: [...], any: [...], none: [...]} — real invariants are usually
@@ -72,11 +86,12 @@ const envTruthy = (v) => {
 }
 
 export class TimeTravelEngine {
-  static async create(wasmBytes) {
+  static async create(wasmBytes, opts = {}) {
     const engine = new TimeTravelEngine()
     engine.vm = await QuickJSVM.instantiate(wasmBytes, {
       onOut: (kind, text) => engine._onOut(kind, text),
       onInterrupt: () => now() > engine._deadline,
+      setupSrc: opts.setupSrc ?? (await defaultSetupSrc()),
     })
     engine._resetSession()
     return engine

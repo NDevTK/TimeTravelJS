@@ -3,7 +3,7 @@
 //   node native/build.mjs [--debug]      → dist/quickjs-tt.wasm
 //
 // Pipeline:
-//   1. clang (wasm32-wasi) compiles QuickJS + tt-wrap.c
+//   1. clang (wasm32-wasi) compiles the QuickJS fork (host interface included) + tt-dom.c
 //   2. Binaryen runs the Asyncify pass (suspendable import env.tt_host_step),
 //      optimizes, and exports the shadow __stack_pointer global
 //   3. native/barrier.mjs instruments every store with the dirty-page write
@@ -28,7 +28,6 @@ const rawWasm = join(out, "quickjs-tt.raw.wasm")
 const finalWasm = join(out, "quickjs-tt.wasm")
 
 const sources = ["quickjs.c", "cutils.c", "libregexp.c", "libunicode.c", "dtoa.c"].map((f) => join(qjs, f))
-sources.push(join(root, "native/tt-wrap.c"))
 sources.push(join(root, "native/tt-dom.c"))
 
 // Lexbor: the DOM/CSS engine shares this linear memory, so the document

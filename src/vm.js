@@ -40,6 +40,16 @@ export class QuickJSVM {
     vm.dirtyMapSize = vm.exports.tt_dirty_map_size()
     const rc = vm.exports.tt_init()
     if (rc !== 0) throw new Error(`tt_init failed: ${rc}`)
+    if (hooks.setupSrc) {
+      // Interim: the shrinking JS substrate (src/vm/tt-setup.js) — being
+      // ported block-by-block to native C inside the engine itself.
+      const bytes = te.encode(hooks.setupSrc)
+      const ptr = vm.exports.tt_alloc(bytes.length)
+      new Uint8Array(vm.memory.buffer, ptr, bytes.length).set(bytes)
+      const rc2 = vm.exports.tt_load_setup(0, ptr, bytes.length)
+      vm.exports.tt_free(ptr)
+      if (rc2 !== 0) throw new Error(`tt_load_setup failed: ${rc2}`)
+    }
     return vm
   }
 

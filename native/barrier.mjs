@@ -1,7 +1,7 @@
 // Write-barrier instrumentation pass over a WebAssembly binary.
 //
 // Rewrites every memory store so it also marks the touched 1 KB page(s) in a
-// byte map inside linear memory (`g_tt_dirty` in tt-wrap.c):
+// byte map inside linear memory (`g_tt_dirty` in the quickjs.c host section):
 //
 //     g_tt_dirty[(addr + offset) >> 10] = 1        (and the end page, when
 //     g_tt_dirty[(addr + offset + size-1) >> 10] = 1    the access can straddle)
