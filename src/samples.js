@@ -131,6 +131,61 @@ console.log("main script done, rolled dice:", Math.floor(Math.random() * 6) + 1)
 `,
   },
   {
+    id: "website",
+    name: "Website (URL params, storage, feature flags)",
+    url: "https://news.example/?user=ada",
+    html: `<style>
+  body { background: white; color: #223; }
+  body.dark { background: #10141d; color: #dde; }
+  body.solar { background: #fdf6e3; color: #586e75; }
+  .hidden { display: none; }
+  #status { font-size: 12px; color: #789; }
+</style>
+<h1 id="title">the daily paradox</h1>
+<section id="beta-panel" class="hidden"><p>🧪 beta tools</p></section>
+<p id="status"></p>
+`,
+    code: `// A tiny "site": its configuration comes from the URL, localStorage
+// and postMessage. Try the probe
+//   !document.getElementById("beta-panel").classList.contains("hidden")
+// then press "?⑂ inputs" — the debugger probes every input the page
+// consulted with canary values and LEARNS real ones by running code
+// branches: each alternate run's own comparisons teach the next
+// candidate ("theme" === "solar", data === "debug:on"), and inputs
+// whose logic never ran as-recorded are probed first.
+const params = new URLSearchParams(location.search);
+
+// dormant logic: no message ever arrives on this page as recorded — the
+// input search wakes the handler and learns its payload from the
+// handler's own comparison (try the probe
+//   document.getElementById("title").classList.contains("debug") )
+window.addEventListener("message", (e) => {
+  if (e.data === "debug:on") {
+    document.getElementById("title").classList.add("debug");
+  }
+});
+
+// colour preference: ?theme=... wins, else the stored preference
+const saved = localStorage.getItem("theme");
+const theme = params.get("theme") || saved || "light";
+if (theme === "dark" || theme === "solar") {
+  document.body.classList.add(theme);
+  localStorage.setItem("theme", theme);
+}
+
+// feature flag: ?beta=1 reveals the hidden panel
+if (params.get("beta") === "1") {
+  document.getElementById("beta-panel").classList.remove("hidden");
+}
+
+const who = params.get("user") || "anonymous";
+document.getElementById("status").textContent =
+  who + " · theme " + theme + (params.get("beta") === "1" ? " · beta on" : "");
+console.log(location.href);
+console.log("theme:", theme, "| beta:", params.get("beta"), "| stored:", localStorage.getItem("theme"));
+`,
+  },
+  {
     id: "dom",
     name: "DOM + CSS (document time travel)",
     html: `<style>

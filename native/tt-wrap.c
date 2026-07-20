@@ -61,6 +61,7 @@ static JSValue g_timer_pop_fn;  /* () -> [fn, argsArray, at] | null       */
 static JSValue g_timer_count_fn;/* () -> int                              */
 static JSValue g_rejected_fn;
 static JSValue g_dom_build_fn;   /* (reason) -> void (console error)       */
+static JSValue g_set_url_fn;     /* (href) -> void — session location init */
 static int g_in_hook;           /* re-entrancy guard for inspect/eval     */
 static char g_arg_buf[65536];
 
@@ -808,6 +809,175 @@ static const char SETUP_SRC[] =
 "    return JSON.stringify(isError ? { error: ser(value, MAXD, []) } : { ok: ser(value, MAXD, []) });\n"
 "  }\n"
 "  function rejected(reason) { consoleOut(3, ['Unhandled promise rejection:', reason]); }\n"
+"  /* ---- web-platform substrate: URL, location, storage -----------------\n"
+"     Self-hosted IN the machine so it snapshots, scrubs and forks with\n"
+"     everything else. Read registries record which URL parameters and\n"
+"     storage keys the program actually consulted — the raw material for\n"
+"     the engine's parameter search. */\n"
+"  const paramReads = new Set();\n"
+"  const storageReads = new Set();\n"
+"  function parseSearch(qs) {\n"
+"    const out = [];\n"
+"    const s = String(qs == null ? '' : qs).replace(/^\\?/, '');\n"
+"    if (s) for (const part of s.split('&')) {\n"
+"      if (!part) continue;\n"
+"      const i = part.indexOf('=');\n"
+"      const k = i < 0 ? part : part.slice(0, i);\n"
+"      const v = i < 0 ? '' : part.slice(i + 1);\n"
+"      out.push([decodeURIComponent(k.replace(/\\+/g, ' ')), decodeURIComponent(v.replace(/\\+/g, ' '))]);\n"
+"    }\n"
+"    return out;\n"
+"  }\n"
+"  class URLSearchParams {\n"
+"    constructor(init) {\n"
+"      this.__l = typeof init === 'string' ? parseSearch(init)\n"
+"        : init instanceof URLSearchParams ? init.__l.map((e) => e.slice())\n"
+"        : Array.isArray(init) ? init.map((e) => [String(e[0]), String(e[1])])\n"
+"        : init && typeof init === 'object' ? Object.keys(init).map((k) => [k, String(init[k])])\n"
+"        : [];\n"
+"    }\n"
+"    get(k) { paramReads.add(String(k)); const e = this.__l.find((x) => x[0] === String(k)); return e ? e[1] : null; }\n"
+"    getAll(k) { paramReads.add(String(k)); return this.__l.filter((x) => x[0] === String(k)).map((x) => x[1]); }\n"
+"    has(k) { paramReads.add(String(k)); return this.__l.some((x) => x[0] === String(k)); }\n"
+"    set(k, v) { const l = this.__l.filter((x) => x[0] !== String(k)); l.push([String(k), String(v)]); this.__l = l; }\n"
+"    append(k, v) { this.__l.push([String(k), String(v)]); }\n"
+"    delete(k) { this.__l = this.__l.filter((x) => x[0] !== String(k)); }\n"
+"    forEach(fn, self) { for (const e of this.__l.slice()) fn.call(self, e[1], e[0], this); }\n"
+"    keys() { return this.__l.map((e) => e[0])[Symbol.iterator](); }\n"
+"    values() { return this.__l.map((e) => e[1])[Symbol.iterator](); }\n"
+"    entries() { return this.__l.map((e) => e.slice())[Symbol.iterator](); }\n"
+"    [Symbol.iterator]() { return this.entries(); }\n"
+"    get size() { return this.__l.length; }\n"
+"    toString() {\n"
+"      return this.__l.map((e) => encodeURIComponent(e[0]) + '=' + encodeURIComponent(e[1])).join('&');\n"
+"    }\n"
+"  }\n"
+"  class URL {\n"
+"    constructor(href, base) {\n"
+"      let h = String(href);\n"
+"      if (base != null && !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(h)) {\n"
+"        const b = base instanceof URL ? base : new URL(String(base));\n"
+"        h = h.startsWith('/') ? b.origin + h\n"
+"          : b.origin + b.pathname.replace(/[^/]*$/, '') + h;\n"
+"      }\n"
+"      const m = /^([a-zA-Z][a-zA-Z0-9+.-]*):\\/\\/([^/?#]*)([^?#]*)(\\?[^#]*)?(#.*)?$/.exec(h);\n"
+"      if (!m) throw new TypeError('Invalid URL: ' + h);\n"
+"      this.protocol = m[1] + ':';\n"
+"      this.host = m[2];\n"
+"      this.pathname = m[3] || '/';\n"
+"      this.hash = m[5] || '';\n"
+"      this.__sp = new URLSearchParams(m[4] || '');\n"
+"    }\n"
+"    get searchParams() { return this.__sp; }\n"
+"    get search() { const q = this.__sp.toString(); return q ? '?' + q : ''; }\n"
+"    set search(v) { this.__sp = new URLSearchParams(String(v)); }\n"
+"    get origin() { return this.protocol + '//' + this.host; }\n"
+"    get hostname() { return this.host.replace(/:\\d+$/, ''); }\n"
+"    get port() { const i = this.host.indexOf(':'); return i < 0 ? '' : this.host.slice(i + 1); }\n"
+"    get href() { return this.origin + this.pathname + this.search + this.hash; }\n"
+"    set href(v) {\n"
+"      const u = new URL(String(v));\n"
+"      this.protocol = u.protocol; this.host = u.host; this.pathname = u.pathname;\n"
+"      this.hash = u.hash; this.__sp = u.__sp;\n"
+"    }\n"
+"    toString() { return this.href; }\n"
+"    toJSON() { return this.href; }\n"
+"  }\n"
+"  const loc = { u: new URL('https://example.test/') };\n"
+"  class Location {\n"
+"    get href() { return loc.u.href; }\n"
+"    set href(v) { loc.u = new URL(String(v), loc.u); }\n"
+"    get origin() { return loc.u.origin; }\n"
+"    get protocol() { return loc.u.protocol; }\n"
+"    get host() { return loc.u.host; }\n"
+"    get hostname() { return loc.u.hostname; }\n"
+"    get port() { return loc.u.port; }\n"
+"    get pathname() { return loc.u.pathname; }\n"
+"    set pathname(v) { loc.u.pathname = String(v); }\n"
+"    get search() { return loc.u.search; }\n"
+"    set search(v) { loc.u.search = String(v); }\n"
+"    get hash() { return loc.u.hash; }\n"
+"    set hash(v) { const s = String(v); loc.u.hash = !s || s.startsWith('#') ? s : '#' + s; }\n"
+"    assign(v) { this.href = v; }\n"
+"    replace(v) { this.href = v; }\n"
+"    reload() {}\n"
+"    toString() { return this.href; }\n"
+"    get __paramReads() { return Array.from(paramReads); }\n"
+"  }\n"
+"  function makeStorage() {\n"
+"    const m = new Map();\n"
+"    return {\n"
+"      getItem(k) { storageReads.add(String(k)); return m.has(String(k)) ? m.get(String(k)) : null; },\n"
+"      setItem(k, v) { m.set(String(k), String(v)); },\n"
+"      removeItem(k) { m.delete(String(k)); },\n"
+"      clear() { m.clear(); },\n"
+"      key(i) { const a = Array.from(m.keys()); return i >= 0 && i < a.length ? a[i] : null; },\n"
+"      get length() { return m.size; },\n"
+"      get __reads() { return Array.from(storageReads); },\n"
+"      get __keys() { return Array.from(m.keys()); },\n"
+"    };\n"
+"  }\n"
+"  G.URL = URL; G.URLSearchParams = URLSearchParams;\n"
+"  G.location = new Location();\n"
+"  G.localStorage = makeStorage();\n"
+"  G.sessionStorage = makeStorage();\n"
+"  for (const n of ['URL', 'URLSearchParams', 'location', 'localStorage', 'sessionStorage'])\n"
+"    baseline.add(n);\n"
+"  function setURL(href) { loc.u = new URL(String(href)); }\n"
+"  /* ---- postMessage: an external input channel -------------------------\n"
+"     Messages queue in-machine and every handler sees every message\n"
+"     exactly once — so a message posted at a fork anchor (before the\n"
+"     program ran a single line) still reaches handlers registered later\n"
+"     in the run. __msgProbe builds a recording payload: property reads\n"
+"     return marked strings, so the comparison journal reveals which keys\n"
+"     an object protocol consults and what it tests them against. */\n"
+"  const msgs = [];\n"
+"  const msgHandlers = [];\n"
+"  const winEvents = new Set();\n"
+"  function msgFlush() {\n"
+"    for (const h of msgHandlers)\n"
+"      while (h.seen < msgs.length) {\n"
+"        const data = msgs[h.seen++];\n"
+"        h.fn.call(G, { type: 'message', data: data, origin: loc.u.origin, source: null, lastEventId: '', ports: [] });\n"
+"      }\n"
+"  }\n"
+"  G.postMessage = function (data) { msgs.push(data); msgFlush(); };\n"
+"  G.addEventListener = function (type, fn) {\n"
+"    winEvents.add(String(type));\n"
+"    if (String(type) === 'message' && typeof fn === 'function') { msgHandlers.push({ fn: fn, seen: 0 }); msgFlush(); }\n"
+"  };\n"
+"  G.removeEventListener = function (type, fn) {\n"
+"    for (let i = 0; i < msgHandlers.length; i++)\n"
+"      if (msgHandlers[i].fn === fn) { msgHandlers.splice(i, 1); return; }\n"
+"  };\n"
+"  let onmsg = null;\n"
+"  Object.defineProperty(G, 'onmessage', {\n"
+"    configurable: true,\n"
+"    get: function () { return onmsg ? onmsg.fn : null; },\n"
+"    set: function (fn) {\n"
+"      if (onmsg) { const i = msgHandlers.indexOf(onmsg); if (i >= 0) msgHandlers.splice(i, 1); onmsg = null; }\n"
+"      if (typeof fn === 'function') { winEvents.add('message'); onmsg = { fn: fn, seen: 0 }; msgHandlers.push(onmsg); msgFlush(); }\n"
+"    },\n"
+"  });\n"
+"  G.__messageStats = function () {\n"
+"    return { handlers: msgHandlers.length, posted: msgs.length, types: Array.from(winEvents) };\n"
+"  };\n"
+"  G.__msgProbe = function (m, over) {\n"
+"    m = String(m);\n"
+"    over = over && typeof over === 'object' ? over : {};\n"
+"    return new Proxy({}, {\n"
+"      get: function (t, k) {\n"
+"        if (k === Symbol.toPrimitive || k === 'toString' || k === 'valueOf' || k === 'toJSON') return function () { return m; };\n"
+"        if (typeof k !== 'string') return undefined;\n"
+"        if (Object.prototype.hasOwnProperty.call(over, k)) return over[k];\n"
+"        return m + '.' + k;\n"
+"      },\n"
+"      has: function () { return true; },\n"
+"    });\n"
+"  };\n"
+"  G.window = G;\n"
+"  for (const n of ['postMessage', 'addEventListener', 'removeEventListener', 'onmessage', '__messageStats', '__msgProbe', 'window'])\n"
+"    baseline.add(n);\n"
 "  /* ---- DOM self-host over the __dom leaf primitives (Lexbor) ----------\n"
 "     Everything here is bytecode: user event handlers, callbacks touching\n"
 "     the DOM, style reads — all park like any other code. The C layer only\n"
@@ -1120,7 +1290,7 @@ static const char SETUP_SRC[] =
 "      return out;\n"
 "    };\n"
 "  }\n"
-"  return { serTop: serTop, envelope: envelope, userGlobals: userGlobals, timerCount: timerCount, timerPop: timerPop, rejected: rejected, buildDOM: buildDOM };\n"
+"  return { serTop: serTop, envelope: envelope, userGlobals: userGlobals, timerCount: timerCount, timerPop: timerPop, rejected: rejected, buildDOM: buildDOM, setURL: setURL };\n"
 "})()\n";
 
 /* ------------------------------------------------------------------------ */
@@ -1154,6 +1324,7 @@ EXPORT("tt_init") int tt_init(void)
     g_timer_pop_fn = JS_GetPropertyStr(g_ctx, setup, "timerPop");
     g_rejected_fn = JS_GetPropertyStr(g_ctx, setup, "rejected");
     g_dom_build_fn = JS_GetPropertyStr(g_ctx, setup, "buildDOM");
+    g_set_url_fn = JS_GetPropertyStr(g_ctx, setup, "setURL");
     JS_FreeValue(g_ctx, setup);
 
     JS_TTSetStepHandler(g_rt, tt_step_handler, NULL);
@@ -1201,6 +1372,7 @@ EXPORT("tt_eval") int tt_eval(const char *code, int len)
 
     g_exec_kind = TT_EXEC_SCRIPT;
     g_suppressed = 0;
+    JS_TTCmpClear(g_rt); /* fresh comparison journal per recording */
     JS_TTEnableStep(g_rt, 1);
     fn = JS_Eval(g_ctx, code, len, "program.js",
                  JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
@@ -1445,6 +1617,8 @@ EXPORT("tt_reset") int tt_reset(void)
     JS_FreeValue(g_ctx, g_timer_pop_fn);
     JS_FreeValue(g_ctx, g_rejected_fn);
     JS_FreeValue(g_ctx, g_dom_build_fn);
+    JS_FreeValue(g_ctx, g_set_url_fn);
+    JS_TTCmpClear(g_rt);
     tt_dom_destroy();
     JS_FreeContext(g_ctx);
     JS_TTSetVirtualTime(0, 1);
@@ -1470,6 +1644,7 @@ EXPORT("tt_reset") int tt_reset(void)
     g_timer_pop_fn = JS_GetPropertyStr(g_ctx, setup, "timerPop");
     g_rejected_fn = JS_GetPropertyStr(g_ctx, setup, "rejected");
     g_dom_build_fn = JS_GetPropertyStr(g_ctx, setup, "buildDOM");
+    g_set_url_fn = JS_GetPropertyStr(g_ctx, setup, "setURL");
     JS_FreeValue(g_ctx, setup);
     JS_TTSetStepFilename(g_ctx, "program.js");
     return 0;
@@ -1481,6 +1656,67 @@ EXPORT("tt_free") void tt_free(void *p) { free(p); }
 /* Load an HTML document for this session (call after tt_init/tt_reset,
    before tt_eval). Parses via Lexbor into THIS linear memory and builds
    the self-hosted DOM API. Returns 0 on success. */
+static char *tt_json_str(char *w, const char *s)
+{
+    *w++ = '"';
+    for (; *s; s++) {
+        if (*s == '"' || *s == '\\')
+            *w++ = '\\';
+        *w++ = *s;
+    }
+    *w++ = '"';
+    return w;
+}
+
+/* The comparison journal OF THE CURRENT MACHINE STATE as JSON:
+   [[op, lhs, rhs], ...] with op 0 eq / 1 includes / 2 startsWith /
+   3 endsWith / 4 indexOf. Position the memory first — each timeline
+   reads back its own comparisons. malloc'd; caller tt_free's. */
+EXPORT("tt_cmp_json") char *tt_cmp_json(void)
+{
+    int n = JS_TTCmpCount(g_rt), i, op;
+    const char *a, *b;
+    char *out, *w;
+
+    out = malloc((size_t)n * 300 + 8);
+    if (!out)
+        return NULL;
+    w = out;
+    *w++ = '[';
+    for (i = 0; i < n; i++) {
+        if (JS_TTCmpGet(g_rt, i, &op, &a, &b))
+            break;
+        if (i)
+            *w++ = ',';
+        *w++ = '[';
+        *w++ = (char)('0' + op);
+        *w++ = ',';
+        w = tt_json_str(w, a);
+        *w++ = ',';
+        w = tt_json_str(w, b);
+        *w++ = ']';
+    }
+    *w++ = ']';
+    *w = 0;
+    return out;
+}
+
+/* Set the session's location BEFORE tt_eval — the program reads its URL
+   parameters off this. Returns 0 on success, 1 for an unparsable URL. */
+EXPORT("tt_set_url") int tt_set_url(const char *href, int len)
+{
+    JSValue s, r;
+    s = JS_NewStringLen(g_ctx, href, (size_t)len);
+    r = JS_Call(g_ctx, g_set_url_fn, JS_UNDEFINED, 1, &s);
+    JS_FreeValue(g_ctx, s);
+    if (JS_IsException(r)) {
+        JS_FreeValue(g_ctx, JS_GetException(g_ctx));
+        return 1;
+    }
+    JS_FreeValue(g_ctx, r);
+    return 0;
+}
+
 EXPORT("tt_dom_load") int tt_dom_load(const char *html, int len)
 {
     JSValue r;

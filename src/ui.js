@@ -154,6 +154,7 @@ export class DebuggerUI {
     this.els = {
       sampleSelect: $("#sample-select"),
       htmlInput: $("#html-input"),
+      urlInput: $("#url-input"),
       domPanel: $("#panel-dom"),
       domFrame: $("#dom-preview"),
       granularitySelect: $("#granularity-select"),
@@ -181,6 +182,7 @@ export class DebuggerUI {
       whatifProbe: $("#whatif-probe"),
       whatifSuggest: $("#whatif-suggest"),
       whatifRun: $("#whatif-run"),
+      whatifParams: $("#whatif-params"),
       whatifResults: $("#whatif-results"),
     }
     this._evalByBranch = new Map() // branchId -> saved evalEntries of that view
@@ -204,6 +206,7 @@ export class DebuggerUI {
       if (sample) {
         this.els.code.value = sample.code
         if (this.els.htmlInput) this.els.htmlInput.value = sample.html || ""
+        if (this.els.urlInput) this.els.urlInput.value = sample.url || ""
         this.refreshGutter()
         this.record()
       }
@@ -434,11 +437,13 @@ export class DebuggerUI {
     this.setStatus("busy", "recording…")
     try {
       const htmlSrc = this.els.htmlInput?.value ?? ""
+      const urlSrc = this.els.urlInput?.value ?? ""
       const summary = await this.engine.run(
         this.els.code.value,
         {
           granularity: this.els.granularitySelect?.value === "opcode" ? "opcode" : "line",
           html: htmlSrc.trim() ? htmlSrc : undefined,
+          url: urlSrc.trim() ? urlSrc : undefined,
         },
         (p) => this.setStatus("busy", `recording… ${p.steps} steps · ${p.checkpoints} snapshots`),
       )
@@ -571,6 +576,7 @@ export class DebuggerUI {
 
   _wireWhatIf() {
     this.els.whatifRun?.addEventListener("click", () => this.runWhatIf())
+    this.els.whatifParams?.addEventListener("click", () => this.runParamSearch())
     this.els.whatifSuggest?.addEventListener("click", () => {
       if (this.recording || !this.summary || !this.engine.suggestEdits) return
       try {
@@ -618,6 +624,79 @@ export class DebuggerUI {
     } finally {
       this.recording = false
       this.els.runBtn.disabled = false
+    }
+  }
+
+  /** "?⑂ inputs": which ?param / storage value / message reaches the goal? */
+  async runParamSearch() {
+    if (this.recording || !this.summary || !this.engine.exploreParams) return
+    const goal = (this.els.whatifProbe?.value ?? "").trim()
+    if (!goal) {
+      this.setStatus("ok", "input search: put a goal expression in the probe field first")
+      return
+    }
+    this.stopPlay()
+    this.recording = true
+    this.els.runBtn.disabled = true
+    this.setStatus("busy", "?⑂ probing external inputs — learning values from the code's own branches…")
+    try {
+      const r = await this.engine.exploreParams({
+        goal,
+        onProgress: (p) => this.setStatus("busy", `?⑂ round ${p.round} · ${p.explored} runs · ${p.found} satisfy the goal`),
+      })
+      this.summary = this.engine.summary()
+      this.renderParamResults(goal, r)
+      this.renderBranches()
+      this.renderMemory()
+      this.setStatus(
+        "ok",
+        r.alreadyTrue
+          ? "the goal already holds on this run"
+          : `?⑂ ${r.examples.length} of ${r.explored} learned candidate runs reach the goal`,
+      )
+    } catch (err) {
+      this.setStatus("err", String(err.message || err))
+    } finally {
+      this.recording = false
+      this.els.runBtn.disabled = false
+    }
+  }
+
+  /** provenance chain of a learned value: probe → startsWith "pref:" → eq "gold" */
+  viaText(assignments) {
+    const parts = []
+    for (const a of assignments ?? []) {
+      for (const v of a.via ?? []) {
+        if (v.op === "probe") parts.push("probe")
+        else if (v.op === "as-run" || v.op === "seed") parts.push(`${v.op} "${v.value}"`)
+        else parts.push(`${v.op}${v.key ? ` .${v.key}` : ""} → "${v.learned ?? ""}"`)
+      }
+    }
+    return parts.join(" · ")
+  }
+
+  renderParamResults(goal, r) {
+    const box = this.els.whatifResults
+    if (!box) return
+    box.textContent = ""
+    box.append(el("div", "whatif-head", r.alreadyTrue ? `already true as-run · ${goal}` : `input search · goal: ${goal}`))
+    for (const ex of r.examples) {
+      const row = el("button", "whatif-result")
+      row.append(span("whatif-edit", ex.search ?? ex.edit))
+      const out = span("whatif-outcome")
+      out.append(span("v-punct", `→ ${ex.steps} steps`))
+      if (ex.newLines?.length) out.append(span("whatif-first", ` +${ex.newLines.length} new lines`))
+      if (ex.firstTrue != null) out.append(span("whatif-first", ` first true @${ex.firstTrue}`))
+      row.append(out)
+      const via = this.viaText(ex.assignments)
+      row.title = `a full alternate run — learned by execution: ${via || "(as given)"} — click to jump in`
+      row.addEventListener("click", () => this.switchTimeline(ex.branch, ex.firstTrue ?? undefined))
+      box.append(row)
+    }
+    if (!r.alreadyTrue && !r.examples.length) {
+      box.append(el("div", "whatif-head", `no satisfying input among ${r.explored} learned candidates`))
+      for (const l of (r.learned ?? []).slice(0, 6))
+        box.append(el("div", "whatif-head", `learned but not sufficient: ${l.input.kind}${l.input.key ? " " + l.input.key : ""} = ${l.value}`))
     }
   }
 

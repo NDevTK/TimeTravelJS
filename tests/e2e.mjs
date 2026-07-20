@@ -197,6 +197,45 @@ assert.ok(jumped.branch >= 2, "clicked into the hypothetical timeline")
 assert.equal(jumped.swaps, 500, "landed on the first state where the probe is true")
 console.log("what-if: jumped into hypothesis, swaps =", jumped.swaps, "on timeline", jumped.branch)
 
+// --- the website sample: URL-parameter constraint search through the UI
+await page.selectOption("#sample-select", "website")
+await page.waitForFunction(
+  () => window.__timetravel.ui.summary && !window.__timetravel.ui.recording && window.__timetravel.engine.branch === 0,
+  null,
+  { timeout: 120000 },
+)
+const siteConsole = await page.textContent("#console-body")
+assert.match(siteConsole, /news\.example\/\?user=ada/, "the page ran under its URL")
+assert.match(siteConsole, /theme: light/, "no theme param → default")
+await page.fill("#whatif-probe", '!document.getElementById("beta-panel").classList.contains("hidden")')
+await page.click("#whatif-params")
+await page.waitForFunction(
+  () => !window.__timetravel.ui.recording && document.querySelectorAll(".whatif-result").length >= 1,
+  null,
+  { timeout: 120000 },
+)
+const paramResults = await page.evaluate(() =>
+  [...document.querySelectorAll(".whatif-result")].map((r) => r.textContent),
+)
+console.log("param search:", JSON.stringify(paramResults))
+assert.ok(
+  paramResults.some((r) => r.includes("beta=1") && r.includes("user=ada")),
+  "found ?beta=1 (keeping the original params) as the feature enabler",
+)
+await page.click(".whatif-result")
+const paramJump = await page.evaluate(() => {
+  const { engine } = window.__timetravel
+  return {
+    branch: engine.branch,
+    beta: engine.consoleEval('new URLSearchParams(location.search).get("beta")').value?.v,
+    panelShown: engine.consoleEval('!document.getElementById("beta-panel").classList.contains("hidden")').value?.v,
+  }
+})
+assert.ok(paramJump.branch > 0, "jumped into the discovered URL's timeline")
+assert.equal(paramJump.beta, "1")
+assert.equal(paramJump.panelShown, true)
+console.log("param search: jumped into ?beta=1 run — panel visible on timeline", paramJump.branch)
+
 // --- crash sample: error surfaces, timeline navigable, stack panel shows frames
 await page.selectOption("#sample-select", "crash")
 await page.waitForFunction(

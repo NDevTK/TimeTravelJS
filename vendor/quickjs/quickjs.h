@@ -971,6 +971,14 @@ JSValue JS_TTBacktrace(JSContext *ctx);
 JSValue JS_TTLocals(JSContext *ctx, int level);
 /* Restrict step hooks to functions compiled from `filename` (NULL = all). */
 void JS_TTSetStepFilename(JSContext *ctx, const char *filename);
+/* Comparison journal (concolic value learning): every string comparison
+   stepped user code performs — ===/!==/==/!= plus includes/startsWith/
+   endsWith/indexOf — is recorded (capped, deduplicated, ASCII-truncated).
+   The journal lives in the runtime struct, so it snapshots and forks with
+   the machine. op: 0 eq, 1 includes, 2 startsWith, 3 endsWith, 4 indexOf. */
+void JS_TTCmpClear(JSRuntime *rt);
+int JS_TTCmpCount(JSRuntime *rt);
+int JS_TTCmpGet(JSRuntime *rt, int i, int *op, const char **a, const char **b);
 /* Script-level let/const/class bindings (global lexical environment). */
 JSValue JS_TTGlobalLexicals(JSContext *ctx);
 /* Clear the runtime's stack-frame chain (fresh session over a rewound heap). */

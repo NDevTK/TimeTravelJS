@@ -370,6 +370,23 @@ struct JSRuntime {
     JSAtom tt_step_filename;
     /* step granularity: 0 = source line (+ backward jumps), 1 = every opcode */
     int tt_granularity;
+    /* TimeTravelJS: string-comparison journal — concolic value learning.
+       Records the string comparisons stepped user code performs (===/!==,
+       includes, startsWith, endsWith, indexOf) so the host can LEARN, from
+       execution, which values external inputs are checked against. Pure
+       observation, never semantics; lives in the runtime struct (linear
+       memory), so it snapshots, rewinds and forks with the machine and
+       each timeline reads back ITS OWN journal. Capped + deduplicated;
+       ASCII-printable, truncated copies only. */
+#define TT_CMP_MAX    384
+#define TT_CMP_STRMAX 64
+    struct TTCmpEnt {
+        uint32_t h;   /* dedup hash of (op, a, b) */
+        uint8_t op;   /* 0 eq, 1 includes, 2 startsWith, 3 endsWith, 4 indexOf */
+        char a[TT_CMP_STRMAX];
+        char b[TT_CMP_STRMAX];
+    } tt_cmp[TT_CMP_MAX];
+    int tt_cmp_len;
     /* TimeTravelJS stackless interpreter state. All interpreter frames live
        in this arena (linear memory), so when no native C frame is below the
        dispatch loop, suspending is just returning to the host and resuming
@@ -7700,6 +7717,95 @@ static int tt_find_line(JSFunctionBytecode *b, uint32_t pc_value,
  fail:
     *pcol_num = 0;
     return 0;
+}
+
+/* ---- TimeTravelJS comparison journal (concolic value learning) --------- */
+/* ASCII-printable truncated copy of a JS string value (any wide/non-ASCII
+   unit degrades to '?'): allocation-free and exception-free, so the note
+   sites can never perturb execution. */
+static void tt_cmp_copy(char *dst, JSValueConst v)
+{
+    JSString *p = JS_VALUE_GET_STRING(v);
+    uint32_t i, n;
+    n = p->len < TT_CMP_STRMAX - 1 ? p->len : TT_CMP_STRMAX - 1;
+    for (i = 0; i < n; i++) {
+        int c = p->is_wide_char ? p->u.str16[i] : p->u.str8[i];
+        dst[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+    }
+}
+
+/* Record one user-code string comparison. Both values MUST be
+   JS_TAG_STRING (callers check). Capped, content-deduplicated. */
+static void tt_cmp_note(JSContext *ctx, int op, JSValueConst v1, JSValueConst v2)
+{
+    JSRuntime *rt = ctx->rt;
+    struct TTCmpEnt e;
+    uint32_t h;
+    int i;
+
+    if (rt->tt_cmp_len >= TT_CMP_MAX)
+        return;
+    memset(&e, 0, sizeof(e));
+    e.op = (uint8_t)op;
+    tt_cmp_copy(e.a, v1);
+    tt_cmp_copy(e.b, v2);
+    h = 0x811c9dc5;
+    h = (h ^ e.op) * 0x01000193;
+    for (i = 0; i < TT_CMP_STRMAX && e.a[i]; i++)
+        h = (h ^ (uint8_t)e.a[i]) * 0x01000193;
+    h = (h ^ 0xff) * 0x01000193;
+    for (i = 0; i < TT_CMP_STRMAX && e.b[i]; i++)
+        h = (h ^ (uint8_t)e.b[i]) * 0x01000193;
+    e.h = h;
+    for (i = 0; i < rt->tt_cmp_len; i++) {
+        if (rt->tt_cmp[i].h == h && rt->tt_cmp[i].op == e.op &&
+            !memcmp(rt->tt_cmp[i].a, e.a, TT_CMP_STRMAX) &&
+            !memcmp(rt->tt_cmp[i].b, e.b, TT_CMP_STRMAX))
+            return;
+    }
+    rt->tt_cmp[rt->tt_cmp_len++] = e;
+}
+
+/* Journal gate for opcode sites: stepping armed and the EXECUTING function
+   is stepped user code. Keeps native/conformance runs (no step handler)
+   and the debugger's own setup layer entirely out of the journal. */
+static force_inline BOOL tt_cmp_gate_b(JSRuntime *rt, JSFunctionBytecode *b)
+{
+    if (!rt->tt_step_handler || rt->tt_cmp_len >= TT_CMP_MAX)
+        return FALSE;
+    if (!b->has_debug)
+        return FALSE;
+    if (rt->tt_step_filename != JS_ATOM_NULL &&
+        b->debug.filename != rt->tt_step_filename)
+        return FALSE;
+    return TRUE;
+}
+
+/* Journal gate for C-builtin sites (String.prototype methods): the nearest
+   bytecode caller decides whether this call came from user code. */
+static BOOL tt_cmp_gate_frame(JSRuntime *rt)
+{
+    JSStackFrame *sf;
+
+    if (!rt->tt_step_handler || rt->tt_cmp_len >= TT_CMP_MAX)
+        return FALSE;
+    for (sf = rt->current_stack_frame; sf; sf = sf->prev_frame) {
+        JSObject *p;
+        JSFunctionBytecode *b;
+        if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+            continue;
+        p = JS_VALUE_GET_OBJ(sf->cur_func);
+        if (!js_class_has_bytecode(p->class_id))
+            continue;
+        b = p->u.func.function_bytecode;
+        if (!b->has_debug)
+            return FALSE;
+        if (rt->tt_step_filename != JS_ATOM_NULL &&
+            b->debug.filename != rt->tt_step_filename)
+            return FALSE;
+        return TRUE;
+    }
+    return FALSE;
 }
 
 /* Called from the dispatch loop whenever stepping is enabled. Fires the host
@@ -22073,6 +22179,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp--;                                               \
                 } else {                                                \
                     sf->cur_pc = pc;                                    \
+                    /* concolic journal: user-code string (in)equality */ \
+                    if ((eq_mode) >= 1 &&                               \
+                        JS_VALUE_GET_TAG(op1) == JS_TAG_STRING &&       \
+                        JS_VALUE_GET_TAG(op2) == JS_TAG_STRING &&       \
+                        unlikely(tt_cmp_gate_b(rt, b)))                 \
+                        tt_cmp_note(ctx, 0, op1, op2);                  \
                     TT_COERCE_OPERANDS(((eq_mode) == 1 ? HINT_NONE : HINT_NUMBER), eq_mode) \
                     if (slow_call)                                      \
                         goto exception;                                 \
@@ -48623,6 +48735,11 @@ static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     JSString *p1;
 
+    /* concolic journal: user code probing an external string's content */
+    if (JS_VALUE_GET_TAG(this_val) == JS_TAG_STRING && argc >= 1 &&
+        JS_VALUE_GET_TAG(argv[0]) == JS_TAG_STRING &&
+        tt_cmp_gate_frame(ctx->rt))
+        tt_cmp_note(ctx, 4, this_val, argv[0]);
     str = JS_ToStringCheckObject(ctx, this_val);
     if (JS_IsException(str))
         return str;
@@ -48691,6 +48808,12 @@ static JSValue js_string_includes(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     JSString *p1;
 
+    /* concolic journal: format checks — includes/startsWith/endsWith.
+       op: magic 0 → 1 (includes), 1 → 2 (startsWith), 2 → 3 (endsWith) */
+    if (JS_VALUE_GET_TAG(this_val) == JS_TAG_STRING && argc >= 1 &&
+        JS_VALUE_GET_TAG(argv[0]) == JS_TAG_STRING &&
+        tt_cmp_gate_frame(ctx->rt))
+        tt_cmp_note(ctx, 1 + magic, this_val, argv[0]);
     str = JS_ToStringCheckObject(ctx, this_val);
     if (JS_IsException(str))
         return str;
@@ -64949,6 +65072,29 @@ void JS_TTSetStepFilename(JSContext *ctx, const char *filename)
     if (rt->tt_step_filename != JS_ATOM_NULL)
         JS_FreeAtomRT(rt, rt->tt_step_filename);
     rt->tt_step_filename = filename ? JS_NewAtom(ctx, filename) : JS_ATOM_NULL;
+}
+
+/* ---- comparison-journal API (concolic value learning) ------------------ */
+void JS_TTCmpClear(JSRuntime *rt)
+{
+    rt->tt_cmp_len = 0;
+}
+
+int JS_TTCmpCount(JSRuntime *rt)
+{
+    return rt->tt_cmp_len;
+}
+
+/* op: 0 eq, 1 includes, 2 startsWith, 3 endsWith, 4 indexOf. The returned
+   strings point into the runtime journal (NUL-terminated, ASCII). */
+int JS_TTCmpGet(JSRuntime *rt, int i, int *op, const char **a, const char **b)
+{
+    if (i < 0 || i >= rt->tt_cmp_len)
+        return -1;
+    *op = rt->tt_cmp[i].op;
+    *a = rt->tt_cmp[i].a;
+    *b = rt->tt_cmp[i].b;
+    return 0;
 }
 
 /* Script-level let/const/class bindings live in ctx->global_var_obj, not on

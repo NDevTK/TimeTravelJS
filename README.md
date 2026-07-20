@@ -74,6 +74,27 @@ npm run build      # rebuild dist/quickjs-tt.wasm (clang + wasi-libc + binaryen)
 - **Two step granularities** — one snapshot per source line, or flip to
   **opcode steps** and scrub between *every two VM instructions*: watch a
   single expression evaluate sub-term by sub-term.
+- **Website-shaped sessions** — programs get `location`, `URL`,
+  `URLSearchParams`, `localStorage`/`sessionStorage` and a `postMessage`
+  channel, self-hosted *inside* the machine, so the URL, every storage
+  cell and the message queue snapshot, scrub and fork with the rest of
+  the state. The machine records which parameters, storage keys and
+  message handlers the program actually consulted.
+- **Concolic input search that learns, never guesses** — the VM keeps a
+  **comparison journal**: every string `===`, `includes`, `startsWith`,
+  `endsWith`, `indexOf` the recorded program performs, living in the
+  machine itself so it rewinds and forks with each timeline. The
+  **"?⑂ inputs" search** answers the real-site question — *which
+  `?param=value` / storage value / message payload enables this
+  feature?* — by probing each observed input with a canary in a full
+  alternate run and reading what that run *compared the canary against*.
+  Each observation becomes the next candidate; required formats compose
+  across rounds (probe → `pref:<canary>` → `pref:gold`), object message
+  protocols reveal their keys through a recording proxy payload, and the
+  search **learns from unused logic**: never-fired handlers are probed
+  first, runs that execute lines the recording never reached explore
+  first, and every answer carries its provenance chain and comes back
+  execution-verified.
 - **DOM + CSS time travel** — give the session an HTML document and it is
   parsed by an embedded [Lexbor](https://github.com/lexbor/lexbor) engine
   *into the same linear memory as the JS heap*. The DOM tree and CSSOM are
@@ -257,6 +278,45 @@ recorded timeline whose future satisfies the goal, jumpable to the exact
 step where it first became true. Timelines that satisfied nothing are
 pruned; their pages return to the pool.
 
+For website-shaped programs the same machinery answers configuration
+questions — and here nothing is guessed from source text. The machine
+keeps a **comparison journal** (every string `===` / `includes` /
+`startsWith` / `endsWith` / `indexOf` the program performs, stored in
+the machine's own memory so it rewinds and forks with each timeline),
+and `exploreParams` runs a concolic BFS over every input the program
+demonstrably consulted — URL parameters, storage keys, the message
+channel:
+
+```js
+await engine.exploreParams({
+  goal: { all: [ 'document.body.classList.contains("dark")',
+                 '!document.querySelector("#beta-panel").classList.contains("hidden")' ] },
+})
+// → examples: [{ params: { theme: "dark", beta: "1" }, search: "?user=ada&theme=dark&beta=1",
+//      assignments: [{ kind, key, value, via: [{op:"probe"...},{op:"eq",learned:"dark"}] }],
+//      branch, firstTrue, newLines, goals: [per-constraint detail] }]
+//   learned: every execution-derived value with its provenance chain
+//   unlocked: which inputs woke lines the recording never executed
+```
+
+Each candidate forks the **earliest parked step** — before the program
+has read anything — so each hypothesis is a complete alternate run
+inside the same multiverse. Round one probes each input with a canary
+value; the journal of that run reports what the program tested the
+input against (`=== "solar"`, `startsWith("pref:")`), and each
+observation is rewritten into the next round's candidate, so formats
+compose: probe → `pref:<canary>` → `pref:gold`, with the whole chain
+kept as `via` provenance. Message probes deliver a recording proxy
+whose property reads return marked strings, so object protocols reveal
+their keys the same way (`{type:"sync"}`, then `{type:"sync",
+mode:"fast"}` behind an `&&`). The base run's own journal seeds round
+zero for free, and **unused logic guides the search**: inputs whose
+handlers never fired as-run are probed first, and children of runs that
+executed never-reached lines explore first. Goals compose as `{all,
+any, none}` with every constraint reported separately; when no single
+input satisfies a compound goal, the most promising singles — ranked by
+how many constraints they did satisfy — are combined pairwise.
+
 ## Repository layout
 
 ```
@@ -322,12 +382,29 @@ site nor the tests require a C toolchain.
 - `explore()` demonstrates usages; it does not prove absence. The search
   is bounded (beam width, depth, `maxBranches` fork budget) and the
   auto-candidate vocabulary is deliberately small — events with live
-  listeners, stylesheet/tree classes, elements with ids (bring explicit
-  candidates for anything else; required for DOM-less sessions). Once a
+  listeners, stylesheet/tree classes, elements with ids, consulted
+  storage keys (bring explicit candidates for anything else). Once a
   hypothesis' future has run to completion there is no "later" left
   inside it, so deeper calls compose back-to-back at the fork moment
   instead. The page-heat visualization aggregates writes across all
   timelines.
+- The web substrate is a *model*, not a browser: `location` mutations
+  never navigate (no page loads, no `fetch`/XHR, no history stack),
+  `URL` parses absolute `scheme://host` URLs plus relative forms against
+  a base, storage is in-memory per session, and `postMessage` delivers
+  synchronously to same-realm handlers (messages queue until a listener
+  exists, so anchor-time injections reach handlers registered later).
+  Input-read tracking sees `URLSearchParams`/storage accessors and
+  `message` listeners, not hand-rolled string parsing of
+  `location.search`.
+- The comparison journal sees **string-to-string** comparisons (plus
+  `includes`/`startsWith`/`endsWith`/`indexOf`): numeric comparisons,
+  regex tests and comparisons against `null`/`undefined` don't journal,
+  entries degrade to ASCII and cap at 64 chars / 384 entries, and a
+  transform that destroys the canary (hashing, `toUpperCase`) breaks
+  attribution for that branch. Values reachable only through such code
+  can be handed to `exploreParams` as `{extraValues}` — they enter the
+  same BFS and derive further from there.
 
 ## Conformance: tc39/test262
 

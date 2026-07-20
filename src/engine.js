@@ -37,6 +37,18 @@ const OUT_TIMER_DONE = 5
 
 const LEVELS = ["log", "info", "warn", "error"]
 
+/**
+ * Goal specs: a bare expression, a list (all must hold), or
+ * {all: [...], any: [...], none: [...]} — real invariants are usually
+ * several constraints, so every evaluation reports per-constraint detail.
+ */
+const normGoal = (goal) =>
+  typeof goal === "string"
+    ? { all: [goal], any: [], none: [] }
+    : Array.isArray(goal)
+      ? { all: goal, any: [], none: [] }
+      : { all: goal.all ?? [], any: goal.any ?? [], none: goal.none ?? [] }
+
 /** truthiness of a serialized value envelope (for search predicates) */
 const envTruthy = (v) => {
   if (!v) return false
@@ -258,6 +270,18 @@ export class TimeTravelEngine {
     // granularity: "line" (default) or "opcode" — suspend between every two
     // VM instructions of user code
     this.vm.exports.tt_set_granularity(opts.granularity === "opcode" ? 1 : 0)
+
+    s.source = String(source)
+    s.url = opts.url != null ? String(opts.url) : "https://example.test/"
+    // optional URL: the program reads its parameters off `location` /
+    // URLSearchParams — self-hosted IN the machine, so the URL (and what
+    // was read from it) snapshots and forks with everything else
+    if (opts.url != null) {
+      const u = this.vm.writeString(String(opts.url))
+      const rc = this.vm.exports.tt_set_url(u.ptr, u.len)
+      this.vm.exports.tt_free(u.ptr)
+      if (rc !== 0) throw new Error(`invalid url: ${opts.url}`)
+    }
 
     // optional HTML document: parsed by the embedded Lexbor into the SAME
     // linear memory, so the DOM+CSSOM time-travels through the ordinary
@@ -681,18 +705,7 @@ export class TimeTravelEngine {
           return null
         }
       }
-      const hasDoc = fetch(`JSON.stringify(typeof document !== "undefined")`)
-      if (hasDoc !== true) throw new Error("suggestEdits reads the live document — pass explicit candidates instead")
-      const ids = fetch(`JSON.stringify([...document.querySelectorAll("[id]")].slice(0, 8).map((e) => e.id))`) ?? []
-      const evTypes = fetch(`JSON.stringify(document.__eventTypes.slice(0, 6))`) ?? []
-      const cssClasses =
-        fetch(
-          `JSON.stringify((() => { const s = new Set(); for (const st of document.querySelectorAll("style")) for (const m of st.textContent.match(/\\.[A-Za-z_][A-Za-z0-9_-]*/g) || []) s.add(m.slice(1)); return [...s].slice(0, 6); })())`,
-        ) ?? []
-      const docClasses =
-        fetch(
-          `JSON.stringify((() => { const s = new Set(); for (const e of document.querySelectorAll("*")) for (const c of e.classList) s.add(c); return [...s].slice(0, 6); })())`,
-        ) ?? []
+      const hasDoc = fetch(`JSON.stringify(typeof document !== "undefined")`) === true
       const out = []
       const seen = new Set()
       const push = (c) => {
@@ -702,13 +715,52 @@ export class TimeTravelEngine {
         }
       }
       const q = (id) => `document.getElementById(${JSON.stringify(id)})`
-      // behavioral first: events someone is actually listening for
-      for (const id of ids) for (const t of evTypes) push(`${q(id)}.dispatchEvent(new Event(${JSON.stringify(t)}, { bubbles: true }))`)
-      // styling: classes the CSS knows about, on and off
-      for (const id of ids) for (const c of cssClasses) push(`${q(id)}.classList.add(${JSON.stringify(c)})`)
-      for (const id of ids) for (const c of docClasses) push(`${q(id)}.classList.remove(${JSON.stringify(c)})`)
+      let ids = []
+      if (hasDoc) {
+        ids = fetch(`JSON.stringify([...document.querySelectorAll("[id]")].slice(0, 8).map((e) => e.id))`) ?? []
+        const evTypes = fetch(`JSON.stringify(document.__eventTypes.slice(0, 6))`) ?? []
+        const cssClasses =
+          fetch(
+            `JSON.stringify((() => { const s = new Set(); for (const st of document.querySelectorAll("style")) for (const m of st.textContent.match(/\\.[A-Za-z_][A-Za-z0-9_-]*/g) || []) s.add(m.slice(1)); return [...s].slice(0, 6); })())`,
+          ) ?? []
+        const docClasses =
+          fetch(
+            `JSON.stringify((() => { const s = new Set(); for (const e of document.querySelectorAll("*")) for (const c of e.classList) s.add(c); return [...s].slice(0, 6); })())`,
+          ) ?? []
+        // behavioral first: events someone is actually listening for
+        for (const id of ids) for (const t of evTypes) push(`${q(id)}.dispatchEvent(new Event(${JSON.stringify(t)}, { bubbles: true }))`)
+        // styling: classes the CSS knows about, on and off
+        for (const id of ids) for (const c of cssClasses) push(`${q(id)}.classList.add(${JSON.stringify(c)})`)
+        for (const id of ids) for (const c of docClasses) push(`${q(id)}.classList.remove(${JSON.stringify(c)})`)
+      }
+      // unused logic: a registered message handler that no message ever
+      // reached is a dormant feature — probe the channel (exploreParams
+      // learns real payloads from the handler's own comparisons)
+      const msg = fetch(`JSON.stringify(typeof __messageStats === "function" ? __messageStats() : null)`)
+      if (msg && msg.handlers > 0 && msg.posted === 0)
+        push(`postMessage("ttprobe0"); postMessage(__msgProbe("ttprobe0"))`)
+      // shared state: storage keys the program actually consulted, with
+      // values LEARNED from the run itself — the comparison journal holds
+      // what each read was tested against ("plain" === "fancy" teaches
+      // "fancy"), so suggestions are values the code demonstrably reacts to
+      const storKeys = fetch(`JSON.stringify(localStorage.__reads.slice(0, 6))`) ?? []
+      if (storKeys.length) {
+        const journal = this.comparisons()
+        for (const k of storKeys) {
+          const asRun = fetch(`JSON.stringify(localStorage.getItem(${JSON.stringify(k)}))`)
+          const attributed = journal.filter((e) => e.a === asRun || e.b === asRun).map((e) => (e.a === asRun ? e.b : e.a))
+          const pool = attributed.length ? attributed : journal.flatMap((e) => [e.a, e.b])
+          const vals = [...new Set(pool)]
+            .filter((v) => v.length >= 1 && v.length <= 32 && v !== asRun && !storKeys.includes(v))
+            .slice(0, 3)
+          for (const v of vals) push(`localStorage.setItem(${JSON.stringify(k)}, ${JSON.stringify(v)})`)
+        }
+        for (const k of storKeys) push(`localStorage.removeItem(${JSON.stringify(k)})`)
+      }
       // structure last
       for (const id of ids) push(`${q(id)}.remove()`)
+      if (!out.length)
+        throw new Error("nothing observable to suggest — no document and no storage reads; pass explicit candidates")
       return out.slice(0, limit)
     } finally {
       this.positionTo(savePos)
@@ -730,7 +782,9 @@ export class TimeTravelEngine {
   async explore(pos, { goal, candidates = null, depth = 2, beam = 6, maxBranches = 48, keep = "examples", onProgress = null } = {}) {
     const s = this.session
     if (!s.finished) throw new Error("no finished recording")
-    if (!goal) throw new Error("explore needs a goal expression")
+    if (!goal) throw new Error("explore needs a goal")
+    const spec = normGoal(goal)
+    const goalX = this._goalExpr(spec)
     const saveView = s.view
     const savePos = s.pos
     pos = Math.max(0, Math.min(pos ?? savePos, this._compositeLen(saveView) - 1))
@@ -738,10 +792,10 @@ export class TimeTravelEngine {
     if (!this._entryAt(pos)?.entry) throw new Error("no parked step to explore from")
 
     this.positionTo(pos)
-    const g0 = this.consoleEval(goal)
-    if (!g0.error && envTruthy(g0.value)) {
+    const g0 = this._evalGoal(spec)
+    if (g0.ok) {
       this.positionTo(savePos)
-      return { alreadyTrue: true, examples: [], explored: 0, pruned: 0, budgetHit: false }
+      return { alreadyTrue: true, examples: [], explored: 0, pruned: 0, budgetHit: false, baseline: g0.detail }
     }
 
     const created = []
@@ -772,18 +826,18 @@ export class TimeTravelEngine {
             created.push(b)
             explored++
             this.positionTo(summary.steps - 1)
-            const g = this.consoleEval(goal)
-            const satisfied = !g.error && envTruthy(g.value)
+            const g = this._evalGoal(spec)
+            const satisfied = g.ok
             const path = [...node.path, edit]
             if (satisfied) {
-              const scan = this.searchAll(goal, { branch: b, limit: 1 })
+              const scan = this.searchAll(goalX, { branch: b, limit: 1 })
               examples.push({
                 path,
                 branch: b,
                 steps: summary.steps,
                 error: summary.error,
                 firstTrue: scan.hits.length ? scan.hits[0].pos : null,
-                goal: g.value,
+                goals: g.detail,
               })
             } else if (!summary.error && level < depth) {
               // extend from this hypothesis' last parked moment — a state that
@@ -818,6 +872,474 @@ export class TimeTravelEngine {
       for (const id of created) if (s.branches[id] && !keepSet.has(id)) pruned += this.pruneBranch(id).length
     }
     return { alreadyTrue: false, examples, explored, pruned, budgetHit }
+  }
+
+  /** Evaluate a goal spec at the current position — per-constraint detail. */
+  _evalGoal(spec) {
+    const detail = []
+    const truthyOf = (expr) => {
+      const r = this.consoleEval(expr)
+      return { truthy: !r.error && envTruthy(r.value), error: r.error ?? null, value: r.value ?? null }
+    }
+    let ok = true
+    for (const expr of spec.all) {
+      const t = truthyOf(expr)
+      detail.push({ expr, kind: "all", ok: t.truthy, value: t.value, error: t.error })
+      if (!t.truthy) ok = false
+    }
+    if (spec.any.length) {
+      let some = false
+      for (const expr of spec.any) {
+        const t = truthyOf(expr)
+        detail.push({ expr, kind: "any", ok: t.truthy, value: t.value, error: t.error })
+        if (t.truthy) some = true
+      }
+      if (!some) ok = false
+    }
+    for (const expr of spec.none) {
+      const t = truthyOf(expr)
+      detail.push({ expr, kind: "none", ok: !t.truthy, value: t.value, error: t.error })
+      if (t.truthy) ok = false
+    }
+    return { ok, detail }
+  }
+
+  /** One boolean expression equivalent to the whole spec (for scans). */
+  _goalExpr(spec) {
+    const parts = spec.all.map((e) => `(${e})`)
+    if (spec.any.length) parts.push(`(${spec.any.map((e) => `(${e})`).join(" || ")})`)
+    for (const e of spec.none) parts.push(`!(${e})`)
+    return parts.join(" && ") || "true"
+  }
+
+  /**
+   * The comparison journal at the current position: every string
+   * comparison the recorded program performed up to this moment — `===`,
+   * includes, startsWith, endsWith, indexOf — as {op, a, b}. The journal
+   * lives inside the machine's linear memory, so it rewinds, forks and
+   * prunes with everything else: at a fork's end it holds exactly that
+   * alternate run's comparisons, and transactional goal evaluations heal
+   * away without polluting it. This is how the debugger LEARNS values by
+   * running code branches instead of guessing them.
+   */
+  comparisons() {
+    const s = this.session
+    if (!s.finished) return []
+    try {
+      this.positionTo(s.pos)
+      this.vm.clearDirtyMap()
+      const ptr = this.vm.exports.tt_cmp_json()
+      let out = []
+      if (ptr) {
+        const mem = this.mem()
+        let end = ptr
+        while (mem[end] !== 0) end++
+        const text = new TextDecoder().decode(mem.subarray(ptr, end))
+        this.vm.exports.tt_free(ptr)
+        const OPS = ["eq", "includes", "startsWith", "endsWith", "indexOf"]
+        out = JSON.parse(text).map(([op, a, b]) => ({ op: OPS[op] ?? "eq", a, b }))
+      }
+      this._healTransaction()
+      return out
+    } catch (e) {
+      this.vm.normalize()
+      s.memDirty = true
+      return []
+    }
+  }
+
+  /**
+   * Concolic search over the program's external inputs: find the URL
+   * parameter, storage value or postMessage payload that leads to an
+   * outcome — "which ?param enables this feature?", "what message wakes
+   * this handler?" Nothing is guessed from source text: every candidate
+   * VALUE is learned by running code branches. A canary probe forks a
+   * full alternate run per input (from the EARLIEST parked step, before
+   * anything was read); the machine's comparison journal then reports
+   * what that run tested the input against — equals "solar", startsWith
+   * "pref:" — and each observation becomes the next, better-shaped
+   * candidate, so required formats compose across rounds: probe →
+   * "pref:<canary>" → "pref:gold". Message probes deliver a recording
+   * payload whose property reads return marked strings, so object
+   * protocols reveal their keys ({type:"sync"}, then {type:"sync",
+   * mode:"fast"}) the same way. The debugger also learns from unused
+   * logic: inputs whose handlers never fired as-run are probed first,
+   * children of runs that executed lines the original recording never
+   * reached explore first, and `unlocked` reports which inputs woke
+   * dormant code. Every example is execution-verified and jumpable via
+   * switchTo(example.branch, example.firstTrue).
+   */
+  async exploreParams({
+    goal,
+    params = null,
+    extraValues = [],
+    rounds = 4,
+    maxBranches = 48,
+    pairTop = 4,
+    keep = "examples",
+    onProgress = null,
+  } = {}) {
+    const s = this.session
+    if (!s.finished) throw new Error("no finished recording")
+    if (!goal) throw new Error("exploreParams needs a goal")
+    const spec = normGoal(goal)
+    const goalX = this._goalExpr(spec)
+    const saveView = s.view
+    const savePos = s.pos
+    const len = this._compositeLen(saveView)
+
+    // the program as-run: constraint status + observed reads live at the END
+    this.positionTo(len - 1)
+    const base = this._evalGoal(spec)
+    if (base.ok) {
+      this.positionTo(savePos)
+      return { alreadyTrue: true, examples: [], explored: 0, pruned: 0, budgetHit: false, baseline: base.detail }
+    }
+    const fetch = (expr) => {
+      const r = this.consoleEval(expr)
+      if (r.error || r.value?.t !== "str" || r.value.trunc) return null
+      try {
+        return JSON.parse(r.value.v)
+      } catch {
+        return null
+      }
+    }
+
+    // ---- inputs: every external channel the program demonstrably consulted
+    const observed = fetch(`JSON.stringify(location.__paramReads.slice(0, 12))`) ?? []
+    const baseSearch = fetch(`JSON.stringify(location.search)`) ?? ""
+    const storKeys = fetch(`JSON.stringify(localStorage.__reads.slice(0, 6))`) ?? []
+    const msgStats = fetch(`JSON.stringify(typeof __messageStats === "function" ? __messageStats() : null)`)
+    const inputs = []
+    for (const k of (params ?? observed).slice(0, 8)) inputs.push({ kind: "param", key: k })
+    if (!params) {
+      for (const k of storKeys) inputs.push({ kind: "storage", key: k })
+      if (msgStats && msgStats.handlers > 0) inputs.push({ kind: "message", key: null, neverFired: msgStats.posted === 0 })
+    }
+    if (!inputs.length) {
+      this.positionTo(savePos)
+      throw new Error("the program consulted no URL parameters, storage keys or message handlers — pass {params: [...]}")
+    }
+    // unused logic first: a handler no message ever reached is a dormant
+    // feature — probing it is the most promising place to start
+    inputs.sort((a, b) => (b.neverFired ? 1 : 0) - (a.neverFired ? 1 : 0))
+    for (const inp of inputs) {
+      inp.asRun =
+        inp.kind === "param"
+          ? fetch(`JSON.stringify(new URLSearchParams(location.search).get(${JSON.stringify(inp.key)}))`)
+          : inp.kind === "storage"
+            ? fetch(`JSON.stringify(localStorage.getItem(${JSON.stringify(inp.key)}))`)
+            : null
+    }
+    // the base run's own journal seeds round 0 for free: everything the
+    // program compared its real inputs against, before a single fork
+    const baseJournal = this.comparisons()
+    const baseLines = new Set()
+    for (const e of this.trace) if (e.entry && e.l > 0) baseLines.add(e.l)
+
+    // the anchor: the earliest parked step — inputs change before any read
+    let anchor = 0
+    while (anchor < len - 1 && !this._entryAt(anchor)?.entry) anchor++
+    if (!this._entryAt(anchor)?.entry) throw new Error("no parked step to fork from")
+
+    const searchWith = (overrides) => {
+      const pairs = []
+      const qs = String(baseSearch).replace(/^\?/, "")
+      if (qs)
+        for (const part of qs.split("&")) {
+          if (!part) continue
+          const i = part.indexOf("=")
+          pairs.push([decodeURIComponent(i < 0 ? part : part.slice(0, i)), i < 0 ? "" : decodeURIComponent(part.slice(i + 1))])
+        }
+      for (const [k, v] of overrides) {
+        const at = pairs.findIndex((p) => p[0] === k)
+        if (at >= 0) pairs[at] = [k, v]
+        else pairs.push([k, v])
+      }
+      return "?" + pairs.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&")
+    }
+    const satCount = (detail) => detail.filter((d) => d.ok).length
+    const CAP = 128
+    const canary = (i) => `ttc${i}z`
+
+    const editFor = (assignments) => {
+      const parts = []
+      const paramPairs = assignments.filter((a) => a.kind === "param").map((a) => [a.key, a.value])
+      if (paramPairs.length) parts.push(`location.search = ${JSON.stringify(searchWith(paramPairs))}`)
+      for (const a of assignments) {
+        if (a.kind === "storage") parts.push(`localStorage.setItem(${JSON.stringify(a.key)}, ${JSON.stringify(a.value)})`)
+        else if (a.kind === "message") {
+          if (a.probe) parts.push(`postMessage(${JSON.stringify(a.marker)}); postMessage(__msgProbe(${JSON.stringify(a.marker)}))`)
+          else if (a.oprobe) parts.push(`postMessage(__msgProbe(${JSON.stringify(a.marker)}, ${a.overrides}))`)
+          else parts.push(`postMessage(${a.value})`)
+        }
+      }
+      return parts.join("; ")
+    }
+
+    const created = []
+    const examples = []
+    const singles = []
+    const unlocked = []
+    const learned = []
+    const learnedSeen = new Set()
+    const tried = inputs.map(() => new Set())
+    let explored = 0
+    let budgetHit = false
+    let round = 0
+
+    const runCandidate = async (assignments, wantJournal) => {
+      s.view = saveView
+      const edit = editFor(assignments)
+      const summary = await this.forkFrom(anchor, edit)
+      const b = s.view
+      created.push(b)
+      explored++
+      this.positionTo(summary.steps - 1)
+      const g = this._evalGoal(spec)
+      // unused logic: lines this alternate run executed that the original
+      // recording never reached — evidence the input woke dormant code
+      const nl = new Set()
+      for (const e of s.branches[b].trace) if (e.entry && e.l > 0 && !baseLines.has(e.l)) nl.add(e.l)
+      const newLines = [...nl].sort((x, y) => x - y)
+      const rec = {
+        assignments: assignments.map((a) => ({
+          kind: a.kind,
+          key: a.key ?? null,
+          value: a.kind === "message" && a.probe ? "(probe)" : a.kind === "message" && a.oprobe ? `(probe ${a.overrides})` : a.value,
+          via: a.via ?? [],
+        })),
+        edit,
+        branch: b,
+        steps: summary.steps,
+        error: summary.error,
+        goals: g.detail,
+        satisfied: g.ok,
+        newLines,
+      }
+      if (assignments.some((a) => a.probe || a.oprobe)) rec.probe = true
+      const paramPairs = assignments.filter((a) => a.kind === "param").map((a) => [a.key, a.value])
+      if (paramPairs.length) {
+        rec.params = Object.fromEntries(paramPairs)
+        rec.search = searchWith(paramPairs)
+      }
+      if (newLines.length) unlocked.push({ lines: newLines.slice(0, 16), assignments: rec.assignments, branch: b, satisfied: g.ok })
+      if (g.ok) {
+        const scan = this.searchAll(goalX, { branch: b, limit: 1 })
+        rec.firstTrue = scan.hits.length ? scan.hits[0].pos : null
+        examples.push(rec)
+      }
+      const journal = wantJournal && !g.ok ? this.comparisons() : []
+      if (onProgress) onProgress({ explored, found: examples.length, round })
+      return { rec, journal }
+    }
+
+    // ---- concolic derivation: a node is a candidate value for one input,
+    // carrying the marker to look for in the journal and its provenance
+    const deriveFrom = (journal, node) => {
+      const inp = inputs[node.i]
+      const m = node.marker
+      const kids = []
+      if (!m || !journal.length) return kids
+      const mprobe = inp.kind === "message" && (node.probe || node.oprobe)
+      const inj = node.probe && inp.kind === "message" ? m : node.oprobe ? node.overrides : node.value
+      const wrapVal = (raw) => (node.probe && inp.kind === "message" ? JSON.stringify(raw) : raw)
+      const seenKid = new Set()
+      const emit = (value, marker, viaAdd) => {
+        if (value == null || value.length > CAP || seenKid.has(value)) return
+        if (inp.kind === "message") {
+          try {
+            JSON.parse(value)
+          } catch {
+            return
+          }
+        }
+        if (marker != null && !value.includes(marker)) marker = null
+        seenKid.add(value)
+        const via = [...node.via, ...viaAdd].slice(-8)
+        kids.push({ i: node.i, value, marker, via })
+        const lk = inp.kind + " " + (inp.key ?? "") + " " + value
+        if (!learnedSeen.has(lk)) {
+          learnedSeen.add(lk)
+          learned.push({ input: { kind: inp.kind, key: inp.key ?? null }, value, via })
+        }
+      }
+      const emitGeneric = (raw, marker, viaEnt) => {
+        const value = wrapVal(raw)
+        emit(value, marker, [viaEnt])
+        if (node.oprobe) {
+          // keep probing: unresolved marked leaves may guard further keys
+          try {
+            const p = JSON.parse(value)
+            if (p && typeof p === "object" && value.includes(m))
+              kids.push({ i: node.i, oprobe: true, overrides: value, marker: m, via: [...node.via, { ...viaEnt, probing: true }].slice(-8) })
+          } catch {
+            /* not an object payload — nothing to continue probing */
+          }
+        }
+      }
+      // rewrite the marker region of `inj` to satisfy `side op other`
+      const rewrite = (op, side, other) => {
+        const ci = side.indexOf(m)
+        const P = side.slice(0, ci)
+        const S = side.slice(ci + m.length)
+        if (op === "eq") {
+          const X =
+            other.startsWith(P) && other.endsWith(S) && other.length >= P.length + S.length
+              ? other.slice(P.length, other.length - S.length)
+              : other
+          return [inj.replace(m, X), X.length ? X : null, { op: "eq", learned: X }]
+        }
+        if (!other.length) return null
+        if (op === "startsWith") {
+          const need = other.startsWith(P) ? other.slice(P.length) : other
+          return need.length ? [inj.replace(m, need + m), m, { op: "startsWith", learned: other }] : null
+        }
+        if (op === "endsWith") {
+          const need = other.endsWith(S) ? other.slice(0, other.length - S.length) : other
+          return need.length ? [inj.replace(m, m + need), m, { op: "endsWith", learned: other }] : null
+        }
+        return [inj.replace(m, m + other), m, { op, learned: other }]
+      }
+      const baseOver = node.oprobe ? JSON.parse(node.overrides) : {}
+      const keyNeeds = new Map()
+      const keyVia = []
+      for (const e of journal) {
+        const aHas = e.a.includes(m)
+        const bHas = e.b.includes(m)
+        if (aHas === bHas) continue // marker on both sides or neither: not attributable
+        const side = aHas ? e.a : e.b
+        const other = aHas ? e.b : e.a
+        if (mprobe && side.startsWith(m + ".")) {
+          // object protocol: the probe proxy returned "<marker>.<key>" for
+          // a property read — this key was consulted and tested here
+          const key = side.slice(m.length + 1)
+          if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key) || Object.prototype.hasOwnProperty.call(baseOver, key)) continue
+          const leaf = !aHas || e.op === "eq" ? other : e.op === "startsWith" ? other + m : e.op === "endsWith" ? m + other : m + other
+          if (!leaf.length) continue
+          const merged = { ...baseOver, [key]: leaf }
+          const txt = JSON.stringify(merged)
+          emit(txt, txt.includes(m) ? m : leaf, [{ op: e.op, key, learned: other }])
+          kids.push({
+            i: node.i,
+            oprobe: true,
+            overrides: txt,
+            marker: m,
+            via: [...node.via, { op: e.op, key, learned: other, probing: true }].slice(-8),
+          })
+          if (!keyNeeds.has(key)) {
+            keyNeeds.set(key, leaf)
+            keyVia.push({ op: e.op, key, learned: other })
+          }
+          continue
+        }
+        if (!aHas && e.op !== "eq") {
+          // our value is the ARGUMENT — constant.op(ourValue): matching the
+          // whole receiver satisfies any of these tests
+          if (other.length) emitGeneric(inj.replace(m, other), other, { op: e.op, learned: other })
+          continue
+        }
+        const r = rewrite(e.op, side, other)
+        if (r) emitGeneric(r[0], r[1], r[2])
+      }
+      if (keyNeeds.size > 1) {
+        // several keys tested in one run: combine every learned constraint
+        // into a single payload (plus a probe continuation for more keys)
+        const merged = { ...baseOver }
+        for (const [k, v] of keyNeeds) merged[k] = v
+        const txt = JSON.stringify(merged)
+        emit(txt, txt.includes(m) ? m : keyNeeds.values().next().value, keyVia)
+        kids.push({ i: node.i, oprobe: true, overrides: txt, marker: m, via: [...node.via, ...keyVia].slice(-8) })
+      }
+      return kids
+    }
+
+    // ---- seeds: one canary probe per input; derivations of each input's
+    // as-run value against the base journal (round 0, no forks spent);
+    // caller-supplied extras
+    let frontier = []
+    for (let i = 0; i < inputs.length; i++) {
+      const inp = inputs[i]
+      frontier.push({ i, probe: true, value: canary(i), marker: canary(i), via: [{ op: "probe", value: canary(i) }] })
+      if (inp.asRun != null) tried[i].add(inp.kind === "message" ? JSON.stringify(inp.asRun) : String(inp.asRun))
+      if (typeof inp.asRun === "string" && inp.asRun.length >= 2 && inp.kind !== "message")
+        frontier.push(...deriveFrom(baseJournal, { i, value: inp.asRun, marker: inp.asRun, via: [{ op: "as-run", value: inp.asRun }] }))
+      for (const v of extraValues)
+        frontier.push({
+          i,
+          value: inp.kind === "message" ? JSON.stringify(String(v)) : String(v),
+          marker: String(v),
+          via: [{ op: "seed", value: String(v) }],
+        })
+    }
+
+    try {
+      bfs: while (frontier.length && round < rounds) {
+        round++
+        // unused-logic guidance: children of runs that unlocked lines the
+        // original recording never executed explore first
+        frontier.sort((a, b) => (b.parentNew ?? 0) - (a.parentNew ?? 0))
+        const next = []
+        for (const node of frontier) {
+          const key = node.probe ? " probe" : node.oprobe ? " oprobe:" + node.overrides : node.value
+          if (key == null || key.length > CAP + 16 || tried[node.i].has(key)) continue
+          tried[node.i].add(key)
+          if (explored >= maxBranches) {
+            budgetHit = true
+            break bfs
+          }
+          const inp = inputs[node.i]
+          const { rec, journal } = await runCandidate([{ ...node, kind: inp.kind, key: inp.key }], true)
+          singles.push(rec)
+          if (rec.satisfied) continue
+          for (const kid of deriveFrom(journal, node)) {
+            kid.parentNew = rec.newLines.length
+            next.push(kid)
+          }
+        }
+        frontier = next
+      }
+      // compound goals: no single input sufficed — combine the most
+      // promising finished singles (partial credit ranks them) pairwise
+      if (!examples.length && inputs.length > 1 && !budgetHit) {
+        const ranked = singles
+          .filter((r) => !r.error && !r.probe && r.assignments.length === 1 && !/ttc\d+z/.test(r.assignments[0].value))
+          .sort((a, b) => satCount(b.goals) - satCount(a.goals))
+          .slice(0, pairTop)
+        pairsLoop: for (let i = 0; i < ranked.length; i++) {
+          for (let j = i + 1; j < ranked.length; j++) {
+            const a = ranked[i].assignments[0]
+            const c = ranked[j].assignments[0]
+            if (a.kind === c.kind && a.key === c.key) continue
+            if (explored >= maxBranches) {
+              budgetHit = true
+              break pairsLoop
+            }
+            await runCandidate([{ ...a }, { ...c }], false)
+          }
+        }
+      }
+    } finally {
+      s.view = saveView
+      this.positionTo(savePos)
+    }
+    let pruned = 0
+    if (keep === "examples") {
+      const keepSet = new Set(examples.map((e) => e.branch))
+      for (const id of created) if (s.branches[id] && !keepSet.has(id)) pruned += this.pruneBranch(id).length
+    }
+    unlocked.sort((a, b) => b.lines.length - a.lines.length)
+    return {
+      alreadyTrue: false,
+      examples,
+      explored,
+      pruned,
+      budgetHit,
+      baseline: base.detail,
+      inputs: inputs.map((x) => ({ kind: x.kind, key: x.key, asRun: x.asRun ?? null, neverFired: !!x.neverFired })),
+      learned,
+      unlocked: unlocked.slice(0, 6).map((u) => ({ ...u, branch: s.branches[u.branch] ? u.branch : null })),
+    }
   }
 
   // ---- transactional inspection / evaluation ------------------------------

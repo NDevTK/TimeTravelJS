@@ -500,3 +500,17 @@ body {
 .whatif-edit { font-family: var(--mono); }
 .whatif-outcome { white-space: nowrap; }
 .whatif-first { color: var(--accent); font-size: 11px; }
+
+/* ---- url input (editor card) ---- */
+.url-input {
+  width: 100%;
+  height: 30px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  margin: 2px 0 6px;
+}
