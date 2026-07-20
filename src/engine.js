@@ -637,6 +637,56 @@ export class TimeTravelEngine {
   }
 
   /**
+   * The story of one expression through time: evaluate `expr` at every
+   * recorded state of the current timeline (or `branch`) and report each
+   * position where its value CHANGED — "when did total go negative?",
+   * "when did this class appear?". Returns transitions including the
+   * initial state, each {pos, local, value, prev}, jumpable via
+   * positionTo(pos) (after switchTo(branch) if given).
+   */
+  searchChanges(expr, { branch = null, limit = 100 } = {}) {
+    const s = this.session
+    if (!s.finished) throw new Error("no finished recording")
+    const saveView = s.view
+    const savePos = s.pos
+    const b = s.branches[branch ?? s.view]
+    if (!b) throw new Error("no such branch")
+    const prefix = this._prefixLen(b.id)
+    const changes = []
+    let visited = 0
+    let errors = 0
+    let prevKey
+    let prev = null
+    try {
+      s.view = b.id
+      for (let local = 0; local < b.trace.length; local++) {
+        this.positionTo(prefix + local)
+        const r = this.consoleEval(expr)
+        visited++
+        let key, val
+        if (r.error) {
+          errors++
+          val = { t: "err", v: String(r.error.v ?? r.error.msg ?? "error") }
+          key = "!" + val.v
+        } else {
+          val = r.value
+          key = JSON.stringify(val)
+        }
+        if (key !== prevKey) {
+          changes.push({ pos: prefix + local, local, value: val, prev })
+          prevKey = key
+          prev = val
+          if (changes.length >= limit) break
+        }
+      }
+    } finally {
+      s.view = saveView
+      this.positionTo(savePos)
+    }
+    return { changes, visited, errors }
+  }
+
+  /**
    * "What would have happened if?" — the counterfactual frontier. Fork the
    * SAME moment once per candidate edit (breadth-first level of the tree),
    * record each hypothetical future, and report the outcomes side by side.
@@ -939,7 +989,7 @@ export class TimeTravelEngine {
         while (mem[end] !== 0) end++
         const text = new TextDecoder().decode(mem.subarray(ptr, end))
         this.vm.exports.tt_free(ptr)
-        const OPS = ["eq", "includes", "startsWith", "endsWith", "indexOf"]
+        const OPS = ["eq", "includes", "startsWith", "endsWith", "indexOf", "lt", "le", "gt", "ge"]
         out = JSON.parse(text).map(([op, a, b]) => ({ op: OPS[op] ?? "eq", a, b }))
       }
       this._healTransaction()
@@ -1045,6 +1095,8 @@ export class TimeTravelEngine {
     // the base run's own journal seeds round 0 for free: everything the
     // program compared its real inputs against, before a single fork
     const baseJournal = this.comparisons()
+    const cmpKey = (e) => e.op + "\0" + e.a + "\0" + e.b
+    const baseCmp = new Set(baseJournal.map(cmpKey))
     const baseLines = new Set()
     for (const e of this.trace) if (e.entry && e.l > 0) baseLines.add(e.l)
 
@@ -1277,7 +1329,28 @@ export class TimeTravelEngine {
       const baseOver = node.oprobe ? JSON.parse(node.overrides) : {}
       const keyNeeds = new Map()
       const keyVia = []
+      // a non-numeric injected value turns into NaN under Number()/
+      // parseInt()/unary + — so a journal entry with exactly one NaN side
+      // is OUR value meeting a numeric constraint, and the NaN is the marker
+      const injNaN = !node.oprobe && Number.isNaN(Number(inj))
       for (const e of journal) {
+        const aNaN = e.a === "NaN"
+        if (injNaN && aNaN !== (e.b === "NaN")) {
+          const c = Number(aNaN ? e.b : e.a)
+          if (Number.isFinite(c)) {
+            // eq: the constant itself; strict bounds: one past the
+            // constant on the satisfying side; le/ge: the bound itself
+            const n =
+              e.op === "lt" ? (aNaN ? c - 1 : c + 1) : e.op === "gt" ? (aNaN ? c + 1 : c - 1) : c
+            const t = String(n)
+            // the conversion may have consumed the marker region (a
+            // numeric field inside a format) or the whole value — try both
+            emit(wrapVal(inj.replace(m, t)), t, [{ op: e.op, learned: String(c) }])
+            if (inj !== m) emit(wrapVal(t), t, [{ op: e.op, learned: String(c), whole: true }])
+            continue
+          }
+          // the "NaN" side is literal text, not a conversion — fall through
+        }
         // case-insensitive: a program that upper/lower-cases its input
         // before comparing still carries the canary, just re-cased
         const aHas = e.a.toLowerCase().includes(mLow)
@@ -1333,6 +1406,36 @@ export class TimeTravelEngine {
       return kids
     }
 
+    // when the canary was destroyed outright (sliced, remapped, hashed) no
+    // marker survives — but the candidate run's journal still names what
+    // its branches tested against. Entries the BASE run never performed
+    // are new behavior this candidate caused: their sides are
+    // execution-derived values, tried directly as the next candidates.
+    const differentialKids = (journal, node) => {
+      const inp = inputs[node.i]
+      const kids = []
+      const seen = new Set()
+      for (const e of journal) {
+        if (kids.length >= 6) break
+        if (e.op === "lt" || e.op === "le" || e.op === "gt" || e.op === "ge") continue
+        if (baseCmp.has(cmpKey(e))) continue
+        for (const v of e.a === e.b ? [e.a] : [e.a, e.b]) {
+          if (!v.length || v.length > CAP || seen.has(v)) continue
+          if (v === "NaN" || v === "Infinity" || v === "-Infinity" || v === "undefined" || v === "null") continue
+          seen.add(v)
+          const value = inp.kind === "message" ? JSON.stringify(v) : v
+          const via = [...node.via, { op: e.op, learned: v, observed: true }].slice(-8)
+          kids.push({ i: node.i, value, marker: v, via })
+          const lk = inp.kind + "\0" + (inp.key ?? "") + "\0" + (inp.store ?? "") + "\0" + value
+          if (!learnedSeen.has(lk)) {
+            learnedSeen.add(lk)
+            learned.push({ input: { kind: inp.kind, key: inp.key ?? null, ...(inp.store ? { store: inp.store } : {}) }, value, via })
+          }
+        }
+      }
+      return kids
+    }
+
     // ---- seeds: one canary probe per input; derivations of each input's
     // as-run value against the base journal (round 0, no forks spent);
     // caller-supplied extras
@@ -1383,7 +1486,9 @@ export class TimeTravelEngine {
               via: [{ op: "discovered", under: rec.edit }, { op: "probe", value: canary(idx) }],
             })
           if (rec.satisfied) continue
-          for (const kid of deriveFrom(journal, node)) {
+          let kids = deriveFrom(journal, node)
+          if (!kids.length && !rec.error && journal.length) kids = differentialKids(journal, node)
+          for (const kid of kids) {
             kid.parentNew = rec.newLines.length
             next.push(kid)
           }

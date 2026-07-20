@@ -358,6 +358,83 @@ console.log(unlocked);
   engine.switchTo(0)
 })
 
+test("numeric constraints journal as NaN-vs-number and teach exact values", async () => {
+  await engine.run(
+    `const params = new URLSearchParams(location.search);
+let level = "none";
+if (Number(params.get("page")) === 7) level = "lucky";
+console.log(level);
+`,
+    { url: "https://site.example/" },
+  )
+  // Number(canary) is NaN — the destroyed-string signature the C journal
+  // records; the constant on the other side becomes the next candidate
+  const r = await engine.exploreParams({ goal: `level === "lucky"` })
+  assert.ok(r.examples.length >= 1)
+  assert.equal(r.examples[0].params.page, "7")
+  assert.deepEqual(r.examples[0].assignments[0].via.at(-1), { op: "eq", learned: "7" })
+  assert.equal(r.explored, 2, "probe → 7: the numeric constant is learned, not guessed")
+})
+
+test("relational bounds teach one-past-the-bound candidates", async () => {
+  await engine.run(
+    `const q = +(new URLSearchParams(location.search).get("qty"));
+let ok = false;
+if (q > 3 && q <= 9) ok = true;
+console.log(ok);
+`,
+    { url: "https://site.example/" },
+  )
+  const r = await engine.exploreParams({ goal: `ok === true` })
+  assert.ok(r.examples.length >= 1)
+  // q > 3 journals as (NaN gt 3) — the satisfying candidate is 4
+  assert.equal(r.examples[0].params.qty, "4")
+  assert.deepEqual(r.examples[0].assignments[0].via.at(-1), { op: "gt", learned: "3" })
+})
+
+test("a destroyed canary still learns via differential journal entries", async () => {
+  await engine.run(
+    `const raw = new URLSearchParams(location.search).get("code") || "";
+let win = false;
+if (raw.slice(0, 3) === "sky") win = true;
+console.log(win);
+`,
+    { url: "https://site.example/" },
+  )
+  // slice(0,3) truncates the canary to "ttc" — no marker survives. But the
+  // probe run performed a comparison the base run never did: its sides are
+  // execution-derived candidates, and "sky" satisfies on the next round
+  const r = await engine.exploreParams({ goal: `win === true` })
+  assert.ok(r.examples.length >= 1)
+  assert.equal(r.examples[0].params.code, "sky")
+  const last = r.examples[0].assignments[0].via.at(-1)
+  assert.equal(last.op, "eq")
+  assert.equal(last.learned, "sky")
+  assert.equal(last.observed, true, "provenance marks the value as journal-observed, not marker-attributed")
+})
+
+test("searchChanges tells one expression's story through time", async () => {
+  await engine.run(
+    `let total = 0;
+for (const d of [30, -45, 60]) {
+  total += d;
+}
+console.log(total);
+`,
+  )
+  const r = engine.searchChanges("total")
+  // initial (undeclared) state, then every distinct value in order
+  const vals = r.changes.map((c) => String(c.value.v))
+  assert.ok(vals.length >= 4)
+  assert.deepEqual(vals.slice(-4), ["0", "30", "-15", "45"])
+  // each change is jumpable and the value holds there
+  const at = r.changes.at(-1)
+  engine.positionTo(at.pos)
+  assert.equal(engine.consoleEval("total").value.v, 45)
+  // prev links chain the story
+  assert.equal(String(r.changes.at(-1).prev.v), "-15")
+})
+
 test("suggestEdits proposes storage writes with values learned from the run", async () => {
   await engine.run(
     `const pref = localStorage.getItem("accent") || "plain";

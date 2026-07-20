@@ -163,6 +163,31 @@ assert.match(backOnMain, /swaps: 13/, "the ORIGINAL future is intact and visible
 assert.ok(!/swaps: 101/.test(backOnMain), "no bleed-through from the forked timeline")
 console.log("branch strip: fork retained, original timeline restored on click")
 
+// --- "when" search: the story of one expression through the timeline
+await page.fill("#whatif-probe", "swaps")
+await page.click("#whatif-when")
+const whenRows = await page.evaluate(() => [...document.querySelectorAll(".whatif-result")].map((r) => r.textContent))
+assert.ok(whenRows.length >= 3, `swaps changed value several times (${whenRows.length} rows)`)
+const lastRowText = whenRows[whenRows.length - 1]
+await page.click(".whatif-result:last-child")
+const afterJump = await page.evaluate(() => window.__timetravel.engine.pos)
+assert.match(lastRowText, new RegExp(`step ${afterJump}(\\D|$)`), "clicking a change row jumps to that step")
+console.log("when search:", whenRows.length, "value changes for swaps — row click jumped to step", afterJump)
+
+// --- changed-value highlight: stepping lights up mutated variables
+await page.evaluate(() => {
+  const { engine, ui } = window.__timetravel
+  engine.positionTo(Math.floor(engine.trace.length / 2))
+  ui.syncPosition()
+})
+let changedRows = 0
+for (let i = 0; i < 5 && !changedRows; i++) {
+  await page.click("#btn-fwd")
+  changedRows = await page.evaluate(() => document.querySelectorAll(".vrow.vchanged").length)
+}
+assert.ok(changedRows >= 1, "stepping highlights the variables whose values changed")
+console.log("changed-var highlight:", changedRows, "row(s) lit after stepping")
+
 // --- what-if: counterfactual fan-out + BFS probe scan, from mid-recording
 await page.evaluate(() => {
   const { engine, ui } = window.__timetravel

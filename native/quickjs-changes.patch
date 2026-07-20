@@ -9,7 +9,7 @@
  #define CONFIG_ATOMICS
  #endif
  
-@@ -360,6 +360,48 @@
+@@ -360,6 +360,65 @@
      JSInterruptHandler *interrupt_handler;
      void *interrupt_opaque;
  
@@ -23,6 +23,23 @@
 +    JSAtom tt_step_filename;
 +    /* step granularity: 0 = source line (+ backward jumps), 1 = every opcode */
 +    int tt_granularity;
++    /* TimeTravelJS: string-comparison journal — concolic value learning.
++       Records the string comparisons stepped user code performs (===/!==,
++       includes, startsWith, endsWith, indexOf) so the host can LEARN, from
++       execution, which values external inputs are checked against. Pure
++       observation, never semantics; lives in the runtime struct (linear
++       memory), so it snapshots, rewinds and forks with the machine and
++       each timeline reads back ITS OWN journal. Capped + deduplicated;
++       ASCII-printable, truncated copies only. */
++#define TT_CMP_MAX    384
++#define TT_CMP_STRMAX 64
++    struct TTCmpEnt {
++        uint32_t h;   /* dedup hash of (op, a, b) */
++        uint8_t op;   /* 0 eq, 1 includes, 2 startsWith, 3 endsWith, 4 indexOf */
++        char a[TT_CMP_STRMAX];
++        char b[TT_CMP_STRMAX];
++    } tt_cmp[TT_CMP_MAX];
++    int tt_cmp_len;
 +    /* TimeTravelJS stackless interpreter state. All interpreter frames live
 +       in this arena (linear memory), so when no native C frame is below the
 +       dispatch loop, suspending is just returning to the host and resuming
@@ -58,7 +75,7 @@
      JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
      void *host_promise_rejection_tracker_opaque;
  
-@@ -409,7 +451,7 @@
+@@ -409,7 +468,7 @@
      JSValue cur_func; /* current function, JS_UNDEFINED if the frame is detached */
      JSValue *arg_buf; /* arguments */
      JSValue *var_buf; /* variables */
@@ -67,7 +84,7 @@
      const uint8_t *cur_pc; /* only used in bytecode functions : PC of the
                          instruction after the call */
      int arg_count;
-@@ -417,8 +459,76 @@
+@@ -417,8 +476,76 @@
      /* only used in generators. Current stack pointer value. NULL if
         the function is running. */
      JSValue *cur_sp;
@@ -144,7 +161,7 @@
  typedef enum {
      JS_GC_OBJ_TYPE_JS_OBJECT,
      JS_GC_OBJ_TYPE_FUNCTION_BYTECODE,
-@@ -2081,6 +2191,9 @@
+@@ -2081,6 +2208,9 @@
      rt->malloc_ctx.mf = *mf;
      rt->malloc_ctx.malloc_state = ms;
      rt->malloc_gc_threshold = 256 * 1024;
@@ -154,7 +171,7 @@
  
      init_list_head(&rt->context_list);
      init_list_head(&rt->gc_obj_list);
-@@ -2134,6 +2247,10 @@
+@@ -2134,6 +2264,10 @@
  }
  
  /* default memory allocation functions with memory limitation */
@@ -165,7 +182,7 @@
  static size_t js_def_malloc_usable_size(const void *ptr)
  {
  #if defined(__APPLE__)
-@@ -2142,7 +2259,7 @@
+@@ -2142,7 +2276,7 @@
      return _msize((void *)ptr);
  #elif defined(__EMSCRIPTEN__)
      return 0;
@@ -174,7 +191,7 @@
      return malloc_usable_size((void *)ptr);
  #else
      /* change this to `return 0;` if compilation fails */
-@@ -2408,6 +2525,10 @@
+@@ -2408,6 +2542,10 @@
      int i;
  
      JS_FreeValueRT(rt, rt->current_exception);
@@ -185,7 +202,7 @@
  
      list_for_each_safe(el, el1, &rt->job_list) {
          JSJobEntry *e = list_entry(el, JSJobEntry, link);
-@@ -7499,6 +7620,160 @@
+@@ -7499,6 +7637,286 @@
      return 0;
  }
  
@@ -271,6 +288,132 @@
 +    return 0;
 +}
 +
++/* ---- TimeTravelJS comparison journal (concolic value learning) --------- */
++/* ASCII-printable truncated copy of a JS string value (any wide/non-ASCII
++   unit degrades to '?'): allocation-free and exception-free, so the note
++   sites can never perturb execution. */
++static void tt_cmp_copy(char *dst, JSValueConst v)
++{
++    JSString *p = JS_VALUE_GET_STRING(v);
++    uint32_t i, n;
++    n = p->len < TT_CMP_STRMAX - 1 ? p->len : TT_CMP_STRMAX - 1;
++    for (i = 0; i < n; i++) {
++        int c = p->is_wide_char ? p->u.str16[i] : p->u.str8[i];
++        dst[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
++    }
++}
++
++/* Hash, dedup and append one filled journal entry. */
++static void tt_cmp_store(JSRuntime *rt, struct TTCmpEnt *e)
++{
++    uint32_t h;
++    int i;
++
++    h = 0x811c9dc5;
++    h = (h ^ e->op) * 0x01000193;
++    for (i = 0; i < TT_CMP_STRMAX && e->a[i]; i++)
++        h = (h ^ (uint8_t)e->a[i]) * 0x01000193;
++    h = (h ^ 0xff) * 0x01000193;
++    for (i = 0; i < TT_CMP_STRMAX && e->b[i]; i++)
++        h = (h ^ (uint8_t)e->b[i]) * 0x01000193;
++    e->h = h;
++    for (i = 0; i < rt->tt_cmp_len; i++) {
++        if (rt->tt_cmp[i].h == h && rt->tt_cmp[i].op == e->op &&
++            !memcmp(rt->tt_cmp[i].a, e->a, TT_CMP_STRMAX) &&
++            !memcmp(rt->tt_cmp[i].b, e->b, TT_CMP_STRMAX))
++            return;
++    }
++    rt->tt_cmp[rt->tt_cmp_len++] = *e;
++}
++
++/* Record one user-code string comparison. Both values MUST be
++   JS_TAG_STRING (callers check). Capped, content-deduplicated. */
++static void tt_cmp_note(JSContext *ctx, int op, JSValueConst v1, JSValueConst v2)
++{
++    JSRuntime *rt = ctx->rt;
++    struct TTCmpEnt e;
++
++    if (rt->tt_cmp_len >= TT_CMP_MAX)
++        return;
++    memset(&e, 0, sizeof(e));
++    e.op = (uint8_t)op;
++    tt_cmp_copy(e.a, v1);
++    tt_cmp_copy(e.b, v2);
++    tt_cmp_store(rt, &e);
++}
++
++/* Decimal image of a journal-visible number (dst is pre-zeroed). */
++static void tt_cmp_fmt_num(char *dst, double d)
++{
++    if (isnan(d))
++        memcpy(dst, "NaN", 3);
++    else if (isinf(d))
++        memcpy(dst, d < 0 ? "-Infinity" : "Infinity", d < 0 ? 9 : 8);
++    else
++        snprintf(dst, TT_CMP_STRMAX, "%.14g", d);
++}
++
++/* Record one user-code numeric comparison where exactly ONE side is NaN
++   (callers check): the signature of a non-numeric string — the concolic
++   search's canary — pushed through Number()/parseInt()/unary +/loose ==.
++   Ordinary arithmetic almost never produces these, so numeric journaling
++   cannot flood the journal the way loop counters would. */
++static void tt_cmp_note_num(JSContext *ctx, int op, double d1, double d2)
++{
++    JSRuntime *rt = ctx->rt;
++    struct TTCmpEnt e;
++
++    if (rt->tt_cmp_len >= TT_CMP_MAX)
++        return;
++    memset(&e, 0, sizeof(e));
++    e.op = (uint8_t)op;
++    tt_cmp_fmt_num(e.a, d1);
++    tt_cmp_fmt_num(e.b, d2);
++    tt_cmp_store(rt, &e);
++}
++
++/* Journal gate for opcode sites: stepping armed and the EXECUTING function
++   is stepped user code. Keeps native/conformance runs (no step handler)
++   and the debugger's own setup layer entirely out of the journal. */
++static force_inline BOOL tt_cmp_gate_b(JSRuntime *rt, JSFunctionBytecode *b)
++{
++    if (!rt->tt_step_handler || rt->tt_cmp_len >= TT_CMP_MAX)
++        return FALSE;
++    if (!b->has_debug)
++        return FALSE;
++    if (rt->tt_step_filename != JS_ATOM_NULL &&
++        b->debug.filename != rt->tt_step_filename)
++        return FALSE;
++    return TRUE;
++}
++
++/* Journal gate for C-builtin sites (String.prototype methods): the nearest
++   bytecode caller decides whether this call came from user code. */
++static BOOL tt_cmp_gate_frame(JSRuntime *rt)
++{
++    JSStackFrame *sf;
++
++    if (!rt->tt_step_handler || rt->tt_cmp_len >= TT_CMP_MAX)
++        return FALSE;
++    for (sf = rt->current_stack_frame; sf; sf = sf->prev_frame) {
++        JSObject *p;
++        JSFunctionBytecode *b;
++        if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
++            continue;
++        p = JS_VALUE_GET_OBJ(sf->cur_func);
++        if (!js_class_has_bytecode(p->class_id))
++            continue;
++        b = p->u.func.function_bytecode;
++        if (!b->has_debug)
++            return FALSE;
++        if (rt->tt_step_filename != JS_ATOM_NULL &&
++            b->debug.filename != rt->tt_step_filename)
++            return FALSE;
++        return TRUE;
++    }
++    return FALSE;
++}
++
 +/* Called from the dispatch loop whenever stepping is enabled. Fires the host
 +   step handler on line changes and backward jumps (loop iterations).
 +   Returns nonzero to abort execution like an interrupt. */
@@ -346,7 +489,7 @@
  /* return a string property without executing arbitrary JS code (used
     when dumping the stack trace or in debug print). */
  static const char *get_prop_string(JSContext *ctx, JSValueConst obj, JSAtom prop)
-@@ -8274,6 +8549,15 @@
+@@ -8274,6 +8692,15 @@
                          return JS_UNDEFINED;
                      } else {
                          JSValue func = JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter);
@@ -362,7 +505,7 @@
                          /* Note: the field could be removed in the getter */
                          func = JS_DupValue(ctx, func);
                          return JS_CallFree(ctx, func, this_obj, 0, NULL);
-@@ -9031,6 +9315,7 @@
+@@ -9031,6 +9458,7 @@
  {
      JSAtom atom;
      JSValue ret;
@@ -370,7 +513,7 @@
  
      if (likely(JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT &&
                 JS_VALUE_GET_TAG(prop) == JS_TAG_INT)) {
-@@ -9086,6 +9371,9 @@
+@@ -9086,6 +9514,9 @@
          }
      } else {
      slow_path:
@@ -380,7 +523,7 @@
          /* ToObject() must be done before ToPropertyKey() */
          if (JS_IsNull(this_obj) || JS_IsUndefined(this_obj)) {
              JS_FreeValue(ctx, prop);
-@@ -9095,7 +9383,9 @@
+@@ -9095,7 +9526,9 @@
          JS_FreeValue(ctx, prop);
          if (unlikely(atom == JS_ATOM_NULL))
              return JS_EXCEPTION;
@@ -390,7 +533,7 @@
          JS_FreeAtom(ctx, atom);
          return ret;
      }
-@@ -9410,6 +9700,15 @@
+@@ -9410,6 +9843,15 @@
      JSValue ret, func;
      if (likely(setter)) {
          func = JS_MKPTR(JS_TAG_OBJECT, setter);
@@ -406,7 +549,7 @@
          /* Note: the field could be removed in the setter */
          func = JS_DupValue(ctx, func);
          ret = JS_CallFree(ctx, func, this_obj, 1, (JSValueConst *)&val);
-@@ -15137,7 +15436,6 @@
+@@ -15137,7 +15579,6 @@
              JS_FreeValue(ctx, op2);
              goto exception;
          }
@@ -414,7 +557,40 @@
          op2 = JS_ToPrimitiveFree(ctx, op2, HINT_NONE);
          if (JS_IsException(op2)) {
              JS_FreeValue(ctx, op1);
-@@ -16724,6 +17022,51 @@
+@@ -15573,6 +16014,11 @@
+             } else {
+                 d2 = JS_VALUE_GET_INT(op2);
+             }
++            /* concolic journal: a lone NaN in a relational test is a
++               destroyed canary meeting a numeric range (Number(x) > 3) */
++            if (unlikely(isnan(d1) != isnan(d2)) && tt_cmp_gate_frame(ctx->rt))
++                tt_cmp_note_num(ctx, op == OP_lt ? 5 : op == OP_lte ? 6 :
++                                     op == OP_gt ? 7 : 8, d1, d2);
+             switch(op) {
+             case OP_lt:
+                 res = (d1 < d2); /* if NaN return false */
+@@ -15636,6 +16082,9 @@
+             } else {
+                 d2 = JS_VALUE_GET_INT(op2);
+             }
++            /* concolic journal: destroyed canary in loose numeric eq */
++            if (unlikely(isnan(d1) != isnan(d2)) && tt_cmp_gate_frame(ctx->rt))
++                tt_cmp_note_num(ctx, 0, d1, d2);
+             res = (d1 == d2);
+         } else {
+             res = js_compare_bigint(ctx, OP_eq, op1, op2);
+@@ -15841,6 +16290,10 @@
+             break;
+         }
+     number_test:
++        /* concolic journal: a lone NaN against a number is a destroyed
++           canary meeting its constraint (Number(input) === 7) */
++        if (unlikely(isnan(d1) != isnan(d2)) && tt_cmp_gate_frame(ctx->rt))
++            tt_cmp_note_num(ctx, 0, d1, d2);
+         if (unlikely(eq_mode >= JS_EQ_SAME_VALUE)) {
+             JSFloat64Union u1, u2;
+             /* NaN is not always normalized, so this test is necessary */
+@@ -16724,6 +17177,51 @@
      return 0;
  }
  
@@ -466,7 +642,7 @@
  static __exception int js_for_await_of_next(JSContext *ctx, JSValue *sp)
  {
      JSValue obj, iter, next;
-@@ -17584,6 +17927,218 @@
+@@ -17584,6 +18082,218 @@
  
  #define JS_CALL_FLAG_COPY_ARGV   (1 << 1)
  #define JS_CALL_FLAG_GENERATOR   (1 << 2)
@@ -685,7 +861,7 @@
  
  static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                                    JSValueConst this_obj,
-@@ -17593,6 +18148,10 @@
+@@ -17593,6 +18303,10 @@
      JSCFunctionType func;
      JSObject *p;
      JSStackFrame sf_s, *sf = &sf_s, *prev_sf;
@@ -696,7 +872,7 @@
      JSValue ret_val;
      JSValueConst *arg_buf;
      int arg_count, i;
-@@ -17777,15 +18336,234 @@
+@@ -17777,15 +18491,234 @@
      JSContext *ctx;
      JSObject *p;
      JSFunctionBytecode *b;
@@ -935,7 +1111,7 @@
  #define CASE(op)        case op
  #define DEFAULT         default
  #define BREAK           break
-@@ -17800,7 +18578,7 @@
+@@ -17800,7 +18733,7 @@
  #include "quickjs-opcode.h"
          [ OP_COUNT ... 255 ] = &&case_default
      };
@@ -944,7 +1120,7 @@
  #ifdef OPCODE_ASM_LABEL
  #define CASE(op)        case_ ## op: asm volatile("label_" #op ":\n.globl label_" #op); dummy_case_ ## op
  #else
-@@ -17810,21 +18588,44 @@
+@@ -17810,21 +18743,44 @@
  #define BREAK           SWITCH(pc)
  #endif
  
@@ -997,7 +1173,7 @@
              sp = sf->cur_sp;
              sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
              pc = sf->cur_pc;
-@@ -17849,58 +18650,93 @@
+@@ -17849,58 +18805,93 @@
          return call_func(caller_ctx, func_obj, this_obj, argc,
                           (JSValueConst *)argv, flags);
      }
@@ -1136,7 +1312,7 @@
          SWITCH(pc) {
          CASE(OP_push_i32):
              *sp++ = JS_NewInt32(ctx, get_u32(pc));
-@@ -18214,6 +19050,78 @@
+@@ -18214,6 +19205,78 @@
              has_call_argc:
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1215,7 +1391,7 @@
                  ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                            JS_UNDEFINED, call_argc, call_argv, 0);
                  if (unlikely(JS_IsException(ret_val)))
-@@ -18232,6 +19140,52 @@
+@@ -18232,6 +19295,52 @@
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1268,7 +1444,7 @@
                  ret_val = JS_CallConstructorInternal(ctx, call_argv[-2],
                                                       call_argv[-1],
                                                       call_argc, call_argv, 0);
-@@ -18250,6 +19204,240 @@
+@@ -18250,6 +19359,240 @@
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1509,7 +1685,7 @@
                  ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                            JS_UNDEFINED, call_argc, call_argv, 0);
                  if (unlikely(JS_IsException(ret_val)))
-@@ -18994,17 +20182,148 @@
+@@ -18994,17 +20337,148 @@
              sp += 2;
              BREAK;
          CASE(OP_for_of_start):
@@ -1663,7 +1839,7 @@
                  if (js_for_of_next(ctx, sp, offset))
                      goto exception;
                  sp += 2;
-@@ -19042,9 +20361,93 @@
+@@ -19042,9 +20516,93 @@
              JS_FreeValue(ctx, sp[-1]); /* drop the next method */
              sp--;
              if (!JS_IsUndefined(sp[-1])) {
@@ -1758,7 +1934,7 @@
                  JS_FreeValue(ctx, sp[-1]);
              }
              sp--;
-@@ -19072,6 +20475,109 @@
+@@ -19072,6 +20630,109 @@
              {
                  JSValue ret;
                  sf->cur_pc = pc;
@@ -1868,7 +2044,7 @@
                  ret = JS_Call(ctx, sp[-3], sp[-4],
                                1, (JSValueConst *)(sp - 1));
                  if (JS_IsException(ret))
-@@ -19096,6 +20602,78 @@
+@@ -19096,6 +20757,78 @@
                  if (JS_IsUndefined(method) || JS_IsNull(method)) {
                      ret_flag = TRUE;
                  } else {
@@ -1947,7 +2123,7 @@
                      if (flags & 2) {
                          /* no argument */
                          ret = JS_CallFree(ctx, method, sp[-4],
-@@ -19173,9 +20751,33 @@
+@@ -19173,9 +20906,33 @@
                  } else {                                                \
                  name ## _slow_path:                                     \
                      sf->cur_pc = pc;                                    \
@@ -1981,7 +2157,7 @@
                  }                                                       \
                  if (keep) {                                             \
                      *sp++ = val;                                        \
-@@ -19230,8 +20832,35 @@
+@@ -19230,8 +20987,35 @@
                  } else {
                  put_field_slow_path:
                      sf->cur_pc = pc;
@@ -2017,7 +2193,7 @@
                      JS_FreeValue(ctx, obj);
                      sp -= 2;
                      if (unlikely(ret < 0))
-@@ -19299,8 +20928,32 @@
+@@ -19299,8 +21083,32 @@
                  atom = get_u32(pc);
                  pc += 4;
  
@@ -2050,7 +2226,7 @@
                  sp--;
                  if (unlikely(ret < 0))
                      goto exception;
-@@ -19439,7 +21092,18 @@
+@@ -19439,7 +21247,18 @@
                  } else {                                                \
                      name ## _slow_path:                                 \
                      sf->cur_pc = pc;                                    \
@@ -2069,7 +2245,7 @@
                      if (unlikely(JS_IsException(val))) {                \
                          if (keep)                                       \
                              sp[-1] = JS_UNDEFINED;                      \
-@@ -19447,6 +21111,28 @@
+@@ -19447,6 +21266,28 @@
                              sp--;                                       \
                          goto exception;                                 \
                      }                                                   \
@@ -2098,7 +2274,7 @@
                  }                                                       \
                  if (keep) {                                             \
                      sp[-1] = val;                                       \
-@@ -19495,6 +21181,8 @@
+@@ -19495,6 +21336,8 @@
                              goto exception;
                          }
                          sf->cur_pc = pc;
@@ -2107,7 +2283,7 @@
                          ret_val = JS_ToPropertyKey(ctx, sp[-1]);
                          if (JS_IsException(ret_val))
                              goto exception;
-@@ -19610,7 +21298,39 @@
+@@ -19610,7 +21453,39 @@
                  } else {
                  put_array_el_slow_path:
                      sf->cur_pc = pc;
@@ -2147,7 +2323,7 @@
                      JS_FreeValue(ctx, sp[-3]);
                      sp -= 3;
                      if (unlikely(ret < 0))
-@@ -19685,8 +21405,30 @@
+@@ -19685,8 +21560,30 @@
          CASE(OP_define_array_el):
              {
                  int ret;
@@ -2178,7 +2354,7 @@
                  sp -= 1;
                  if (unlikely(ret < 0))
                      goto exception;
-@@ -19695,10 +21437,55 @@
+@@ -19695,10 +21592,55 @@
  
          CASE(OP_append):    /* array pos enumobj -- array pos */
              {
@@ -2236,7 +2412,7 @@
              }
              BREAK;
  
-@@ -19760,6 +21547,7 @@
+@@ -19760,6 +21702,7 @@
                  } else {
                  add_slow_case:
                      sf->cur_pc = pc;
@@ -2244,7 +2420,7 @@
                      if (js_add_slow(ctx, sp))
                          goto exception;
                      sp--;
-@@ -19942,6 +21730,7 @@
+@@ -19942,6 +21885,7 @@
          CASE(OP_pow):
          binary_arith_slow:
              sf->cur_pc = pc;
@@ -2252,7 +2428,7 @@
              if (js_binary_arith_slow(ctx, sp, opcode))
                  goto exception;
              sp--;
-@@ -19958,6 +21747,8 @@
+@@ -19958,6 +21902,8 @@
                      sp[-1] = JS_NewInt32(ctx, JS_VALUE_GET_INT(op1));
                  } else {
                      sf->cur_pc = pc;
@@ -2261,7 +2437,7 @@
                      if (js_unary_arith_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -19991,6 +21782,8 @@
+@@ -19991,6 +21937,8 @@
                      sp[-1] = __JS_NewFloat64(ctx, d);
                  } else {
                      sf->cur_pc = pc;
@@ -2270,7 +2446,7 @@
                      if (js_unary_arith_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -20009,6 +21802,8 @@
+@@ -20009,6 +21957,8 @@
                  } else {
                  inc_slow:
                      sf->cur_pc = pc;
@@ -2279,7 +2455,7 @@
                      if (js_unary_arith_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -20027,6 +21822,8 @@
+@@ -20027,6 +21977,8 @@
                  } else {
                  dec_slow:
                      sf->cur_pc = pc;
@@ -2288,7 +2464,7 @@
                      if (js_unary_arith_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -20045,6 +21842,8 @@
+@@ -20045,6 +21997,8 @@
                  } else {
                  post_inc_slow:
                      sf->cur_pc = pc;
@@ -2297,7 +2473,7 @@
                      if (js_post_inc_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -20064,6 +21863,8 @@
+@@ -20064,6 +22018,8 @@
                  } else {
                  post_dec_slow:
                      sf->cur_pc = pc;
@@ -2306,7 +2482,7 @@
                      if (js_post_inc_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -20130,6 +21931,8 @@
+@@ -20130,6 +22086,8 @@
                      sp[-1] = JS_NewInt32(ctx, ~JS_VALUE_GET_INT(op1));
                  } else {
                      sf->cur_pc = pc;
@@ -2315,7 +2491,7 @@
                      if (js_not_slow(ctx, sp))
                          goto exception;
                  }
-@@ -20150,6 +21953,7 @@
+@@ -20150,6 +22108,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -2323,7 +2499,7 @@
                      if (js_binary_logic_slow(ctx, sp, opcode))
                          goto exception;
                      sp--;
-@@ -20171,6 +21975,7 @@
+@@ -20171,6 +22130,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -2331,7 +2507,7 @@
                      if (js_shr_slow(ctx, sp))
                          goto exception;
                      sp--;
-@@ -20191,6 +21996,7 @@
+@@ -20191,6 +22151,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -2339,7 +2515,7 @@
                      if (js_binary_logic_slow(ctx, sp, opcode))
                          goto exception;
                      sp--;
-@@ -20209,6 +22015,7 @@
+@@ -20209,6 +22170,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -2347,7 +2523,7 @@
                      if (js_binary_logic_slow(ctx, sp, opcode))
                          goto exception;
                      sp--;
-@@ -20227,6 +22034,7 @@
+@@ -20227,6 +22189,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -2355,7 +2531,7 @@
                      if (js_binary_logic_slow(ctx, sp, opcode))
                          goto exception;
                      sp--;
-@@ -20245,6 +22053,7 @@
+@@ -20245,6 +22208,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -2363,7 +2539,7 @@
                      if (js_binary_logic_slow(ctx, sp, opcode))
                          goto exception;
                      sp--;
-@@ -20253,7 +22062,7 @@
+@@ -20253,7 +22217,7 @@
              BREAK;
  
  
@@ -2372,15 +2548,21 @@
              CASE(opcode):                                 \
                  {                                         \
                  JSValue op1, op2;                         \
-@@ -20264,6 +22073,7 @@
+@@ -20264,6 +22228,13 @@
                      sp--;                                               \
                  } else {                                                \
                      sf->cur_pc = pc;                                    \
++                    /* concolic journal: user-code string (in)equality */ \
++                    if ((eq_mode) >= 1 &&                               \
++                        JS_VALUE_GET_TAG(op1) == JS_TAG_STRING &&       \
++                        JS_VALUE_GET_TAG(op2) == JS_TAG_STRING &&       \
++                        unlikely(tt_cmp_gate_b(rt, b)))                 \
++                        tt_cmp_note(ctx, 0, op1, op2);                  \
 +                    TT_COERCE_OPERANDS(((eq_mode) == 1 ? HINT_NONE : HINT_NUMBER), eq_mode) \
                      if (slow_call)                                      \
                          goto exception;                                 \
                      sp--;                                               \
-@@ -20271,14 +22081,14 @@
+@@ -20271,14 +22242,14 @@
                  }                                                       \
              BREAK
  
@@ -2403,7 +2585,7 @@
  
          CASE(OP_in):
              sf->cur_pc = pc;
-@@ -20293,10 +22103,59 @@
+@@ -20293,10 +22264,59 @@
              sp--;
              BREAK;
          CASE(OP_instanceof):
@@ -2467,7 +2649,7 @@
              BREAK;
          CASE(OP_typeof):
              {
-@@ -20350,6 +22209,10 @@
+@@ -20350,6 +22370,10 @@
                  break;
              default:
                  sf->cur_pc = pc;
@@ -2478,7 +2660,7 @@
                  ret_val = JS_ToPropertyKey(ctx, sp[-1]);
                  if (JS_IsException(ret_val))
                      goto exception;
-@@ -20411,9 +22274,37 @@
+@@ -20411,9 +22435,37 @@
                              } 
                              val = JS_UNDEFINED;
                          } else {
@@ -2517,7 +2699,7 @@
                          }
                          set_value(ctx, &sp[-1], val);
                          break;
-@@ -20426,10 +22317,38 @@
+@@ -20426,10 +22478,38 @@
                              if (is_strict_mode(ctx)) {
                                  JS_ThrowReferenceErrorNotDefined(ctx, atom);
                                  goto exception;
@@ -2557,7 +2739,7 @@
                          JS_FreeValue(ctx, sp[-1]);
                          sp -= 2;
                          if (unlikely(ret < 0))
-@@ -20455,9 +22374,34 @@
+@@ -20455,9 +22535,34 @@
                          if (!ret) {
                              val = JS_UNDEFINED;
                          } else {
@@ -2593,7 +2775,7 @@
                          }
                          *sp++ = val;
                          break;
-@@ -20578,8 +22522,228 @@
+@@ -20578,8 +22683,228 @@
      done_generator:
          sf->cur_pc = pc;
          sf->cur_sp = sp;
@@ -2824,7 +3006,7 @@
          if (unlikely(b->var_ref_count != 0)) {
              /* variable references reference the stack: must close them */
              close_var_refs(rt, b, sf);
-@@ -20588,9 +22752,847 @@
+@@ -20588,9 +22913,847 @@
          for(pval = local_buf; pval < sp; pval++) {
              JS_FreeValue(ctx, *pval);
          }
@@ -3674,7 +3856,7 @@
  }
  
  #ifdef OPCODE_ASM_LABEL
-@@ -20803,6 +23805,19 @@
+@@ -20803,6 +23966,19 @@
      sf->arg_count = arg_buf_len;
      sf->var_buf = sf->arg_buf + arg_buf_len;
      sf->cur_sp = sf->var_buf + b->var_count;
@@ -3694,7 +3876,7 @@
      sf->var_refs = (JSVarRef **)(sf->cur_sp + b->stack_size);
      for(i = 0; i < b->var_ref_count; i++)
          sf->var_refs[i] = NULL;
-@@ -20831,28 +23846,22 @@
+@@ -20831,28 +24007,22 @@
      JS_FreeValueRT(rt, s->this_val);
  }
  
@@ -3730,7 +3912,7 @@
          if (JS_IsUndefined(ret)) {
              ret = sf->cur_sp[-1];
              sf->cur_sp[-1] = JS_UNDEFINED;
-@@ -20862,12 +23871,29 @@
+@@ -20862,12 +24032,29 @@
  
          /* close the closure variables. */
          close_var_refs(rt, b, sf);
@@ -3761,7 +3943,7 @@
  static void __async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
  {
      /* cannot close the closure variables here because it would
-@@ -20915,6 +23941,12 @@
+@@ -20915,6 +24102,12 @@
      JSAsyncFunctionState *func_state;
  } JSGeneratorData;
  
@@ -3774,7 +3956,7 @@
  static void free_generator_stack_rt(JSRuntime *rt, JSGeneratorData *s)
  {
      if (s->state == JS_GENERATOR_STATE_COMPLETED)
-@@ -20952,26 +23984,27 @@
+@@ -20952,26 +24145,27 @@
      mark_func(rt, &s->func_state->header);
  }
  
@@ -3814,7 +3996,7 @@
          if (magic == GEN_MAGIC_NEXT) {
              goto exec_no_arg;
          } else {
-@@ -20983,7 +24016,7 @@
+@@ -20983,7 +24177,7 @@
      case JS_GENERATOR_STATE_SUSPENDED_YIELD:
          sf = &s->func_state->frame;
          /* cur_sp[-1] was set to JS_UNDEFINED in the previous call */
@@ -3823,7 +4005,7 @@
          if (magic == GEN_MAGIC_THROW &&
              s->state == JS_GENERATOR_STATE_SUSPENDED_YIELD) {
              JS_Throw(ctx, ret);
-@@ -20996,26 +24029,7 @@
+@@ -20996,26 +24190,7 @@
              s->func_state->throw_flag = FALSE;
          }
          s->state = JS_GENERATOR_STATE_EXECUTING;
@@ -3851,7 +4033,7 @@
      case JS_GENERATOR_STATE_COMPLETED:
      done:
          /* execution is finished */
-@@ -21025,10 +24039,10 @@
+@@ -21025,10 +24200,10 @@
              ret = JS_UNDEFINED;
              break;
          case GEN_MAGIC_RETURN:
@@ -3864,7 +4046,7 @@
              break;
          }
          break;
-@@ -21036,33 +24050,88 @@
+@@ -21036,33 +24211,88 @@
          ret = JS_ThrowTypeError(ctx, "cannot invoke a running generator");
          break;
      }
@@ -3963,7 +4145,7 @@
      obj = js_create_from_ctor(ctx, func_obj, JS_CLASS_GENERATOR);
      if (JS_IsException(obj))
          goto fail;
-@@ -21074,6 +24143,22 @@
+@@ -21074,6 +24304,22 @@
      return JS_EXCEPTION;
  }
  
@@ -3986,7 +4168,7 @@
  /* AsyncFunction */
  
  static void js_async_function_resolve_finalizer(JSRuntime *rt, JSValue val)
-@@ -21118,11 +24203,14 @@
+@@ -21118,11 +24364,14 @@
      return 0;
  }
  
@@ -4004,7 +4186,7 @@
      if (s->is_completed) {
          if (JS_IsException(func_ret)) {
              JSValue error;
-@@ -21173,6 +24261,11 @@
+@@ -21173,6 +24422,11 @@
      }
  }
  
@@ -4016,7 +4198,7 @@
  static JSValue js_async_function_resolve_call(JSContext *ctx,
                                                JSValueConst func_obj,
                                                JSValueConst this_obj,
-@@ -21448,25 +24541,38 @@
+@@ -21448,25 +24702,38 @@
      return res;
  }
  
@@ -4062,7 +4244,7 @@
              } else {
                  js_async_generator_complete(ctx, s);
              }
-@@ -21480,7 +24586,7 @@
+@@ -21480,7 +24747,7 @@
              } else {
                  js_async_generator_reject(ctx, s, next->result);
              }
@@ -4071,7 +4253,7 @@
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD:
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
              value = JS_DupValue(ctx, next->result);
-@@ -21495,59 +24601,78 @@
+@@ -21495,59 +24762,78 @@
                  s->func_state->frame.cur_sp[0] =
                      JS_NewInt32(ctx, next->completion_type);
                  s->func_state->frame.cur_sp++;
@@ -4195,7 +4377,7 @@
  }
  
  static JSValue js_async_generator_resolve_function(JSContext *ctx,
-@@ -21586,14 +24711,19 @@
+@@ -21586,14 +24872,19 @@
  }
  
  /* magic = GEN_MAGIC_x */
@@ -4218,7 +4400,7 @@
      promise = JS_NewPromiseCapability(ctx, resolving_funcs);
      if (JS_IsException(promise))
          return JS_EXCEPTION;
-@@ -21613,14 +24743,13 @@
+@@ -21613,14 +24904,13 @@
      if (!req)
          goto fail;
      req->completion_type = magic;
@@ -4236,7 +4418,7 @@
      return promise;
   fail:
      JS_FreeValue(ctx, resolving_funcs[0]);
-@@ -21629,29 +24758,54 @@
+@@ -21629,29 +24919,54 @@
      return JS_EXCEPTION;
  }
  
@@ -4303,7 +4485,7 @@
      obj = js_create_from_ctor(ctx, func_obj, JS_CLASS_ASYNC_GENERATOR);
      if (JS_IsException(obj))
          goto fail;
-@@ -21663,6 +24817,22 @@
+@@ -21663,6 +24978,22 @@
      return JS_EXCEPTION;
  }
  
@@ -4326,7 +4508,32 @@
  /* JS parser */
  
  enum {
-@@ -47146,6 +50316,12 @@
+@@ -45453,6 +48784,11 @@
+     JSString *p;
+     JSString *p1;
+ 
++    /* concolic journal: user code probing an external string's content */
++    if (JS_VALUE_GET_TAG(this_val) == JS_TAG_STRING && argc >= 1 &&
++        JS_VALUE_GET_TAG(argv[0]) == JS_TAG_STRING &&
++        tt_cmp_gate_frame(ctx->rt))
++        tt_cmp_note(ctx, 4, this_val, argv[0]);
+     str = JS_ToStringCheckObject(ctx, this_val);
+     if (JS_IsException(str))
+         return str;
+@@ -45521,6 +48857,12 @@
+     JSString *p;
+     JSString *p1;
+ 
++    /* concolic journal: format checks — includes/startsWith/endsWith.
++       op: magic 0 → 1 (includes), 1 → 2 (startsWith), 2 → 3 (endsWith) */
++    if (JS_VALUE_GET_TAG(this_val) == JS_TAG_STRING && argc >= 1 &&
++        JS_VALUE_GET_TAG(argv[0]) == JS_TAG_STRING &&
++        tt_cmp_gate_frame(ctx->rt))
++        tt_cmp_note(ctx, 1 + magic, this_val, argv[0]);
+     str = JS_ToStringCheckObject(ctx, this_val);
+     if (JS_IsException(str))
+         return str;
+@@ -47146,6 +50488,12 @@
  static void js_random_init(JSContext *ctx)
  {
      struct timeval tv;
@@ -4339,7 +4546,7 @@
      gettimeofday(&tv, NULL);
      ctx->random_state = ((int64_t)tv.tv_sec * 1000000) + tv.tv_usec;
      /* the state must be non zero */
-@@ -50587,8 +53763,15 @@
+@@ -50587,8 +53935,15 @@
      int res;
      JSValueConst args[3];
      JSPropertyDescriptor desc;
@@ -4355,7 +4562,7 @@
      if (!s)
          return JS_EXCEPTION;
      /* Note: recursion is possible thru the prototype of s->target */
-@@ -50599,6 +53782,30 @@
+@@ -50599,6 +53954,30 @@
          JS_FreeValue(ctx, method);
          return JS_EXCEPTION;
      }
@@ -4386,7 +4593,7 @@
      args[0] = s->target;
      args[1] = atom_val;
      args[2] = receiver;
-@@ -50636,8 +53843,14 @@
+@@ -50636,8 +54015,14 @@
      JSValue method, ret1, atom_val;
      int ret, res;
      JSValueConst args[4];
@@ -4401,7 +4608,7 @@
      if (!s)
          return -1;
      if (JS_IsUndefined(method)) {
-@@ -50650,6 +53863,31 @@
+@@ -50650,6 +54035,31 @@
          JS_FreeValue(ctx, method);
          return -1;
      }
@@ -4433,7 +4640,7 @@
      args[0] = s->target;
      args[1] = atom_val;
      args[2] = value;
-@@ -50842,8 +54080,13 @@
+@@ -50842,8 +54252,13 @@
      JSValueConst args[3];
      JSPropertyDescriptor desc;
      BOOL setting_not_configurable;
@@ -4447,7 +4654,7 @@
      if (!s)
          return -1;
      if (JS_IsUndefined(method)) {
-@@ -50860,6 +54103,32 @@
+@@ -50860,6 +54275,32 @@
          JS_FreeValue(ctx, method);
          return -1;
      }
@@ -4480,7 +4687,7 @@
      args[0] = s->target;
      args[1] = prop_val;
      args[2] = desc_val;
-@@ -53280,6 +56549,317 @@
+@@ -53280,6 +56721,317 @@
      return res;
  }
  
@@ -4798,7 +5005,7 @@
  static void js_promise_resolve_function_free_resolved(JSRuntime *rt,
                                                        JSPromiseFunctionDataResolved *sr)
  {
-@@ -55169,6 +58749,10 @@
+@@ -55169,6 +58921,10 @@
  /* OS dependent: return the UTC time in ms since 1970. */
  static int64_t date_now(void) {
      struct timeval tv;
@@ -4809,7 +5016,7 @@
      gettimeofday(&tv, NULL);
      return (int64_t)tv.tv_sec * 1000 + (tv.tv_usec / 1000);
  }
-@@ -61195,3 +64779,387 @@
+@@ -61195,3 +64951,410 @@
      JS_FreeValue(ctx, obj);
      return 0;
  }
@@ -4983,6 +5190,29 @@
 +    if (rt->tt_step_filename != JS_ATOM_NULL)
 +        JS_FreeAtomRT(rt, rt->tt_step_filename);
 +    rt->tt_step_filename = filename ? JS_NewAtom(ctx, filename) : JS_ATOM_NULL;
++}
++
++/* ---- comparison-journal API (concolic value learning) ------------------ */
++void JS_TTCmpClear(JSRuntime *rt)
++{
++    rt->tt_cmp_len = 0;
++}
++
++int JS_TTCmpCount(JSRuntime *rt)
++{
++    return rt->tt_cmp_len;
++}
++
++/* op: 0 eq, 1 includes, 2 startsWith, 3 endsWith, 4 indexOf. The returned
++   strings point into the runtime journal (NUL-terminated, ASCII). */
++int JS_TTCmpGet(JSRuntime *rt, int i, int *op, const char **a, const char **b)
++{
++    if (i < 0 || i >= rt->tt_cmp_len)
++        return -1;
++    *op = rt->tt_cmp[i].op;
++    *a = rt->tt_cmp[i].a;
++    *b = rt->tt_cmp[i].b;
++    return 0;
 +}
 +
 +/* Script-level let/const/class bindings live in ctx->global_var_obj, not on
@@ -5199,7 +5429,7 @@
 +}
 --- a/quickjs-2026-06-04/quickjs.h
 +++ b/vendor/quickjs/quickjs.h
-@@ -926,6 +926,57 @@
+@@ -926,6 +926,65 @@
  void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
  /* if can_block is TRUE, Atomics.wait() can be used */
  void JS_SetCanBlock(JSRuntime *rt, JS_BOOL can_block);
@@ -5248,6 +5478,14 @@
 +JSValue JS_TTLocals(JSContext *ctx, int level);
 +/* Restrict step hooks to functions compiled from `filename` (NULL = all). */
 +void JS_TTSetStepFilename(JSContext *ctx, const char *filename);
++/* Comparison journal (concolic value learning): every string comparison
++   stepped user code performs — ===/!==/==/!= plus includes/startsWith/
++   endsWith/indexOf — is recorded (capped, deduplicated, ASCII-truncated).
++   The journal lives in the runtime struct, so it snapshots and forks with
++   the machine. op: 0 eq, 1 includes, 2 startsWith, 3 endsWith, 4 indexOf. */
++void JS_TTCmpClear(JSRuntime *rt);
++int JS_TTCmpCount(JSRuntime *rt);
++int JS_TTCmpGet(JSRuntime *rt, int i, int *op, const char **a, const char **b);
 +/* Script-level let/const/class bindings (global lexical environment). */
 +JSValue JS_TTGlobalLexicals(JSContext *ctx);
 +/* Clear the runtime's stack-frame chain (fresh session over a rewound heap). */

@@ -183,6 +183,7 @@ export class DebuggerUI {
       whatifSuggest: $("#whatif-suggest"),
       whatifRun: $("#whatif-run"),
       whatifParams: $("#whatif-params"),
+      whatifWhen: $("#whatif-when"),
       whatifResults: $("#whatif-results"),
     }
     this._evalByBranch = new Map() // branchId -> saved evalEntries of that view
@@ -432,6 +433,7 @@ export class DebuggerUI {
     this.evalEntries = []
     this._evalByBranch = new Map()
     if (this.els.whatifResults) this.els.whatifResults.textContent = ""
+    this._varSnap = null
     this.els.code.readOnly = true
     this.els.runBtn.disabled = true
     this.setStatus("busy", "recording…")
@@ -577,6 +579,7 @@ export class DebuggerUI {
   _wireWhatIf() {
     this.els.whatifRun?.addEventListener("click", () => this.runWhatIf())
     this.els.whatifParams?.addEventListener("click", () => this.runParamSearch())
+    this.els.whatifWhen?.addEventListener("click", () => this.runWhenSearch())
     this.els.whatifSuggest?.addEventListener("click", () => {
       if (this.recording || !this.summary || !this.engine.suggestEdits) return
       try {
@@ -664,16 +667,60 @@ export class DebuggerUI {
 
   /** provenance chain of a learned value: probe → startsWith "pref:" → eq "gold" */
   viaText(assignments) {
+    const OPTXT = { lt: "<", le: "≤", gt: ">", ge: "≥" }
     const parts = []
     for (const a of assignments ?? []) {
       for (const v of a.via ?? []) {
         if (v.op === "probe") parts.push("probe")
         else if (v.op === "discovered") parts.push(`discovered under ${v.under}`)
         else if (v.op === "as-run" || v.op === "seed") parts.push(`${v.op} "${v.value}"`)
-        else parts.push(`${v.op}${v.key ? ` .${v.key}` : ""} → "${v.learned ?? ""}"${v.folded ? ` (as "${v.folded}")` : ""}`)
+        else
+          parts.push(
+            `${v.observed ? "saw " : ""}${OPTXT[v.op] ?? v.op}${v.key ? ` .${v.key}` : ""} → "${v.learned ?? ""}"${v.folded ? ` (as "${v.folded}")` : ""}`,
+          )
       }
     }
     return parts.join(" · ")
+  }
+
+  /** "🕐 when": every step where the probe expression changed value */
+  runWhenSearch() {
+    if (this.recording || !this.summary || !this.engine.searchChanges) return
+    const expr = (this.els.whatifProbe?.value ?? "").trim()
+    if (!expr) {
+      this.setStatus("ok", "when: put an expression in the probe field first")
+      return
+    }
+    this.stopPlay()
+    try {
+      const r = this.engine.searchChanges(expr, { limit: 60 })
+      this.renderWhenResults(expr, r)
+      this.setStatus("ok", `🕐 value changed at ${r.changes.length} of ${r.visited} steps on this timeline`)
+    } catch (err) {
+      this.setStatus("err", String(err.message || err))
+    }
+  }
+
+  renderWhenResults(expr, r) {
+    const box = this.els.whatifResults
+    if (!box) return
+    box.textContent = ""
+    box.append(el("div", "whatif-head", `when · ${expr} — the expression's story on this timeline`))
+    for (const c of r.changes) {
+      const row = el("button", "whatif-result")
+      row.append(span("whatif-edit", `step ${c.pos}`))
+      const out = span("whatif-outcome")
+      out.append(span("v-punct", "→ "))
+      out.append(c.value.t === "err" ? span("v-special", c.value.v) : inlinePreview(c.value, 1))
+      row.append(out)
+      row.title = "jump to the moment the value changed"
+      row.addEventListener("click", () => {
+        this.engine.positionTo(c.pos)
+        this.syncPosition(true)
+      })
+      box.append(row)
+    }
+    if (!r.changes.length) box.append(el("div", "whatif-head", "the expression never changed value"))
   }
 
   renderParamResults(goal, r) {
@@ -681,6 +728,13 @@ export class DebuggerUI {
     if (!box) return
     box.textContent = ""
     box.append(el("div", "whatif-head", r.alreadyTrue ? `already true as-run · ${goal}` : `input search · goal: ${goal}`))
+    if (!r.alreadyTrue && r.inputs?.length) {
+      const tag = (i) =>
+        (i.kind === "param" ? `?${i.key}` : i.kind === "storage" ? `${i.store === "sessionStorage" ? "session" : "local"}[${i.key}]` : "postMessage") +
+        (i.discovered ? " ⊕" : "") +
+        (i.neverFired ? " (never fired)" : "")
+      box.append(el("div", "whatif-head", `inputs consulted: ${r.inputs.map(tag).join(" · ")}${r.inputs.some((i) => i.discovered) ? " — ⊕ discovered mid-search" : ""}`))
+    }
     for (const ex of r.examples) {
       const row = el("button", "whatif-result")
       row.append(span("whatif-edit", ex.search ?? ex.edit))
@@ -846,16 +900,33 @@ export class DebuggerUI {
     varsHint.textContent = entry && entry.l ? `line ${entry.l}` : entry?.end ? "program finished" : ""
 
     const tree = el("div", "vtree")
+    // change tracking: a row whose value differs from the previously
+    // rendered step lights up — the eye follows state through time
+    const prevSnap = this._varSnap
+    const newSnap = new Map()
+    const addRow = (scope, k, v, cls, open) => {
+      const node = treeRow(k, v, cls, open)
+      const key = scope + "\0" + k
+      const sig = JSON.stringify(v)
+      newSnap.set(key, sig)
+      if (prevSnap && prevSnap.has(key) && prevSnap.get(key) !== sig) {
+        const row = node.classList?.contains("vrow") ? node : node.firstElementChild
+        row?.classList.add("vchanged")
+      }
+      tree.append(node)
+    }
     const locals = ins.frames?.[frameIdx] ?? []
     if (locals.length) {
       const fname = ins.stack?.[frameIdx]?.name
       tree.append(el("div", "vgroup-title", frameIdx === 0 ? "in scope" : `frame: ${fname || "(anonymous)"}`))
-      for (const [k, v] of locals) tree.append(treeRow(k, v, "vkey vkey-local", v && (v.t === "arr" || v.t === "obj") && this._smallEnough(v)))
+      for (const [k, v] of locals)
+        addRow("L:" + (fname ?? ""), k, v, "vkey vkey-local", v && (v.t === "arr" || v.t === "obj") && this._smallEnough(v))
     }
     if (ins.globals && ins.globals.length) {
       tree.append(el("div", "vgroup-title", "top level & globals"))
-      for (const [k, v] of ins.globals) tree.append(treeRow(k, v, "vkey"))
+      for (const [k, v] of ins.globals) addRow("G", k, v, "vkey")
     }
+    this._varSnap = newSnap
     if (!tree.childElementCount) tree.append(el("div", "empty-note", this.engine.pos === 0 ? "before first statement — step forward" : "no visible variables here"))
     varsBody.append(tree)
 

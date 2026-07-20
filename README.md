@@ -31,6 +31,11 @@ npm run build      # rebuild dist/quickjs-tt.wasm (clang + wasi-libc + binaryen)
 - **Real frames** — the variables panel reads arguments, locals, closure
   captures and TDZ slots straight out of the interpreter's stack frames via a
   C-level introspection API. Click any call-stack frame to see its locals.
+- **Change tracking through time** — stepping highlights every variable
+  whose value differs from the previously viewed moment, and the **🕐
+  when** search lists each step where a watched expression *changed*
+  value — "when did total go negative?" is one click, and every answer
+  row jumps straight to that moment.
 - **Everything is steppable** — `async`/`await`, promise jobs, generators,
   getters, constructors, class methods, callbacks inside `Array.map`: user
   code is **never transformed**; the VM itself pauses, wherever it is.
@@ -54,7 +59,9 @@ npm run build      # rebuild dist/quickjs-tt.wasm (clang + wasi-libc + binaryen)
   step once per candidate edit, records every hypothetical future, and
   shows the outcomes side by side with the first step where a probe turns
   true. `searchAll(expr)` BFS-scans a predicate across every state of every
-  timeline (each state visited exactly once); `explore({goal, depth})` goes
+  timeline (each state visited exactly once); `searchChanges(expr)`
+  reports every step where an expression's value changed — the 🕐 when
+  button; `explore({goal, depth})` goes
   further and *learns how the web platform API could have been used*: it
   reads candidate calls off the live document (events with real listeners,
   stylesheet classes, elements by id), forks each as a timeline, composes
@@ -314,7 +321,17 @@ compose: probe → `pref:<canary>` → `pref:gold`, with the whole chain
 kept as `via` provenance. Attribution is case-insensitive — a program
 that runs `raw.toUpperCase() === "GRANDE"` still carries the canary,
 re-cased — and each learned constant is tried in both its literal and
-lower-case spellings, so the goal picks the raw form it needs. Message
+lower-case spellings, so the goal picks the raw form it needs. Numeric
+gates are visible the same way: a non-numeric canary pushed through
+`Number()`/`parseInt()`/unary `+` compares as `NaN`, the journal
+records the lone-NaN entry, and the constant on the other side comes
+back exact (`=== 7` teaches `7`) or one past the bound (`> 3` teaches
+`4`, `<= 9` teaches `9`). When a transform destroys the canary outright
+— `raw.slice(0, 3) === "sky"` — the search falls back to *differential*
+attribution: journal entries this candidate's run performed that the
+base run never did are new behavior the candidate caused, so their
+sides are execution-derived values, tried directly (`"sky"` wins on the
+next round, marked `observed` in its provenance). Message
 probes deliver a recording proxy whose property reads return marked
 strings, so object protocols reveal their keys the same way
 (`{type:"sync"}`, then `{type:"sync", mode:"fast"}` behind an `&&`).
@@ -412,15 +429,20 @@ site nor the tests require a C toolchain.
   `message` listeners, not hand-rolled string parsing of
   `location.search`.
 - The comparison journal sees **string-to-string** comparisons (plus
-  `includes`/`startsWith`/`endsWith`/`indexOf`): numeric comparisons,
-  regex tests and comparisons against `null`/`undefined` don't journal,
+  `includes`/`startsWith`/`endsWith`/`indexOf`) and **lone-NaN numeric**
+  comparisons — `===`/`==`/`<`/`<=`/`>`/`>=` where exactly one side is
+  NaN, the signature of a non-numeric input pushed through
+  `Number()`/`parseInt()`/unary `+`. Comparisons between two *finite*
+  numbers (`n === 42` after a numeric guard already admitted `n`), regex
+  tests and comparisons against `null`/`undefined` don't journal;
   entries degrade to ASCII and cap at 64 chars / 384 entries. Case
-  transforms are survived (attribution is case-insensitive), but a
-  transform that *destroys* the canary — hashing, slicing to a fixed
-  width, character remapping — breaks attribution for that branch.
-  Values reachable only through such code can be handed to
-  `exploreParams` as `{extraValues}` — they enter the same BFS and
-  derive further from there.
+  transforms are survived (attribution is case-insensitive), and a
+  canary destroyed outright (sliced, remapped) falls back to
+  differential attribution — comparisons the base run never performed
+  are tried directly — which recovers plain constants but not composed
+  formats. Values reachable only through hostile transforms (hashing)
+  can be handed to `exploreParams` as `{extraValues}` — they enter the
+  same BFS and derive further from there.
 
 ## Conformance: tc39/test262
 

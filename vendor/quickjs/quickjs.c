@@ -7734,14 +7734,35 @@ static void tt_cmp_copy(char *dst, JSValueConst v)
     }
 }
 
+/* Hash, dedup and append one filled journal entry. */
+static void tt_cmp_store(JSRuntime *rt, struct TTCmpEnt *e)
+{
+    uint32_t h;
+    int i;
+
+    h = 0x811c9dc5;
+    h = (h ^ e->op) * 0x01000193;
+    for (i = 0; i < TT_CMP_STRMAX && e->a[i]; i++)
+        h = (h ^ (uint8_t)e->a[i]) * 0x01000193;
+    h = (h ^ 0xff) * 0x01000193;
+    for (i = 0; i < TT_CMP_STRMAX && e->b[i]; i++)
+        h = (h ^ (uint8_t)e->b[i]) * 0x01000193;
+    e->h = h;
+    for (i = 0; i < rt->tt_cmp_len; i++) {
+        if (rt->tt_cmp[i].h == h && rt->tt_cmp[i].op == e->op &&
+            !memcmp(rt->tt_cmp[i].a, e->a, TT_CMP_STRMAX) &&
+            !memcmp(rt->tt_cmp[i].b, e->b, TT_CMP_STRMAX))
+            return;
+    }
+    rt->tt_cmp[rt->tt_cmp_len++] = *e;
+}
+
 /* Record one user-code string comparison. Both values MUST be
    JS_TAG_STRING (callers check). Capped, content-deduplicated. */
 static void tt_cmp_note(JSContext *ctx, int op, JSValueConst v1, JSValueConst v2)
 {
     JSRuntime *rt = ctx->rt;
     struct TTCmpEnt e;
-    uint32_t h;
-    int i;
 
     if (rt->tt_cmp_len >= TT_CMP_MAX)
         return;
@@ -7749,21 +7770,37 @@ static void tt_cmp_note(JSContext *ctx, int op, JSValueConst v1, JSValueConst v2
     e.op = (uint8_t)op;
     tt_cmp_copy(e.a, v1);
     tt_cmp_copy(e.b, v2);
-    h = 0x811c9dc5;
-    h = (h ^ e.op) * 0x01000193;
-    for (i = 0; i < TT_CMP_STRMAX && e.a[i]; i++)
-        h = (h ^ (uint8_t)e.a[i]) * 0x01000193;
-    h = (h ^ 0xff) * 0x01000193;
-    for (i = 0; i < TT_CMP_STRMAX && e.b[i]; i++)
-        h = (h ^ (uint8_t)e.b[i]) * 0x01000193;
-    e.h = h;
-    for (i = 0; i < rt->tt_cmp_len; i++) {
-        if (rt->tt_cmp[i].h == h && rt->tt_cmp[i].op == e.op &&
-            !memcmp(rt->tt_cmp[i].a, e.a, TT_CMP_STRMAX) &&
-            !memcmp(rt->tt_cmp[i].b, e.b, TT_CMP_STRMAX))
-            return;
-    }
-    rt->tt_cmp[rt->tt_cmp_len++] = e;
+    tt_cmp_store(rt, &e);
+}
+
+/* Decimal image of a journal-visible number (dst is pre-zeroed). */
+static void tt_cmp_fmt_num(char *dst, double d)
+{
+    if (isnan(d))
+        memcpy(dst, "NaN", 3);
+    else if (isinf(d))
+        memcpy(dst, d < 0 ? "-Infinity" : "Infinity", d < 0 ? 9 : 8);
+    else
+        snprintf(dst, TT_CMP_STRMAX, "%.14g", d);
+}
+
+/* Record one user-code numeric comparison where exactly ONE side is NaN
+   (callers check): the signature of a non-numeric string — the concolic
+   search's canary — pushed through Number()/parseInt()/unary +/loose ==.
+   Ordinary arithmetic almost never produces these, so numeric journaling
+   cannot flood the journal the way loop counters would. */
+static void tt_cmp_note_num(JSContext *ctx, int op, double d1, double d2)
+{
+    JSRuntime *rt = ctx->rt;
+    struct TTCmpEnt e;
+
+    if (rt->tt_cmp_len >= TT_CMP_MAX)
+        return;
+    memset(&e, 0, sizeof(e));
+    e.op = (uint8_t)op;
+    tt_cmp_fmt_num(e.a, d1);
+    tt_cmp_fmt_num(e.b, d2);
+    tt_cmp_store(rt, &e);
 }
 
 /* Journal gate for opcode sites: stepping armed and the EXECUTING function
@@ -15977,6 +16014,11 @@ static no_inline int js_relational_slow(JSContext *ctx, JSValue *sp,
             } else {
                 d2 = JS_VALUE_GET_INT(op2);
             }
+            /* concolic journal: a lone NaN in a relational test is a
+               destroyed canary meeting a numeric range (Number(x) > 3) */
+            if (unlikely(isnan(d1) != isnan(d2)) && tt_cmp_gate_frame(ctx->rt))
+                tt_cmp_note_num(ctx, op == OP_lt ? 5 : op == OP_lte ? 6 :
+                                     op == OP_gt ? 7 : 8, d1, d2);
             switch(op) {
             case OP_lt:
                 res = (d1 < d2); /* if NaN return false */
@@ -16040,6 +16082,9 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
             } else {
                 d2 = JS_VALUE_GET_INT(op2);
             }
+            /* concolic journal: destroyed canary in loose numeric eq */
+            if (unlikely(isnan(d1) != isnan(d2)) && tt_cmp_gate_frame(ctx->rt))
+                tt_cmp_note_num(ctx, 0, d1, d2);
             res = (d1 == d2);
         } else {
             res = js_compare_bigint(ctx, OP_eq, op1, op2);
@@ -16245,6 +16290,10 @@ static BOOL js_strict_eq2(JSContext *ctx, JSValue op1, JSValue op2,
             break;
         }
     number_test:
+        /* concolic journal: a lone NaN against a number is a destroyed
+           canary meeting its constraint (Number(input) === 7) */
+        if (unlikely(isnan(d1) != isnan(d2)) && tt_cmp_gate_frame(ctx->rt))
+            tt_cmp_note_num(ctx, 0, d1, d2);
         if (unlikely(eq_mode >= JS_EQ_SAME_VALUE)) {
             JSFloat64Union u1, u2;
             /* NaN is not always normalized, so this test is necessary */
