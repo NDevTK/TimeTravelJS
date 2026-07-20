@@ -418,6 +418,16 @@ struct JSRuntime {
     int tt_defer_kind;  /* armed intent: 1 = accessor/put sites, 3 = define sites */
     void *tt_defer_aux; /* proxy-get handoff: arena block [target, key,
                            receiver, handler]; set with the deferred trap */
+    /* pump protocol: a C builtin that must invoke user callbacks stages its
+       loop state here (armed by the call sites) and returns UNINITIALIZED;
+       the dispatch loop then drives the callbacks as in-loop frames and
+       continues the builtin's loop in the per-kind pump handler. */
+    BOOL tt_pump_ok;     /* the active call site understands pump requests */
+    void *tt_pump_cfun;  /* identity of the callee the site armed for: only
+                            that exact C function may stage (C-to-C reentry
+                            must never see the token) */
+    int tt_pump_kind;    /* TT_PUMP_* */
+    void *tt_pump_state; /* per-kind state (js_malloc'd), owned by the pump */
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
@@ -534,7 +544,30 @@ enum {
     TT_FRAME_PROXY_DEFINE,  /* bytecode proxy defineProperty trap (field init) */
     TT_FRAME_ITER_CLOSE,    /* bytecode .return for OP_iterator_close          */
     TT_FRAME_INIT_CTOR,     /* implicit derived ctor's parent call (OP_init_ctor) */
+    TT_FRAME_PUMP,          /* one user callback of a pumped C builtin; the pop
+                               feeds tt_pump_step which pushes the next one   */
 };
+
+/* pump kinds (rt->tt_pump_kind / TTPump.kind) */
+enum {
+    TT_PUMP_ARRAY_EVERY = 1,  /* every/some/forEach/map/filter (+TA)  */
+    TT_PUMP_ARRAY_FIND,       /* find/findIndex/findLast/findLastIndex */
+    TT_PUMP_ARRAY_REDUCE,     /* reduce/reduceRight                    */
+    TT_PUMP_ARRAY_SORT,       /* sort with a bytecode comparator       */
+    TT_PUMP_MAP_FOREACH,      /* Map/Set forEach                       */
+};
+
+/* the arena descriptor every pumped call shares: how to complete the call
+   site, the per-callback argument slots, and the builtin's loop state */
+typedef struct TTPump {
+    int kind;
+    int base;        /* call-site fixup: -1 OP_call shape, -2 method shape */
+    int cargc;       /* call-site argument count on the caller stack       */
+    int tail;        /* caller returns the result (OP_tail_call*)          */
+    void *state;     /* per-kind malloc'd state                            */
+    int nargs;       /* live argument slots below                          */
+    JSValue args[4]; /* owned arguments of the callback frame in flight    */
+} TTPump;
 
 /* how a TT_FRAME_GEN resume returns its value to the caller (tt_aux_i is
    magic | (shape << 8) | (extra << 16)) */
@@ -18149,6 +18182,412 @@ static JSValue *tt_arena_alloc_vals(JSRuntime *rt, size_t n)
     return (JSValue *)base;
 }
 
+/* ==== builtin callback pumps ============================================
+   A C builtin whose spec loop invokes user callbacks cannot suspend, so —
+   when the call site armed the protocol — it stages its loop state and
+   returns UNINITIALIZED instead of calling the first callback. The call
+   site then drives every callback as an ordinary in-loop frame
+   (TT_FRAME_PUMP) and tt_pump_step continues the builtin's loop between
+   frames. The staging builtin keeps its whole prologue (coercions,
+   species creation, initial-accumulator scan) so semantics stay in one
+   place; only the loop body is mirrored here. */
+
+#define special_every    0
+#define special_some     1
+#define special_forEach  2
+#define special_map      3
+#define special_filter   4
+#define special_TA       8
+#define special_reduce       0
+#define special_reduceRight  1
+enum {
+    ArrayFind,
+    ArrayFindIndex,
+    ArrayFindLast,
+    ArrayFindLastIndex,
+};
+
+static void map_decref_record(JSRuntime *rt, JSMapRecord *mr);
+
+typedef struct {
+    JSValue obj, func, this_arg, ret;
+    int special;
+    int64_t len, k, n;
+} TTPumpArrayEvery;
+
+typedef struct {
+    JSValue obj, this_val, func, this_arg;
+    int mode;
+    int64_t len, k, end;
+    int dir;
+} TTPumpArrayFind;
+
+typedef struct {
+    JSValue obj, func, acc;
+    int special;
+    int64_t len, k;
+} TTPumpArrayReduce;
+
+typedef struct {
+    JSValue obj, func;
+    JSValue *items, *tmp;
+    int64_t m, undef;
+    int64_t w, lo, mid, hi, i, j, kk;
+} TTPumpArraySort;
+
+typedef struct {
+    JSValue map_obj, func, this_arg;
+    JSMapRecord *cur; /* locked while its callback is in flight */
+    JSMapState *ms;
+    int is_set;
+} TTPumpMapForEach;
+
+static void tt_pump_free_args(JSContext *ctx, TTPump *pu)
+{
+    int i;
+    for (i = 0; i < pu->nargs; i++)
+        JS_FreeValue(ctx, pu->args[i]);
+    pu->nargs = 0;
+}
+
+static void tt_pump_abort(JSContext *ctx, TTPump *pu)
+{
+    tt_pump_free_args(ctx, pu);
+    switch (pu->kind) {
+    case TT_PUMP_ARRAY_EVERY: {
+        TTPumpArrayEvery *st = pu->state;
+        JS_FreeValue(ctx, st->obj);
+        JS_FreeValue(ctx, st->func);
+        JS_FreeValue(ctx, st->this_arg);
+        JS_FreeValue(ctx, st->ret);
+        break;
+    }
+    case TT_PUMP_ARRAY_FIND: {
+        TTPumpArrayFind *st = pu->state;
+        JS_FreeValue(ctx, st->obj);
+        JS_FreeValue(ctx, st->this_val);
+        JS_FreeValue(ctx, st->func);
+        JS_FreeValue(ctx, st->this_arg);
+        break;
+    }
+    case TT_PUMP_ARRAY_REDUCE: {
+        TTPumpArrayReduce *st = pu->state;
+        JS_FreeValue(ctx, st->obj);
+        JS_FreeValue(ctx, st->func);
+        JS_FreeValue(ctx, st->acc);
+        break;
+    }
+    case TT_PUMP_ARRAY_SORT: {
+        TTPumpArraySort *st = pu->state;
+        int64_t x;
+        for (x = 0; x < st->m; x++)
+            JS_FreeValue(ctx, st->items[x]);
+        js_free_rt(ctx->rt, st->items);
+        js_free_rt(ctx->rt, st->tmp);
+        JS_FreeValue(ctx, st->obj);
+        JS_FreeValue(ctx, st->func);
+        break;
+    }
+    case TT_PUMP_MAP_FOREACH: {
+        TTPumpMapForEach *st = pu->state;
+        if (st->cur)
+            map_decref_record(ctx->rt, st->cur);
+        JS_FreeValue(ctx, st->map_obj);
+        JS_FreeValue(ctx, st->func);
+        JS_FreeValue(ctx, st->this_arg);
+        break;
+    }
+    }
+    js_free_rt(ctx->rt, pu->state);
+    pu->state = NULL;
+}
+
+/* Continue a pumped builtin. cb_result is owned (ignored when first).
+   Returns 0 = next callback staged in pu->args / *pfunc / *pthis,
+   1 = builtin finished with *pres, -1 = exception (state freed). */
+static int tt_pump_step(JSContext *ctx, TTPump *pu, JSValue cb_result,
+                        BOOL first, JSValue *pfunc, JSValue *pthis,
+                        JSValue *pres)
+{
+    switch (pu->kind) {
+    case TT_PUMP_ARRAY_EVERY: {
+        TTPumpArrayEvery *st = pu->state;
+        if (!first) {
+            switch (st->special) {
+            case special_every:
+            case special_every | special_TA:
+                if (!JS_ToBoolFree(ctx, cb_result)) {
+                    JS_FreeValue(ctx, st->ret);
+                    st->ret = JS_FALSE;
+                    goto every_done;
+                }
+                break;
+            case special_some:
+            case special_some | special_TA:
+                if (JS_ToBoolFree(ctx, cb_result)) {
+                    JS_FreeValue(ctx, st->ret);
+                    st->ret = JS_TRUE;
+                    goto every_done;
+                }
+                break;
+            case special_map:
+                if (JS_DefinePropertyValueInt64(ctx, st->ret, st->k, cb_result,
+                                                JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                    goto every_fail;
+                break;
+            case special_map | special_TA:
+                if (JS_SetPropertyValue(ctx, st->ret, JS_NewInt32(ctx, st->k),
+                                        cb_result, JS_PROP_THROW) < 0)
+                    goto every_fail;
+                break;
+            case special_filter:
+            case special_filter | special_TA:
+                if (JS_ToBoolFree(ctx, cb_result)) {
+                    if (JS_DefinePropertyValueInt64(ctx, st->ret, st->n++,
+                                                    JS_DupValue(ctx, pu->args[0]),
+                                                    JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                        goto every_fail;
+                }
+                break;
+            default:
+                JS_FreeValue(ctx, cb_result);
+                break;
+            }
+            st->k++;
+        }
+        tt_pump_free_args(ctx, pu);
+        for (; st->k < st->len; st->k++) {
+            JSValue val;
+            int present;
+            if (st->special & special_TA) {
+                val = JS_GetPropertyInt64(ctx, st->obj, st->k);
+                if (JS_IsException(val))
+                    goto every_fail;
+                present = TRUE;
+            } else {
+                present = JS_TryGetPropertyInt64(ctx, st->obj, st->k, &val);
+                if (present < 0)
+                    goto every_fail;
+            }
+            if (present) {
+                pu->args[0] = val;
+                pu->args[1] = JS_NewInt64(ctx, st->k);
+                pu->args[2] = JS_DupValue(ctx, st->obj);
+                pu->nargs = 3;
+                *pfunc = st->func;
+                *pthis = st->this_arg;
+                return 0;
+            }
+        }
+    every_done:
+        /* the TA-filter tail (species re-create + set) never pumps: TA
+           filter stages only for plain-array paths */
+        *pres = st->ret;
+        st->ret = JS_UNDEFINED;
+        tt_pump_abort(ctx, pu);
+        return 1;
+    every_fail:
+        tt_pump_abort(ctx, pu);
+        return -1;
+    }
+    case TT_PUMP_ARRAY_FIND: {
+        TTPumpArrayFind *st = pu->state;
+        if (!first) {
+            if (JS_ToBoolFree(ctx, cb_result)) {
+                if (st->mode == ArrayFindIndex || st->mode == ArrayFindLastIndex)
+                    *pres = JS_NewInt64(ctx, st->k);
+                else
+                    *pres = JS_DupValue(ctx, pu->args[0]);
+                tt_pump_abort(ctx, pu);
+                return 1;
+            }
+            st->k += st->dir;
+        }
+        tt_pump_free_args(ctx, pu);
+        if (st->k != st->end) {
+            JSValue val = JS_GetPropertyInt64(ctx, st->obj, st->k);
+            if (JS_IsException(val)) {
+                tt_pump_abort(ctx, pu);
+                return -1;
+            }
+            pu->args[0] = val;
+            pu->args[1] = JS_NewInt64(ctx, st->k);
+            pu->args[2] = JS_DupValue(ctx, st->this_val);
+            pu->nargs = 3;
+            *pfunc = st->func;
+            *pthis = st->this_arg;
+            return 0;
+        }
+        if (st->mode == ArrayFindIndex || st->mode == ArrayFindLastIndex)
+            *pres = JS_NewInt32(ctx, -1);
+        else
+            *pres = JS_UNDEFINED;
+        tt_pump_abort(ctx, pu);
+        return 1;
+    }
+    case TT_PUMP_ARRAY_REDUCE: {
+        TTPumpArrayReduce *st = pu->state;
+        if (!first) {
+            JS_FreeValue(ctx, st->acc);
+            st->acc = cb_result;
+            st->k++;
+        }
+        tt_pump_free_args(ctx, pu);
+        for (; st->k < st->len; st->k++) {
+            int64_t k1 = (st->special & special_reduceRight)
+                             ? st->len - st->k - 1 : st->k;
+            JSValue val;
+            int present;
+            if (st->special & special_TA) {
+                val = JS_GetPropertyInt64(ctx, st->obj, k1);
+                if (JS_IsException(val))
+                    goto reduce_fail;
+                present = TRUE;
+            } else {
+                present = JS_TryGetPropertyInt64(ctx, st->obj, k1, &val);
+                if (present < 0)
+                    goto reduce_fail;
+            }
+            if (present) {
+                pu->args[0] = JS_DupValue(ctx, st->acc);
+                pu->args[1] = val;
+                pu->args[2] = JS_NewInt64(ctx, k1);
+                pu->args[3] = JS_DupValue(ctx, st->obj);
+                pu->nargs = 4;
+                *pfunc = st->func;
+                *pthis = JS_UNDEFINED;
+                return 0;
+            }
+        }
+        *pres = st->acc;
+        st->acc = JS_UNDEFINED;
+        tt_pump_abort(ctx, pu);
+        return 1;
+    reduce_fail:
+        tt_pump_abort(ctx, pu);
+        return -1;
+    }
+    case TT_PUMP_ARRAY_SORT: {
+        TTPumpArraySort *st = pu->state;
+        if (!first) {
+            /* SortCompare tail: ToNumber(result), NaN -> 0 */
+            double r = 0;
+            if (JS_ToFloat64Free(ctx, &r, cb_result)) {
+                tt_pump_abort(ctx, pu);
+                return -1;
+            }
+            if (isnan(r))
+                r = 0;
+            if (r <= 0)
+                st->tmp[st->kk++] = st->items[st->i++];
+            else
+                st->tmp[st->kk++] = st->items[st->j++];
+        }
+        tt_pump_free_args(ctx, pu);
+        for (;;) {
+            if (st->w >= st->m)
+                break;
+            if (st->lo >= st->m - st->w) {
+                st->w *= 2;
+                st->lo = 0;
+                continue;
+            }
+            if (st->mid < 0) {
+                st->mid = st->lo + st->w;
+                st->hi = st->lo + 2 * st->w < st->m ? st->lo + 2 * st->w : st->m;
+                st->i = st->lo;
+                st->j = st->mid;
+                st->kk = st->lo;
+            }
+            if (st->i < st->mid && st->j < st->hi) {
+                pu->args[0] = JS_DupValue(ctx, st->items[st->i]);
+                pu->args[1] = JS_DupValue(ctx, st->items[st->j]);
+                pu->nargs = 2;
+                *pfunc = st->func;
+                *pthis = JS_UNDEFINED;
+                return 0;
+            }
+            while (st->i < st->mid)
+                st->tmp[st->kk++] = st->items[st->i++];
+            while (st->j < st->hi)
+                st->tmp[st->kk++] = st->items[st->j++];
+            {
+                int64_t t;
+                for (t = st->lo; t < st->hi; t++)
+                    st->items[t] = st->tmp[t];
+            }
+            st->lo += 2 * st->w;
+            st->mid = -1;
+        }
+        /* write back: sorted values, then the undefined tail */
+        {
+            int64_t x;
+            for (x = 0; x < st->m; x++) {
+                if (JS_SetPropertyInt64(ctx, st->obj, x, st->items[x]) < 0) {
+                    st->items[x] = JS_UNDEFINED; /* consumed */
+                    while (++x < st->m) {
+                        JS_FreeValue(ctx, st->items[x]);
+                        st->items[x] = JS_UNDEFINED;
+                    }
+                    st->m = 0;
+                    tt_pump_abort(ctx, pu);
+                    return -1;
+                }
+                st->items[x] = JS_UNDEFINED; /* consumed by the set */
+            }
+            for (x = 0; x < st->undef; x++) {
+                if (JS_SetPropertyInt64(ctx, st->obj, st->m + x, JS_UNDEFINED) < 0) {
+                    st->m = 0;
+                    tt_pump_abort(ctx, pu);
+                    return -1;
+                }
+            }
+        }
+        *pres = st->obj;
+        st->obj = JS_UNDEFINED;
+        st->m = 0;
+        tt_pump_abort(ctx, pu);
+        return 1;
+    }
+    case TT_PUMP_MAP_FOREACH: {
+        TTPumpMapForEach *st = pu->state;
+        struct list_head *el;
+        if (!first) {
+            JSMapRecord *done = st->cur;
+            JS_FreeValue(ctx, cb_result);
+            el = done->link.next;
+            st->cur = NULL;
+            map_decref_record(ctx->rt, done);
+        } else {
+            el = st->ms->records.next;
+        }
+        tt_pump_free_args(ctx, pu);
+        while (el != &st->ms->records) {
+            JSMapRecord *mr = list_entry(el, JSMapRecord, link);
+            if (!mr->empty) {
+                mr->ref_count++;
+                st->cur = mr;
+                pu->args[1] = JS_DupValue(ctx, mr->key);
+                pu->args[0] = st->is_set ? JS_DupValue(ctx, mr->key)
+                                         : JS_DupValue(ctx, mr->value);
+                pu->args[2] = JS_DupValue(ctx, st->map_obj);
+                pu->nargs = 3;
+                *pfunc = st->func;
+                *pthis = st->this_arg;
+                return 0;
+            }
+            el = el->next;
+        }
+        *pres = JS_UNDEFINED;
+        tt_pump_abort(ctx, pu);
+        return 1;
+    }
+    }
+    *pres = JS_UNDEFINED;
+    tt_pump_abort(ctx, pu);
+    return 1;
+}
+
 /* Which method would OrdinaryToPrimitive invoke on val, starting at step?
    Pure property reads — never calls user code. Returns 0 = none callable
    remain, 1 = *pmethod is bytecode (owned), 2 = *pmethod is a C callable
@@ -18561,6 +19000,59 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         argc = sf->tt_orig_argc;                                 \
         argv = sf->tt_orig_argv;                                 \
     } while (0)
+
+/* After an armed C call returned the pump sentinel: take over the staged
+   builtin. Either pushes the first callback frame, completes immediately
+   (ret_val replaced, control falls through to the classic completion), or
+   raises. Uses the surrounding locals of JS_CallInternal. */
+#define TT_PUMP_TRY_START(basev, tailv)                                     \
+    if (unlikely(JS_VALUE_GET_TAG(ret_val) == JS_TAG_UNINITIALIZED &&       \
+                 rt->tt_pump_state != NULL)) {                              \
+        TTPump *pu;                                                         \
+        JSValue pfn, pth, pres;                                             \
+        int pact;                                                           \
+        pu = (TTPump *)tt_arena_alloc_vals(rt,                              \
+            (sizeof(TTPump) + sizeof(JSValue) - 1) / sizeof(JSValue));      \
+        if (unlikely(!pu)) {                                                \
+            rt->tt_pump_state = NULL;                                       \
+            JS_ThrowStackOverflow(caller_ctx);                              \
+            goto exception;                                                 \
+        }                                                                   \
+        pu->kind = rt->tt_pump_kind;                                        \
+        pu->state = rt->tt_pump_state;                                      \
+        rt->tt_pump_state = NULL;                                           \
+        pu->base = (basev);                                                 \
+        pu->cargc = call_argc;                                              \
+        pu->tail = (tailv);                                                 \
+        pu->nargs = 0;                                                      \
+        pact = tt_pump_step(ctx, pu, JS_UNDEFINED, TRUE, &pfn, &pth, &pres);\
+        if (pact < 0) {                                                     \
+            rt->tt_arena_top = (uint8_t *)pu;                               \
+            goto exception;                                                 \
+        }                                                                   \
+        if (pact == 0) {                                                    \
+            if (unlikely(js_poll_interrupts(ctx))) {                        \
+                tt_pump_abort(ctx, pu);                                     \
+                rt->tt_arena_top = (uint8_t *)pu;                           \
+                goto exception;                                             \
+            }                                                               \
+            sf->cur_sp = sp;                                                \
+            pf_func = pfn;                                                  \
+            pf_this = pth;                                                  \
+            pf_new_target = JS_UNDEFINED;                                   \
+            pf_argc = pu->nargs;                                            \
+            pf_argv = pu->args;                                             \
+            pf_flags = 0;                                                   \
+            pf_kind = TT_FRAME_PUMP;                                        \
+            pf_ctor_this = JS_UNDEFINED;                                    \
+            pf_aux = pu;                                                    \
+            pf_aux_i = 0;                                                   \
+            pf_cargc = pu->cargc;                                           \
+            goto push_frame;                                                \
+        }                                                                   \
+        rt->tt_arena_top = (uint8_t *)pu;                                   \
+        ret_val = pres;                                                     \
+    }
 
 /* Coerce ONE object-valued stack slot toward a primitive IN-LOOP, exactly
    as JS_ToPrimitiveFree would: a present Symbol.toPrimitive is read once
@@ -19283,8 +19775,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         TT_COERCE_SLOT(&call_argv[0], HINT_STRING, cs_delta, 1)
                     }
                 }
+                rt->tt_pump_ok = TRUE;
+                rt->tt_pump_cfun = NULL;
+                if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
+                    JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_C_FUNCTION)
+                    rt->tt_pump_cfun =
+                        (void *)JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.c_function.generic;
                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                           JS_UNDEFINED, call_argc, call_argv, 0);
+                rt->tt_pump_ok = FALSE;
+                rt->tt_pump_cfun = NULL;
+                TT_PUMP_TRY_START(-1, opcode == OP_tail_call)
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
                 if (opcode == OP_tail_call)
@@ -19599,8 +20100,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     pf_aux = NULL;
                     goto push_frame;
                 }
+                rt->tt_pump_ok = TRUE;
+                rt->tt_pump_cfun = NULL;
+                if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
+                    JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_C_FUNCTION)
+                    rt->tt_pump_cfun =
+                        (void *)JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.c_function.generic;
                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                           JS_UNDEFINED, call_argc, call_argv, 0);
+                rt->tt_pump_ok = FALSE;
+                rt->tt_pump_cfun = NULL;
+                TT_PUMP_TRY_START(-2, opcode == OP_tail_call_method)
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
                 if (opcode == OP_tail_call_method)
@@ -23027,6 +23537,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, ic_eb[0]); /* super */
                 rt->tt_arena_top = (uint8_t *)ic_eb;
             }
+            if (kind == TT_FRAME_PUMP) {
+                TTPump *pu = (TTPump *)kaux_p;
+                tt_pump_abort(ctx, pu);
+                rt->tt_arena_top = (uint8_t *)pu;
+            }
             if (kind == TT_FRAME_APPLY)
                 free_arg_list(ctx, kaux_p, (uint32_t)kaux);
             if (kind == TT_FRAME_FOROF) {
@@ -23484,6 +23999,49 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ret_val = ctor_this;
             }
             *sp++ = ret_val;
+            goto restart;
+        }
+        if (kind == TT_FRAME_PUMP) {
+            TTPump *pu = (TTPump *)kaux_p;
+            JSValue pfn, pth, pres;
+            int pact = tt_pump_step(ctx, pu, ret_val, FALSE, &pfn, &pth, &pres);
+            if (pact < 0) {
+                rt->tt_arena_top = (uint8_t *)pu;
+                goto exception;
+            }
+            if (pact == 0) {
+                if (unlikely(js_poll_interrupts(ctx))) {
+                    tt_pump_abort(ctx, pu);
+                    rt->tt_arena_top = (uint8_t *)pu;
+                    goto exception;
+                }
+                sf->cur_sp = sp;
+                pf_func = pfn;
+                pf_this = pth;
+                pf_new_target = JS_UNDEFINED;
+                pf_argc = pu->nargs;
+                pf_argv = pu->args;
+                pf_flags = 0;
+                pf_kind = TT_FRAME_PUMP;
+                pf_ctor_this = JS_UNDEFINED;
+                pf_aux = pu;
+                pf_aux_i = 0;
+                pf_cargc = pu->cargc;
+                goto push_frame;
+            }
+            {
+                int p_cargc = pu->cargc, p_base = pu->base, p_tail = pu->tail;
+                JSValue *cav;
+                rt->tt_arena_top = (uint8_t *)pu;
+                cav = sp - p_cargc;
+                for (i = p_base; i < p_cargc; i++)
+                    JS_FreeValue(ctx, cav[i]);
+                sp = cav + p_base;
+                ret_val = pres;
+                if (p_tail)
+                    goto done;
+                *sp++ = ret_val;
+            }
             goto restart;
         }
         {
@@ -45373,12 +45931,6 @@ exception:
     return JS_EXCEPTION;
 }
 
-#define special_every    0
-#define special_some     1
-#define special_forEach  2
-#define special_map      3
-#define special_filter   4
-#define special_TA       8
 
 static JSValue js_typed_array___speciesCreate(JSContext *ctx,
                                               JSValueConst this_val,
@@ -45447,6 +45999,32 @@ static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
         break;
     }
     n = 0;
+
+    /* TimeTravelJS: with a bytecode callback and an armed call site, hand
+       the loop to the interpreter pump so every callback is parkable. The
+       TA-filter tail (species re-create) keeps the classic path. */
+    if (ctx->rt->tt_pump_ok &&
+        ctx->rt->tt_pump_cfun == (void *)js_array_every &&
+        JS_VALUE_GET_TAG(func) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(func)->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+        special != (special_filter | special_TA)) {
+        TTPumpArrayEvery *st = js_malloc(ctx, sizeof(*st));
+        if (st) {
+            st->obj = obj;
+            st->func = JS_DupValue(ctx, func);
+            st->this_arg = JS_DupValue(ctx, this_arg);
+            st->ret = ret;
+            st->special = special;
+            st->len = len;
+            st->k = 0;
+            st->n = 0;
+            ctx->rt->tt_pump_kind = TT_PUMP_ARRAY_EVERY;
+            ctx->rt->tt_pump_state = st;
+            ctx->rt->tt_pump_ok = FALSE;
+            return JS_UNINITIALIZED;
+        }
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
 
     for(k = 0; k < len; k++) {
         if (special & special_TA) {
@@ -45538,8 +46116,6 @@ exception:
     return JS_EXCEPTION;
 }
 
-#define special_reduce       0
-#define special_reduceRight  1
 
 static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv, int special)
@@ -45592,6 +46168,28 @@ static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
             }
         }
     }
+    /* TimeTravelJS: pump bytecode reducers in-loop (the accumulator scan
+       above already resolved the starting k) */
+    if (ctx->rt->tt_pump_ok &&
+        ctx->rt->tt_pump_cfun == (void *)js_array_reduce &&
+        JS_VALUE_GET_TAG(func) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(func)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+        TTPumpArrayReduce *st = js_malloc(ctx, sizeof(*st));
+        if (st) {
+            st->obj = obj;
+            st->func = JS_DupValue(ctx, func);
+            st->acc = acc;
+            st->special = special;
+            st->len = len;
+            st->k = k;
+            ctx->rt->tt_pump_kind = TT_PUMP_ARRAY_REDUCE;
+            ctx->rt->tt_pump_state = st;
+            ctx->rt->tt_pump_ok = FALSE;
+            return JS_UNINITIALIZED;
+        }
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+
     for (; k < len; k++) {
         k1 = (special & special_reduceRight) ? len - k - 1 : k;
         if (special & special_TA) {
@@ -45806,12 +46404,6 @@ static JSValue js_array_lastIndexOf(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
-enum {
-    ArrayFind,
-    ArrayFindIndex,
-    ArrayFindLast,
-    ArrayFindLastIndex,
-};
 
 static JSValue js_array_find(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv, int mode)
@@ -45843,6 +46435,30 @@ static JSValue js_array_find(JSContext *ctx, JSValueConst this_val,
         k = len - 1;
         dir = -1;
         end = -1;
+    }
+
+    /* TimeTravelJS: pump bytecode predicates in-loop */
+    if (ctx->rt->tt_pump_ok &&
+        ctx->rt->tt_pump_cfun == (void *)js_array_find &&
+        JS_VALUE_GET_TAG(func) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(func)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+        TTPumpArrayFind *st = js_malloc(ctx, sizeof(*st));
+        if (st) {
+            st->obj = obj;
+            st->this_val = JS_DupValue(ctx, this_val);
+            st->func = JS_DupValue(ctx, func);
+            st->this_arg = JS_DupValue(ctx, this_arg);
+            st->mode = mode;
+            st->len = len;
+            st->k = k;
+            st->end = end;
+            st->dir = dir;
+            ctx->rt->tt_pump_kind = TT_PUMP_ARRAY_FIND;
+            ctx->rt->tt_pump_state = st;
+            ctx->rt->tt_pump_ok = FALSE;
+            return JS_UNINITIALIZED;
+        }
+        JS_FreeValue(ctx, JS_GetException(ctx));
     }
 
     // TODO(bnoordhuis) add fast path for fast arrays
@@ -46614,6 +47230,55 @@ static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
         if (check_function(ctx, asc.method))
             goto exception;
         asc.has_method = 1;
+    }
+    /* TimeTravelJS: a plain fast array with a bytecode comparator sorts
+       through the interpreter pump (stable bottom-up merge; SortCompare
+       NaN handling and the undefined/hole tail per spec), so comparator
+       code is parkable. Anything exotic keeps the classic path. */
+    if (ctx->rt->tt_pump_ok &&
+        ctx->rt->tt_pump_cfun == (void *)js_array_sort && asc.has_method &&
+        JS_VALUE_GET_TAG(asc.method) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(asc.method)->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+        JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(this_val)->class_id == JS_CLASS_ARRAY &&
+        JS_VALUE_GET_OBJ(this_val)->fast_array &&
+        JS_VALUE_GET_OBJ(this_val)->shape->proto ==
+            JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY])) {
+        JSObject *ap = JS_VALUE_GET_OBJ(this_val);
+        uint32_t n0 = ap->u.array.count, x;
+        TTPumpArraySort *st = js_malloc(ctx, sizeof(*st));
+        JSValue *items = st ? js_malloc(ctx, sizeof(JSValue) * (n0 + 1)) : NULL;
+        JSValue *tmp = items ? js_malloc(ctx, sizeof(JSValue) * (n0 + 1)) : NULL;
+        if (tmp) {
+            int64_t m = 0, undef = 0;
+            for (x = 0; x < n0; x++) {
+                JSValue v = ap->u.array.u.values[x];
+                if (JS_IsUndefined(v))
+                    undef++;
+                else
+                    items[m++] = JS_DupValue(ctx, v);
+            }
+            st->obj = JS_DupValue(ctx, this_val);
+            st->func = JS_DupValue(ctx, asc.method);
+            st->items = items;
+            st->tmp = tmp;
+            st->m = m;
+            st->undef = undef;
+            st->w = 1;
+            st->lo = 0;
+            st->mid = -1;
+            st->hi = 0;
+            st->i = 0;
+            st->j = 0;
+            st->kk = 0;
+            ctx->rt->tt_pump_kind = TT_PUMP_ARRAY_SORT;
+            ctx->rt->tt_pump_state = st;
+            ctx->rt->tt_pump_ok = FALSE;
+            return JS_UNINITIALIZED;
+        }
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        js_free(ctx, items);
+        js_free(ctx, st);
     }
     obj = JS_ToObject(ctx, this_val);
     if (js_get_length64(ctx, &len, obj))
@@ -55599,6 +56264,27 @@ static JSValue js_map_forEach(JSContext *ctx, JSValueConst this_val,
         this_arg = JS_UNDEFINED;
     if (check_function(ctx, func))
         return JS_EXCEPTION;
+    /* TimeTravelJS: pump bytecode callbacks in-loop (records are locked
+       around each callback exactly like the classic walk) */
+    if (ctx->rt->tt_pump_ok &&
+        ctx->rt->tt_pump_cfun == (void *)js_map_forEach &&
+        JS_VALUE_GET_TAG(func) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(func)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+        TTPumpMapForEach *st = js_malloc(ctx, sizeof(*st));
+        if (st) {
+            st->map_obj = JS_DupValue(ctx, this_val);
+            st->func = JS_DupValue(ctx, func);
+            st->this_arg = JS_DupValue(ctx, this_arg);
+            st->cur = NULL;
+            st->ms = s;
+            st->is_set = magic != 0;
+            ctx->rt->tt_pump_kind = TT_PUMP_MAP_FOREACH;
+            ctx->rt->tt_pump_state = st;
+            ctx->rt->tt_pump_ok = FALSE;
+            return JS_UNINITIALIZED;
+        }
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
     /* Note: the list can be modified while traversing it, but the
        current element is locked */
     el = s->records.next;

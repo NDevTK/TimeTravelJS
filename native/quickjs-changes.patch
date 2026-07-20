@@ -9,7 +9,7 @@
  #define CONFIG_ATOMICS
  #endif
  
-@@ -360,6 +360,65 @@
+@@ -360,6 +360,75 @@
      JSInterruptHandler *interrupt_handler;
      void *interrupt_opaque;
  
@@ -71,11 +71,21 @@
 +    int tt_defer_kind;  /* armed intent: 1 = accessor/put sites, 3 = define sites */
 +    void *tt_defer_aux; /* proxy-get handoff: arena block [target, key,
 +                           receiver, handler]; set with the deferred trap */
++    /* pump protocol: a C builtin that must invoke user callbacks stages its
++       loop state here (armed by the call sites) and returns UNINITIALIZED;
++       the dispatch loop then drives the callbacks as in-loop frames and
++       continues the builtin's loop in the per-kind pump handler. */
++    BOOL tt_pump_ok;     /* the active call site understands pump requests */
++    void *tt_pump_cfun;  /* identity of the callee the site armed for: only
++                            that exact C function may stage (C-to-C reentry
++                            must never see the token) */
++    int tt_pump_kind;    /* TT_PUMP_* */
++    void *tt_pump_state; /* per-kind state (js_malloc'd), owned by the pump */
 +
      JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
      void *host_promise_rejection_tracker_opaque;
  
-@@ -409,7 +468,7 @@
+@@ -409,7 +478,7 @@
      JSValue cur_func; /* current function, JS_UNDEFINED if the frame is detached */
      JSValue *arg_buf; /* arguments */
      JSValue *var_buf; /* variables */
@@ -84,7 +94,7 @@
      const uint8_t *cur_pc; /* only used in bytecode functions : PC of the
                          instruction after the call */
      int arg_count;
-@@ -417,8 +476,77 @@
+@@ -417,8 +486,100 @@
      /* only used in generators. Current stack pointer value. NULL if
         the function is running. */
      JSValue *cur_sp;
@@ -146,7 +156,30 @@
 +    TT_FRAME_PROXY_DEFINE,  /* bytecode proxy defineProperty trap (field init) */
 +    TT_FRAME_ITER_CLOSE,    /* bytecode .return for OP_iterator_close          */
 +    TT_FRAME_INIT_CTOR,     /* implicit derived ctor's parent call (OP_init_ctor) */
++    TT_FRAME_PUMP,          /* one user callback of a pumped C builtin; the pop
++                               feeds tt_pump_step which pushes the next one   */
 +};
++
++/* pump kinds (rt->tt_pump_kind / TTPump.kind) */
++enum {
++    TT_PUMP_ARRAY_EVERY = 1,  /* every/some/forEach/map/filter (+TA)  */
++    TT_PUMP_ARRAY_FIND,       /* find/findIndex/findLast/findLastIndex */
++    TT_PUMP_ARRAY_REDUCE,     /* reduce/reduceRight                    */
++    TT_PUMP_ARRAY_SORT,       /* sort with a bytecode comparator       */
++    TT_PUMP_MAP_FOREACH,      /* Map/Set forEach                       */
++};
++
++/* the arena descriptor every pumped call shares: how to complete the call
++   site, the per-callback argument slots, and the builtin's loop state */
++typedef struct TTPump {
++    int kind;
++    int base;        /* call-site fixup: -1 OP_call shape, -2 method shape */
++    int cargc;       /* call-site argument count on the caller stack       */
++    int tail;        /* caller returns the result (OP_tail_call*)          */
++    void *state;     /* per-kind malloc'd state                            */
++    int nargs;       /* live argument slots below                          */
++    JSValue args[4]; /* owned arguments of the callback frame in flight    */
++} TTPump;
 +
 +/* how a TT_FRAME_GEN resume returns its value to the caller (tt_aux_i is
 +   magic | (shape << 8) | (extra << 16)) */
@@ -162,7 +195,7 @@
  typedef enum {
      JS_GC_OBJ_TYPE_JS_OBJECT,
      JS_GC_OBJ_TYPE_FUNCTION_BYTECODE,
-@@ -742,6 +870,8 @@
+@@ -742,6 +903,8 @@
      uint32_t atom_count;
      uint8_t in_prototype_chain;
      uint8_t is_array;
@@ -171,7 +204,7 @@
      JSPropertyEnum *tab_atom; /* is_array = FALSE */
  } JSForInIterator;
  
-@@ -2081,6 +2211,9 @@
+@@ -2081,6 +2244,9 @@
      rt->malloc_ctx.mf = *mf;
      rt->malloc_ctx.malloc_state = ms;
      rt->malloc_gc_threshold = 256 * 1024;
@@ -181,7 +214,7 @@
  
      init_list_head(&rt->context_list);
      init_list_head(&rt->gc_obj_list);
-@@ -2134,6 +2267,10 @@
+@@ -2134,6 +2300,10 @@
  }
  
  /* default memory allocation functions with memory limitation */
@@ -192,7 +225,7 @@
  static size_t js_def_malloc_usable_size(const void *ptr)
  {
  #if defined(__APPLE__)
-@@ -2142,7 +2279,7 @@
+@@ -2142,7 +2312,7 @@
      return _msize((void *)ptr);
  #elif defined(__EMSCRIPTEN__)
      return 0;
@@ -201,7 +234,7 @@
      return malloc_usable_size((void *)ptr);
  #else
      /* change this to `return 0;` if compilation fails */
-@@ -2408,6 +2545,10 @@
+@@ -2408,6 +2578,10 @@
      int i;
  
      JS_FreeValueRT(rt, rt->current_exception);
@@ -212,7 +245,7 @@
  
      list_for_each_safe(el, el1, &rt->job_list) {
          JSJobEntry *e = list_entry(el, JSJobEntry, link);
-@@ -7499,6 +7640,286 @@
+@@ -7499,6 +7673,286 @@
      return 0;
  }
  
@@ -499,7 +532,7 @@
  /* return a string property without executing arbitrary JS code (used
     when dumping the stack trace or in debug print). */
  static const char *get_prop_string(JSContext *ctx, JSValueConst obj, JSAtom prop)
-@@ -8274,6 +8695,15 @@
+@@ -8274,6 +8728,15 @@
                          return JS_UNDEFINED;
                      } else {
                          JSValue func = JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter);
@@ -515,7 +548,7 @@
                          /* Note: the field could be removed in the getter */
                          func = JS_DupValue(ctx, func);
                          return JS_CallFree(ctx, func, this_obj, 0, NULL);
-@@ -9031,6 +9461,7 @@
+@@ -9031,6 +9494,7 @@
  {
      JSAtom atom;
      JSValue ret;
@@ -523,7 +556,7 @@
  
      if (likely(JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT &&
                 JS_VALUE_GET_TAG(prop) == JS_TAG_INT)) {
-@@ -9086,6 +9517,9 @@
+@@ -9086,6 +9550,9 @@
          }
      } else {
      slow_path:
@@ -533,7 +566,7 @@
          /* ToObject() must be done before ToPropertyKey() */
          if (JS_IsNull(this_obj) || JS_IsUndefined(this_obj)) {
              JS_FreeValue(ctx, prop);
-@@ -9095,7 +9529,9 @@
+@@ -9095,7 +9562,9 @@
          JS_FreeValue(ctx, prop);
          if (unlikely(atom == JS_ATOM_NULL))
              return JS_EXCEPTION;
@@ -543,7 +576,7 @@
          JS_FreeAtom(ctx, atom);
          return ret;
      }
-@@ -9410,6 +9846,15 @@
+@@ -9410,6 +9879,15 @@
      JSValue ret, func;
      if (likely(setter)) {
          func = JS_MKPTR(JS_TAG_OBJECT, setter);
@@ -559,7 +592,7 @@
          /* Note: the field could be removed in the setter */
          func = JS_DupValue(ctx, func);
          ret = JS_CallFree(ctx, func, this_obj, 1, (JSValueConst *)&val);
-@@ -15137,7 +15582,6 @@
+@@ -15137,7 +15615,6 @@
              JS_FreeValue(ctx, op2);
              goto exception;
          }
@@ -567,7 +600,7 @@
          op2 = JS_ToPrimitiveFree(ctx, op2, HINT_NONE);
          if (JS_IsException(op2)) {
              JS_FreeValue(ctx, op1);
-@@ -15573,6 +16017,11 @@
+@@ -15573,6 +16050,11 @@
              } else {
                  d2 = JS_VALUE_GET_INT(op2);
              }
@@ -579,7 +612,7 @@
              switch(op) {
              case OP_lt:
                  res = (d1 < d2); /* if NaN return false */
-@@ -15636,6 +16085,9 @@
+@@ -15636,6 +16118,9 @@
              } else {
                  d2 = JS_VALUE_GET_INT(op2);
              }
@@ -589,7 +622,7 @@
              res = (d1 == d2);
          } else {
              res = js_compare_bigint(ctx, OP_eq, op1, op2);
-@@ -15841,6 +16293,10 @@
+@@ -15841,6 +16326,10 @@
              break;
          }
      number_test:
@@ -600,7 +633,7 @@
          if (unlikely(eq_mode >= JS_EQ_SAME_VALUE)) {
              JSFloat64Union u1, u2;
              /* NaN is not always normalized, so this test is necessary */
-@@ -16305,6 +16761,7 @@
+@@ -16305,6 +16794,7 @@
          return JS_EXCEPTION;
      }
      it->is_array = FALSE;
@@ -608,7 +641,7 @@
      it->obj = obj;
      it->idx = 0;
      it->tab_atom = NULL;
-@@ -16724,6 +17181,51 @@
+@@ -16724,6 +17214,51 @@
      return 0;
  }
  
@@ -660,7 +693,7 @@
  static __exception int js_for_await_of_next(JSContext *ctx, JSValue *sp)
  {
      JSValue obj, iter, next;
-@@ -17584,6 +18086,220 @@
+@@ -17584,6 +18119,626 @@
  
  #define JS_CALL_FLAG_COPY_ARGV   (1 << 1)
  #define JS_CALL_FLAG_GENERATOR   (1 << 2)
@@ -725,6 +758,412 @@
 +        return NULL;
 +    rt->tt_arena_top = base + size;
 +    return (JSValue *)base;
++}
++
++/* ==== builtin callback pumps ============================================
++   A C builtin whose spec loop invokes user callbacks cannot suspend, so —
++   when the call site armed the protocol — it stages its loop state and
++   returns UNINITIALIZED instead of calling the first callback. The call
++   site then drives every callback as an ordinary in-loop frame
++   (TT_FRAME_PUMP) and tt_pump_step continues the builtin's loop between
++   frames. The staging builtin keeps its whole prologue (coercions,
++   species creation, initial-accumulator scan) so semantics stay in one
++   place; only the loop body is mirrored here. */
++
++#define special_every    0
++#define special_some     1
++#define special_forEach  2
++#define special_map      3
++#define special_filter   4
++#define special_TA       8
++#define special_reduce       0
++#define special_reduceRight  1
++enum {
++    ArrayFind,
++    ArrayFindIndex,
++    ArrayFindLast,
++    ArrayFindLastIndex,
++};
++
++static void map_decref_record(JSRuntime *rt, JSMapRecord *mr);
++
++typedef struct {
++    JSValue obj, func, this_arg, ret;
++    int special;
++    int64_t len, k, n;
++} TTPumpArrayEvery;
++
++typedef struct {
++    JSValue obj, this_val, func, this_arg;
++    int mode;
++    int64_t len, k, end;
++    int dir;
++} TTPumpArrayFind;
++
++typedef struct {
++    JSValue obj, func, acc;
++    int special;
++    int64_t len, k;
++} TTPumpArrayReduce;
++
++typedef struct {
++    JSValue obj, func;
++    JSValue *items, *tmp;
++    int64_t m, undef;
++    int64_t w, lo, mid, hi, i, j, kk;
++} TTPumpArraySort;
++
++typedef struct {
++    JSValue map_obj, func, this_arg;
++    JSMapRecord *cur; /* locked while its callback is in flight */
++    JSMapState *ms;
++    int is_set;
++} TTPumpMapForEach;
++
++static void tt_pump_free_args(JSContext *ctx, TTPump *pu)
++{
++    int i;
++    for (i = 0; i < pu->nargs; i++)
++        JS_FreeValue(ctx, pu->args[i]);
++    pu->nargs = 0;
++}
++
++static void tt_pump_abort(JSContext *ctx, TTPump *pu)
++{
++    tt_pump_free_args(ctx, pu);
++    switch (pu->kind) {
++    case TT_PUMP_ARRAY_EVERY: {
++        TTPumpArrayEvery *st = pu->state;
++        JS_FreeValue(ctx, st->obj);
++        JS_FreeValue(ctx, st->func);
++        JS_FreeValue(ctx, st->this_arg);
++        JS_FreeValue(ctx, st->ret);
++        break;
++    }
++    case TT_PUMP_ARRAY_FIND: {
++        TTPumpArrayFind *st = pu->state;
++        JS_FreeValue(ctx, st->obj);
++        JS_FreeValue(ctx, st->this_val);
++        JS_FreeValue(ctx, st->func);
++        JS_FreeValue(ctx, st->this_arg);
++        break;
++    }
++    case TT_PUMP_ARRAY_REDUCE: {
++        TTPumpArrayReduce *st = pu->state;
++        JS_FreeValue(ctx, st->obj);
++        JS_FreeValue(ctx, st->func);
++        JS_FreeValue(ctx, st->acc);
++        break;
++    }
++    case TT_PUMP_ARRAY_SORT: {
++        TTPumpArraySort *st = pu->state;
++        int64_t x;
++        for (x = 0; x < st->m; x++)
++            JS_FreeValue(ctx, st->items[x]);
++        js_free_rt(ctx->rt, st->items);
++        js_free_rt(ctx->rt, st->tmp);
++        JS_FreeValue(ctx, st->obj);
++        JS_FreeValue(ctx, st->func);
++        break;
++    }
++    case TT_PUMP_MAP_FOREACH: {
++        TTPumpMapForEach *st = pu->state;
++        if (st->cur)
++            map_decref_record(ctx->rt, st->cur);
++        JS_FreeValue(ctx, st->map_obj);
++        JS_FreeValue(ctx, st->func);
++        JS_FreeValue(ctx, st->this_arg);
++        break;
++    }
++    }
++    js_free_rt(ctx->rt, pu->state);
++    pu->state = NULL;
++}
++
++/* Continue a pumped builtin. cb_result is owned (ignored when first).
++   Returns 0 = next callback staged in pu->args / *pfunc / *pthis,
++   1 = builtin finished with *pres, -1 = exception (state freed). */
++static int tt_pump_step(JSContext *ctx, TTPump *pu, JSValue cb_result,
++                        BOOL first, JSValue *pfunc, JSValue *pthis,
++                        JSValue *pres)
++{
++    switch (pu->kind) {
++    case TT_PUMP_ARRAY_EVERY: {
++        TTPumpArrayEvery *st = pu->state;
++        if (!first) {
++            switch (st->special) {
++            case special_every:
++            case special_every | special_TA:
++                if (!JS_ToBoolFree(ctx, cb_result)) {
++                    JS_FreeValue(ctx, st->ret);
++                    st->ret = JS_FALSE;
++                    goto every_done;
++                }
++                break;
++            case special_some:
++            case special_some | special_TA:
++                if (JS_ToBoolFree(ctx, cb_result)) {
++                    JS_FreeValue(ctx, st->ret);
++                    st->ret = JS_TRUE;
++                    goto every_done;
++                }
++                break;
++            case special_map:
++                if (JS_DefinePropertyValueInt64(ctx, st->ret, st->k, cb_result,
++                                                JS_PROP_C_W_E | JS_PROP_THROW) < 0)
++                    goto every_fail;
++                break;
++            case special_map | special_TA:
++                if (JS_SetPropertyValue(ctx, st->ret, JS_NewInt32(ctx, st->k),
++                                        cb_result, JS_PROP_THROW) < 0)
++                    goto every_fail;
++                break;
++            case special_filter:
++            case special_filter | special_TA:
++                if (JS_ToBoolFree(ctx, cb_result)) {
++                    if (JS_DefinePropertyValueInt64(ctx, st->ret, st->n++,
++                                                    JS_DupValue(ctx, pu->args[0]),
++                                                    JS_PROP_C_W_E | JS_PROP_THROW) < 0)
++                        goto every_fail;
++                }
++                break;
++            default:
++                JS_FreeValue(ctx, cb_result);
++                break;
++            }
++            st->k++;
++        }
++        tt_pump_free_args(ctx, pu);
++        for (; st->k < st->len; st->k++) {
++            JSValue val;
++            int present;
++            if (st->special & special_TA) {
++                val = JS_GetPropertyInt64(ctx, st->obj, st->k);
++                if (JS_IsException(val))
++                    goto every_fail;
++                present = TRUE;
++            } else {
++                present = JS_TryGetPropertyInt64(ctx, st->obj, st->k, &val);
++                if (present < 0)
++                    goto every_fail;
++            }
++            if (present) {
++                pu->args[0] = val;
++                pu->args[1] = JS_NewInt64(ctx, st->k);
++                pu->args[2] = JS_DupValue(ctx, st->obj);
++                pu->nargs = 3;
++                *pfunc = st->func;
++                *pthis = st->this_arg;
++                return 0;
++            }
++        }
++    every_done:
++        /* the TA-filter tail (species re-create + set) never pumps: TA
++           filter stages only for plain-array paths */
++        *pres = st->ret;
++        st->ret = JS_UNDEFINED;
++        tt_pump_abort(ctx, pu);
++        return 1;
++    every_fail:
++        tt_pump_abort(ctx, pu);
++        return -1;
++    }
++    case TT_PUMP_ARRAY_FIND: {
++        TTPumpArrayFind *st = pu->state;
++        if (!first) {
++            if (JS_ToBoolFree(ctx, cb_result)) {
++                if (st->mode == ArrayFindIndex || st->mode == ArrayFindLastIndex)
++                    *pres = JS_NewInt64(ctx, st->k);
++                else
++                    *pres = JS_DupValue(ctx, pu->args[0]);
++                tt_pump_abort(ctx, pu);
++                return 1;
++            }
++            st->k += st->dir;
++        }
++        tt_pump_free_args(ctx, pu);
++        if (st->k != st->end) {
++            JSValue val = JS_GetPropertyInt64(ctx, st->obj, st->k);
++            if (JS_IsException(val)) {
++                tt_pump_abort(ctx, pu);
++                return -1;
++            }
++            pu->args[0] = val;
++            pu->args[1] = JS_NewInt64(ctx, st->k);
++            pu->args[2] = JS_DupValue(ctx, st->this_val);
++            pu->nargs = 3;
++            *pfunc = st->func;
++            *pthis = st->this_arg;
++            return 0;
++        }
++        if (st->mode == ArrayFindIndex || st->mode == ArrayFindLastIndex)
++            *pres = JS_NewInt32(ctx, -1);
++        else
++            *pres = JS_UNDEFINED;
++        tt_pump_abort(ctx, pu);
++        return 1;
++    }
++    case TT_PUMP_ARRAY_REDUCE: {
++        TTPumpArrayReduce *st = pu->state;
++        if (!first) {
++            JS_FreeValue(ctx, st->acc);
++            st->acc = cb_result;
++            st->k++;
++        }
++        tt_pump_free_args(ctx, pu);
++        for (; st->k < st->len; st->k++) {
++            int64_t k1 = (st->special & special_reduceRight)
++                             ? st->len - st->k - 1 : st->k;
++            JSValue val;
++            int present;
++            if (st->special & special_TA) {
++                val = JS_GetPropertyInt64(ctx, st->obj, k1);
++                if (JS_IsException(val))
++                    goto reduce_fail;
++                present = TRUE;
++            } else {
++                present = JS_TryGetPropertyInt64(ctx, st->obj, k1, &val);
++                if (present < 0)
++                    goto reduce_fail;
++            }
++            if (present) {
++                pu->args[0] = JS_DupValue(ctx, st->acc);
++                pu->args[1] = val;
++                pu->args[2] = JS_NewInt64(ctx, k1);
++                pu->args[3] = JS_DupValue(ctx, st->obj);
++                pu->nargs = 4;
++                *pfunc = st->func;
++                *pthis = JS_UNDEFINED;
++                return 0;
++            }
++        }
++        *pres = st->acc;
++        st->acc = JS_UNDEFINED;
++        tt_pump_abort(ctx, pu);
++        return 1;
++    reduce_fail:
++        tt_pump_abort(ctx, pu);
++        return -1;
++    }
++    case TT_PUMP_ARRAY_SORT: {
++        TTPumpArraySort *st = pu->state;
++        if (!first) {
++            /* SortCompare tail: ToNumber(result), NaN -> 0 */
++            double r = 0;
++            if (JS_ToFloat64Free(ctx, &r, cb_result)) {
++                tt_pump_abort(ctx, pu);
++                return -1;
++            }
++            if (isnan(r))
++                r = 0;
++            if (r <= 0)
++                st->tmp[st->kk++] = st->items[st->i++];
++            else
++                st->tmp[st->kk++] = st->items[st->j++];
++        }
++        tt_pump_free_args(ctx, pu);
++        for (;;) {
++            if (st->w >= st->m)
++                break;
++            if (st->lo >= st->m - st->w) {
++                st->w *= 2;
++                st->lo = 0;
++                continue;
++            }
++            if (st->mid < 0) {
++                st->mid = st->lo + st->w;
++                st->hi = st->lo + 2 * st->w < st->m ? st->lo + 2 * st->w : st->m;
++                st->i = st->lo;
++                st->j = st->mid;
++                st->kk = st->lo;
++            }
++            if (st->i < st->mid && st->j < st->hi) {
++                pu->args[0] = JS_DupValue(ctx, st->items[st->i]);
++                pu->args[1] = JS_DupValue(ctx, st->items[st->j]);
++                pu->nargs = 2;
++                *pfunc = st->func;
++                *pthis = JS_UNDEFINED;
++                return 0;
++            }
++            while (st->i < st->mid)
++                st->tmp[st->kk++] = st->items[st->i++];
++            while (st->j < st->hi)
++                st->tmp[st->kk++] = st->items[st->j++];
++            {
++                int64_t t;
++                for (t = st->lo; t < st->hi; t++)
++                    st->items[t] = st->tmp[t];
++            }
++            st->lo += 2 * st->w;
++            st->mid = -1;
++        }
++        /* write back: sorted values, then the undefined tail */
++        {
++            int64_t x;
++            for (x = 0; x < st->m; x++) {
++                if (JS_SetPropertyInt64(ctx, st->obj, x, st->items[x]) < 0) {
++                    st->items[x] = JS_UNDEFINED; /* consumed */
++                    while (++x < st->m) {
++                        JS_FreeValue(ctx, st->items[x]);
++                        st->items[x] = JS_UNDEFINED;
++                    }
++                    st->m = 0;
++                    tt_pump_abort(ctx, pu);
++                    return -1;
++                }
++                st->items[x] = JS_UNDEFINED; /* consumed by the set */
++            }
++            for (x = 0; x < st->undef; x++) {
++                if (JS_SetPropertyInt64(ctx, st->obj, st->m + x, JS_UNDEFINED) < 0) {
++                    st->m = 0;
++                    tt_pump_abort(ctx, pu);
++                    return -1;
++                }
++            }
++        }
++        *pres = st->obj;
++        st->obj = JS_UNDEFINED;
++        st->m = 0;
++        tt_pump_abort(ctx, pu);
++        return 1;
++    }
++    case TT_PUMP_MAP_FOREACH: {
++        TTPumpMapForEach *st = pu->state;
++        struct list_head *el;
++        if (!first) {
++            JSMapRecord *done = st->cur;
++            JS_FreeValue(ctx, cb_result);
++            el = done->link.next;
++            st->cur = NULL;
++            map_decref_record(ctx->rt, done);
++        } else {
++            el = st->ms->records.next;
++        }
++        tt_pump_free_args(ctx, pu);
++        while (el != &st->ms->records) {
++            JSMapRecord *mr = list_entry(el, JSMapRecord, link);
++            if (!mr->empty) {
++                mr->ref_count++;
++                st->cur = mr;
++                pu->args[1] = JS_DupValue(ctx, mr->key);
++                pu->args[0] = st->is_set ? JS_DupValue(ctx, mr->key)
++                                         : JS_DupValue(ctx, mr->value);
++                pu->args[2] = JS_DupValue(ctx, st->map_obj);
++                pu->nargs = 3;
++                *pfunc = st->func;
++                *pthis = st->this_arg;
++                return 0;
++            }
++            el = el->next;
++        }
++        *pres = JS_UNDEFINED;
++        tt_pump_abort(ctx, pu);
++        return 1;
++    }
++    }
++    *pres = JS_UNDEFINED;
++    tt_pump_abort(ctx, pu);
++    return 1;
 +}
 +
 +/* Which method would OrdinaryToPrimitive invoke on val, starting at step?
@@ -881,7 +1320,7 @@
  
  static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                                    JSValueConst this_obj,
-@@ -17593,6 +18309,10 @@
+@@ -17593,6 +18748,10 @@
      JSCFunctionType func;
      JSObject *p;
      JSStackFrame sf_s, *sf = &sf_s, *prev_sf;
@@ -892,7 +1331,7 @@
      JSValue ret_val;
      JSValueConst *arg_buf;
      int arg_count, i;
-@@ -17777,15 +18497,234 @@
+@@ -17777,15 +18936,287 @@
      JSContext *ctx;
      JSObject *p;
      JSFunctionBytecode *b;
@@ -963,6 +1402,59 @@
 +        argc = sf->tt_orig_argc;                                 \
 +        argv = sf->tt_orig_argv;                                 \
 +    } while (0)
++
++/* After an armed C call returned the pump sentinel: take over the staged
++   builtin. Either pushes the first callback frame, completes immediately
++   (ret_val replaced, control falls through to the classic completion), or
++   raises. Uses the surrounding locals of JS_CallInternal. */
++#define TT_PUMP_TRY_START(basev, tailv)                                     \
++    if (unlikely(JS_VALUE_GET_TAG(ret_val) == JS_TAG_UNINITIALIZED &&       \
++                 rt->tt_pump_state != NULL)) {                              \
++        TTPump *pu;                                                         \
++        JSValue pfn, pth, pres;                                             \
++        int pact;                                                           \
++        pu = (TTPump *)tt_arena_alloc_vals(rt,                              \
++            (sizeof(TTPump) + sizeof(JSValue) - 1) / sizeof(JSValue));      \
++        if (unlikely(!pu)) {                                                \
++            rt->tt_pump_state = NULL;                                       \
++            JS_ThrowStackOverflow(caller_ctx);                              \
++            goto exception;                                                 \
++        }                                                                   \
++        pu->kind = rt->tt_pump_kind;                                        \
++        pu->state = rt->tt_pump_state;                                      \
++        rt->tt_pump_state = NULL;                                           \
++        pu->base = (basev);                                                 \
++        pu->cargc = call_argc;                                              \
++        pu->tail = (tailv);                                                 \
++        pu->nargs = 0;                                                      \
++        pact = tt_pump_step(ctx, pu, JS_UNDEFINED, TRUE, &pfn, &pth, &pres);\
++        if (pact < 0) {                                                     \
++            rt->tt_arena_top = (uint8_t *)pu;                               \
++            goto exception;                                                 \
++        }                                                                   \
++        if (pact == 0) {                                                    \
++            if (unlikely(js_poll_interrupts(ctx))) {                        \
++                tt_pump_abort(ctx, pu);                                     \
++                rt->tt_arena_top = (uint8_t *)pu;                           \
++                goto exception;                                             \
++            }                                                               \
++            sf->cur_sp = sp;                                                \
++            pf_func = pfn;                                                  \
++            pf_this = pth;                                                  \
++            pf_new_target = JS_UNDEFINED;                                   \
++            pf_argc = pu->nargs;                                            \
++            pf_argv = pu->args;                                             \
++            pf_flags = 0;                                                   \
++            pf_kind = TT_FRAME_PUMP;                                        \
++            pf_ctor_this = JS_UNDEFINED;                                    \
++            pf_aux = pu;                                                    \
++            pf_aux_i = 0;                                                   \
++            pf_cargc = pu->cargc;                                           \
++            goto push_frame;                                                \
++        }                                                                   \
++        rt->tt_arena_top = (uint8_t *)pu;                                   \
++        ret_val = pres;                                                     \
++    }
 +
 +/* Coerce ONE object-valued stack slot toward a primitive IN-LOOP, exactly
 +   as JS_ToPrimitiveFree would: a present Symbol.toPrimitive is read once
@@ -1131,7 +1623,7 @@
  #define CASE(op)        case op
  #define DEFAULT         default
  #define BREAK           break
-@@ -17800,7 +18739,7 @@
+@@ -17800,7 +19231,7 @@
  #include "quickjs-opcode.h"
          [ OP_COUNT ... 255 ] = &&case_default
      };
@@ -1140,7 +1632,7 @@
  #ifdef OPCODE_ASM_LABEL
  #define CASE(op)        case_ ## op: asm volatile("label_" #op ":\n.globl label_" #op); dummy_case_ ## op
  #else
-@@ -17810,21 +18749,44 @@
+@@ -17810,21 +19241,44 @@
  #define BREAK           SWITCH(pc)
  #endif
  
@@ -1193,7 +1685,7 @@
              sp = sf->cur_sp;
              sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
              pc = sf->cur_pc;
-@@ -17849,58 +18811,93 @@
+@@ -17849,58 +19303,93 @@
          return call_func(caller_ctx, func_obj, this_obj, argc,
                           (JSValueConst *)argv, flags);
      }
@@ -1332,7 +1824,7 @@
          SWITCH(pc) {
          CASE(OP_push_i32):
              *sp++ = JS_NewInt32(ctx, get_u32(pc));
-@@ -18214,6 +19211,78 @@
+@@ -18214,8 +19703,89 @@
              has_call_argc:
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1408,10 +1900,21 @@
 +                        TT_COERCE_SLOT(&call_argv[0], HINT_STRING, cs_delta, 1)
 +                    }
 +                }
++                rt->tt_pump_ok = TRUE;
++                rt->tt_pump_cfun = NULL;
++                if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
++                    JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_C_FUNCTION)
++                    rt->tt_pump_cfun =
++                        (void *)JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.c_function.generic;
                  ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                            JS_UNDEFINED, call_argc, call_argv, 0);
++                rt->tt_pump_ok = FALSE;
++                rt->tt_pump_cfun = NULL;
++                TT_PUMP_TRY_START(-1, opcode == OP_tail_call)
                  if (unlikely(JS_IsException(ret_val)))
-@@ -18232,6 +19301,52 @@
+                     goto exception;
+                 if (opcode == OP_tail_call)
+@@ -18232,6 +19802,52 @@
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1464,7 +1967,7 @@
                  ret_val = JS_CallConstructorInternal(ctx, call_argv[-2],
                                                       call_argv[-1],
                                                       call_argc, call_argv, 0);
-@@ -18250,6 +19365,240 @@
+@@ -18250,8 +19866,251 @@
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1702,10 +2205,21 @@
 +                    pf_aux = NULL;
 +                    goto push_frame;
 +                }
++                rt->tt_pump_ok = TRUE;
++                rt->tt_pump_cfun = NULL;
++                if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
++                    JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_C_FUNCTION)
++                    rt->tt_pump_cfun =
++                        (void *)JS_VALUE_GET_OBJ(call_argv[-1])->u.cfunc.c_function.generic;
                  ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                            JS_UNDEFINED, call_argc, call_argv, 0);
++                rt->tt_pump_ok = FALSE;
++                rt->tt_pump_cfun = NULL;
++                TT_PUMP_TRY_START(-2, opcode == OP_tail_call_method)
                  if (unlikely(JS_IsException(ret_val)))
-@@ -18325,6 +19674,53 @@
+                     goto exception;
+                 if (opcode == OP_tail_call_method)
+@@ -18325,6 +20184,53 @@
                  super = JS_GetPrototype(ctx, func_obj);
                  if (JS_IsException(super))
                      goto exception;
@@ -1759,7 +2273,7 @@
                  ret = JS_CallConstructor2(ctx, super, new_target, argc, (JSValueConst *)argv);
                  JS_FreeValue(ctx, super);
                  if (JS_IsException(ret))
-@@ -18994,17 +20390,148 @@
+@@ -18994,17 +20900,148 @@
              sp += 2;
              BREAK;
          CASE(OP_for_of_start):
@@ -1913,7 +2427,7 @@
                  if (js_for_of_next(ctx, sp, offset))
                      goto exception;
                  sp += 2;
-@@ -19042,9 +20569,93 @@
+@@ -19042,9 +21079,93 @@
              JS_FreeValue(ctx, sp[-1]); /* drop the next method */
              sp--;
              if (!JS_IsUndefined(sp[-1])) {
@@ -2008,7 +2522,7 @@
                  JS_FreeValue(ctx, sp[-1]);
              }
              sp--;
-@@ -19072,6 +20683,109 @@
+@@ -19072,6 +21193,109 @@
              {
                  JSValue ret;
                  sf->cur_pc = pc;
@@ -2118,7 +2632,7 @@
                  ret = JS_Call(ctx, sp[-3], sp[-4],
                                1, (JSValueConst *)(sp - 1));
                  if (JS_IsException(ret))
-@@ -19096,6 +20810,78 @@
+@@ -19096,6 +21320,78 @@
                  if (JS_IsUndefined(method) || JS_IsNull(method)) {
                      ret_flag = TRUE;
                  } else {
@@ -2197,7 +2711,7 @@
                      if (flags & 2) {
                          /* no argument */
                          ret = JS_CallFree(ctx, method, sp[-4],
-@@ -19173,9 +20959,33 @@
+@@ -19173,9 +21469,33 @@
                  } else {                                                \
                  name ## _slow_path:                                     \
                      sf->cur_pc = pc;                                    \
@@ -2231,7 +2745,7 @@
                  }                                                       \
                  if (keep) {                                             \
                      *sp++ = val;                                        \
-@@ -19230,8 +21040,35 @@
+@@ -19230,8 +21550,35 @@
                  } else {
                  put_field_slow_path:
                      sf->cur_pc = pc;
@@ -2267,7 +2781,7 @@
                      JS_FreeValue(ctx, obj);
                      sp -= 2;
                      if (unlikely(ret < 0))
-@@ -19299,8 +21136,32 @@
+@@ -19299,8 +21646,32 @@
                  atom = get_u32(pc);
                  pc += 4;
  
@@ -2300,7 +2814,7 @@
                  sp--;
                  if (unlikely(ret < 0))
                      goto exception;
-@@ -19439,7 +21300,18 @@
+@@ -19439,7 +21810,18 @@
                  } else {                                                \
                      name ## _slow_path:                                 \
                      sf->cur_pc = pc;                                    \
@@ -2319,7 +2833,7 @@
                      if (unlikely(JS_IsException(val))) {                \
                          if (keep)                                       \
                              sp[-1] = JS_UNDEFINED;                      \
-@@ -19447,6 +21319,28 @@
+@@ -19447,6 +21829,28 @@
                              sp--;                                       \
                          goto exception;                                 \
                      }                                                   \
@@ -2348,7 +2862,7 @@
                  }                                                       \
                  if (keep) {                                             \
                      sp[-1] = val;                                       \
-@@ -19495,6 +21389,8 @@
+@@ -19495,6 +21899,8 @@
                              goto exception;
                          }
                          sf->cur_pc = pc;
@@ -2357,7 +2871,7 @@
                          ret_val = JS_ToPropertyKey(ctx, sp[-1]);
                          if (JS_IsException(ret_val))
                              goto exception;
-@@ -19610,7 +21506,39 @@
+@@ -19610,7 +22016,39 @@
                  } else {
                  put_array_el_slow_path:
                      sf->cur_pc = pc;
@@ -2397,7 +2911,7 @@
                      JS_FreeValue(ctx, sp[-3]);
                      sp -= 3;
                      if (unlikely(ret < 0))
-@@ -19685,8 +21613,30 @@
+@@ -19685,8 +22123,30 @@
          CASE(OP_define_array_el):
              {
                  int ret;
@@ -2428,7 +2942,7 @@
                  sp -= 1;
                  if (unlikely(ret < 0))
                      goto exception;
-@@ -19695,10 +21645,55 @@
+@@ -19695,10 +22155,55 @@
  
          CASE(OP_append):    /* array pos enumobj -- array pos */
              {
@@ -2486,7 +3000,7 @@
              }
              BREAK;
  
-@@ -19760,6 +21755,7 @@
+@@ -19760,6 +22265,7 @@
                  } else {
                  add_slow_case:
                      sf->cur_pc = pc;
@@ -2494,7 +3008,7 @@
                      if (js_add_slow(ctx, sp))
                          goto exception;
                      sp--;
-@@ -19942,6 +21938,7 @@
+@@ -19942,6 +22448,7 @@
          CASE(OP_pow):
          binary_arith_slow:
              sf->cur_pc = pc;
@@ -2502,7 +3016,7 @@
              if (js_binary_arith_slow(ctx, sp, opcode))
                  goto exception;
              sp--;
-@@ -19958,6 +21955,8 @@
+@@ -19958,6 +22465,8 @@
                      sp[-1] = JS_NewInt32(ctx, JS_VALUE_GET_INT(op1));
                  } else {
                      sf->cur_pc = pc;
@@ -2511,7 +3025,7 @@
                      if (js_unary_arith_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -19991,6 +21990,8 @@
+@@ -19991,6 +22500,8 @@
                      sp[-1] = __JS_NewFloat64(ctx, d);
                  } else {
                      sf->cur_pc = pc;
@@ -2520,7 +3034,7 @@
                      if (js_unary_arith_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -20009,6 +22010,8 @@
+@@ -20009,6 +22520,8 @@
                  } else {
                  inc_slow:
                      sf->cur_pc = pc;
@@ -2529,7 +3043,7 @@
                      if (js_unary_arith_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -20027,6 +22030,8 @@
+@@ -20027,6 +22540,8 @@
                  } else {
                  dec_slow:
                      sf->cur_pc = pc;
@@ -2538,7 +3052,7 @@
                      if (js_unary_arith_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -20045,6 +22050,8 @@
+@@ -20045,6 +22560,8 @@
                  } else {
                  post_inc_slow:
                      sf->cur_pc = pc;
@@ -2547,7 +3061,7 @@
                      if (js_post_inc_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -20064,6 +22071,8 @@
+@@ -20064,6 +22581,8 @@
                  } else {
                  post_dec_slow:
                      sf->cur_pc = pc;
@@ -2556,7 +3070,7 @@
                      if (js_post_inc_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -20130,6 +22139,8 @@
+@@ -20130,6 +22649,8 @@
                      sp[-1] = JS_NewInt32(ctx, ~JS_VALUE_GET_INT(op1));
                  } else {
                      sf->cur_pc = pc;
@@ -2565,7 +3079,7 @@
                      if (js_not_slow(ctx, sp))
                          goto exception;
                  }
-@@ -20150,6 +22161,7 @@
+@@ -20150,6 +22671,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -2573,7 +3087,7 @@
                      if (js_binary_logic_slow(ctx, sp, opcode))
                          goto exception;
                      sp--;
-@@ -20171,6 +22183,7 @@
+@@ -20171,6 +22693,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -2581,7 +3095,7 @@
                      if (js_shr_slow(ctx, sp))
                          goto exception;
                      sp--;
-@@ -20191,6 +22204,7 @@
+@@ -20191,6 +22714,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -2589,7 +3103,7 @@
                      if (js_binary_logic_slow(ctx, sp, opcode))
                          goto exception;
                      sp--;
-@@ -20209,6 +22223,7 @@
+@@ -20209,6 +22733,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -2597,7 +3111,7 @@
                      if (js_binary_logic_slow(ctx, sp, opcode))
                          goto exception;
                      sp--;
-@@ -20227,6 +22242,7 @@
+@@ -20227,6 +22752,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -2605,7 +3119,7 @@
                      if (js_binary_logic_slow(ctx, sp, opcode))
                          goto exception;
                      sp--;
-@@ -20245,6 +22261,7 @@
+@@ -20245,6 +22771,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -2613,7 +3127,7 @@
                      if (js_binary_logic_slow(ctx, sp, opcode))
                          goto exception;
                      sp--;
-@@ -20253,7 +22270,7 @@
+@@ -20253,7 +22780,7 @@
              BREAK;
  
  
@@ -2622,7 +3136,7 @@
              CASE(opcode):                                 \
                  {                                         \
                  JSValue op1, op2;                         \
-@@ -20264,6 +22281,13 @@
+@@ -20264,6 +22791,13 @@
                      sp--;                                               \
                  } else {                                                \
                      sf->cur_pc = pc;                                    \
@@ -2636,7 +3150,7 @@
                      if (slow_call)                                      \
                          goto exception;                                 \
                      sp--;                                               \
-@@ -20271,14 +22295,14 @@
+@@ -20271,14 +22805,14 @@
                  }                                                       \
              BREAK
  
@@ -2659,7 +3173,7 @@
  
          CASE(OP_in):
              sf->cur_pc = pc;
-@@ -20293,10 +22317,59 @@
+@@ -20293,10 +22827,59 @@
              sp--;
              BREAK;
          CASE(OP_instanceof):
@@ -2723,7 +3237,7 @@
              BREAK;
          CASE(OP_typeof):
              {
-@@ -20350,6 +22423,10 @@
+@@ -20350,6 +22933,10 @@
                  break;
              default:
                  sf->cur_pc = pc;
@@ -2734,7 +3248,7 @@
                  ret_val = JS_ToPropertyKey(ctx, sp[-1]);
                  if (JS_IsException(ret_val))
                      goto exception;
-@@ -20411,9 +22488,37 @@
+@@ -20411,9 +22998,37 @@
                              } 
                              val = JS_UNDEFINED;
                          } else {
@@ -2773,7 +3287,7 @@
                          }
                          set_value(ctx, &sp[-1], val);
                          break;
-@@ -20426,10 +22531,38 @@
+@@ -20426,10 +23041,38 @@
                              if (is_strict_mode(ctx)) {
                                  JS_ThrowReferenceErrorNotDefined(ctx, atom);
                                  goto exception;
@@ -2813,7 +3327,7 @@
                          JS_FreeValue(ctx, sp[-1]);
                          sp -= 2;
                          if (unlikely(ret < 0))
-@@ -20455,9 +22588,34 @@
+@@ -20455,9 +23098,34 @@
                          if (!ret) {
                              val = JS_UNDEFINED;
                          } else {
@@ -2849,7 +3363,7 @@
                          }
                          *sp++ = val;
                          break;
-@@ -20578,8 +22736,228 @@
+@@ -20578,8 +23246,228 @@
      done_generator:
          sf->cur_pc = pc;
          sf->cur_sp = sp;
@@ -3080,7 +3594,7 @@
          if (unlikely(b->var_ref_count != 0)) {
              /* variable references reference the stack: must close them */
              close_var_refs(rt, b, sf);
-@@ -20588,9 +22966,870 @@
+@@ -20588,9 +23476,918 @@
          for(pval = local_buf; pval < sp; pval++) {
              JS_FreeValue(ctx, *pval);
          }
@@ -3144,6 +3658,11 @@
 +                JS_FreeValue(ctx, ctor_this);
 +                JS_FreeValue(ctx, ic_eb[0]); /* super */
 +                rt->tt_arena_top = (uint8_t *)ic_eb;
++            }
++            if (kind == TT_FRAME_PUMP) {
++                TTPump *pu = (TTPump *)kaux_p;
++                tt_pump_abort(ctx, pu);
++                rt->tt_arena_top = (uint8_t *)pu;
 +            }
 +            if (kind == TT_FRAME_APPLY)
 +                free_arg_list(ctx, kaux_p, (uint32_t)kaux);
@@ -3604,6 +4123,49 @@
 +            *sp++ = ret_val;
 +            goto restart;
 +        }
++        if (kind == TT_FRAME_PUMP) {
++            TTPump *pu = (TTPump *)kaux_p;
++            JSValue pfn, pth, pres;
++            int pact = tt_pump_step(ctx, pu, ret_val, FALSE, &pfn, &pth, &pres);
++            if (pact < 0) {
++                rt->tt_arena_top = (uint8_t *)pu;
++                goto exception;
++            }
++            if (pact == 0) {
++                if (unlikely(js_poll_interrupts(ctx))) {
++                    tt_pump_abort(ctx, pu);
++                    rt->tt_arena_top = (uint8_t *)pu;
++                    goto exception;
++                }
++                sf->cur_sp = sp;
++                pf_func = pfn;
++                pf_this = pth;
++                pf_new_target = JS_UNDEFINED;
++                pf_argc = pu->nargs;
++                pf_argv = pu->args;
++                pf_flags = 0;
++                pf_kind = TT_FRAME_PUMP;
++                pf_ctor_this = JS_UNDEFINED;
++                pf_aux = pu;
++                pf_aux_i = 0;
++                pf_cargc = pu->cargc;
++                goto push_frame;
++            }
++            {
++                int p_cargc = pu->cargc, p_base = pu->base, p_tail = pu->tail;
++                JSValue *cav;
++                rt->tt_arena_top = (uint8_t *)pu;
++                cav = sp - p_cargc;
++                for (i = p_base; i < p_cargc; i++)
++                    JS_FreeValue(ctx, cav[i]);
++                sp = cav + p_base;
++                ret_val = pres;
++                if (p_tail)
++                    goto done;
++                *sp++ = ret_val;
++            }
++            goto restart;
++        }
 +        {
 +            JSValue *cav = sp - cargc;
 +            int base = (kind == TT_FRAME_CALL || kind == TT_FRAME_TAIL ||
@@ -3953,7 +4515,7 @@
  }
  
  #ifdef OPCODE_ASM_LABEL
-@@ -20803,6 +24042,19 @@
+@@ -20803,6 +24600,19 @@
      sf->arg_count = arg_buf_len;
      sf->var_buf = sf->arg_buf + arg_buf_len;
      sf->cur_sp = sf->var_buf + b->var_count;
@@ -3973,7 +4535,7 @@
      sf->var_refs = (JSVarRef **)(sf->cur_sp + b->stack_size);
      for(i = 0; i < b->var_ref_count; i++)
          sf->var_refs[i] = NULL;
-@@ -20831,28 +24083,22 @@
+@@ -20831,28 +24641,22 @@
      JS_FreeValueRT(rt, s->this_val);
  }
  
@@ -4009,7 +4571,7 @@
          if (JS_IsUndefined(ret)) {
              ret = sf->cur_sp[-1];
              sf->cur_sp[-1] = JS_UNDEFINED;
-@@ -20862,12 +24108,29 @@
+@@ -20862,12 +24666,29 @@
  
          /* close the closure variables. */
          close_var_refs(rt, b, sf);
@@ -4040,7 +4602,7 @@
  static void __async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
  {
      /* cannot close the closure variables here because it would
-@@ -20915,6 +24178,12 @@
+@@ -20915,6 +24736,12 @@
      JSAsyncFunctionState *func_state;
  } JSGeneratorData;
  
@@ -4053,7 +4615,7 @@
  static void free_generator_stack_rt(JSRuntime *rt, JSGeneratorData *s)
  {
      if (s->state == JS_GENERATOR_STATE_COMPLETED)
-@@ -20952,26 +24221,27 @@
+@@ -20952,26 +24779,27 @@
      mark_func(rt, &s->func_state->header);
  }
  
@@ -4093,7 +4655,7 @@
          if (magic == GEN_MAGIC_NEXT) {
              goto exec_no_arg;
          } else {
-@@ -20983,7 +24253,7 @@
+@@ -20983,7 +24811,7 @@
      case JS_GENERATOR_STATE_SUSPENDED_YIELD:
          sf = &s->func_state->frame;
          /* cur_sp[-1] was set to JS_UNDEFINED in the previous call */
@@ -4102,7 +4664,7 @@
          if (magic == GEN_MAGIC_THROW &&
              s->state == JS_GENERATOR_STATE_SUSPENDED_YIELD) {
              JS_Throw(ctx, ret);
-@@ -20996,26 +24266,7 @@
+@@ -20996,26 +24824,7 @@
              s->func_state->throw_flag = FALSE;
          }
          s->state = JS_GENERATOR_STATE_EXECUTING;
@@ -4130,7 +4692,7 @@
      case JS_GENERATOR_STATE_COMPLETED:
      done:
          /* execution is finished */
-@@ -21025,10 +24276,10 @@
+@@ -21025,10 +24834,10 @@
              ret = JS_UNDEFINED;
              break;
          case GEN_MAGIC_RETURN:
@@ -4143,7 +4705,7 @@
              break;
          }
          break;
-@@ -21036,33 +24287,88 @@
+@@ -21036,33 +24845,88 @@
          ret = JS_ThrowTypeError(ctx, "cannot invoke a running generator");
          break;
      }
@@ -4242,7 +4804,7 @@
      obj = js_create_from_ctor(ctx, func_obj, JS_CLASS_GENERATOR);
      if (JS_IsException(obj))
          goto fail;
-@@ -21074,6 +24380,22 @@
+@@ -21074,6 +24938,22 @@
      return JS_EXCEPTION;
  }
  
@@ -4265,7 +4827,7 @@
  /* AsyncFunction */
  
  static void js_async_function_resolve_finalizer(JSRuntime *rt, JSValue val)
-@@ -21118,11 +24440,14 @@
+@@ -21118,11 +24998,14 @@
      return 0;
  }
  
@@ -4283,7 +4845,7 @@
      if (s->is_completed) {
          if (JS_IsException(func_ret)) {
              JSValue error;
-@@ -21173,6 +24498,11 @@
+@@ -21173,6 +25056,11 @@
      }
  }
  
@@ -4295,7 +4857,7 @@
  static JSValue js_async_function_resolve_call(JSContext *ctx,
                                                JSValueConst func_obj,
                                                JSValueConst this_obj,
-@@ -21448,25 +24778,38 @@
+@@ -21448,25 +25336,38 @@
      return res;
  }
  
@@ -4341,7 +4903,7 @@
              } else {
                  js_async_generator_complete(ctx, s);
              }
-@@ -21480,7 +24823,7 @@
+@@ -21480,7 +25381,7 @@
              } else {
                  js_async_generator_reject(ctx, s, next->result);
              }
@@ -4350,7 +4912,7 @@
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD:
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
              value = JS_DupValue(ctx, next->result);
-@@ -21495,59 +24838,78 @@
+@@ -21495,59 +25396,78 @@
                  s->func_state->frame.cur_sp[0] =
                      JS_NewInt32(ctx, next->completion_type);
                  s->func_state->frame.cur_sp++;
@@ -4474,7 +5036,7 @@
  }
  
  static JSValue js_async_generator_resolve_function(JSContext *ctx,
-@@ -21586,14 +24948,19 @@
+@@ -21586,14 +25506,19 @@
  }
  
  /* magic = GEN_MAGIC_x */
@@ -4497,7 +5059,7 @@
      promise = JS_NewPromiseCapability(ctx, resolving_funcs);
      if (JS_IsException(promise))
          return JS_EXCEPTION;
-@@ -21613,14 +24980,13 @@
+@@ -21613,14 +25538,13 @@
      if (!req)
          goto fail;
      req->completion_type = magic;
@@ -4515,7 +5077,7 @@
      return promise;
   fail:
      JS_FreeValue(ctx, resolving_funcs[0]);
-@@ -21629,29 +24995,54 @@
+@@ -21629,29 +25553,54 @@
      return JS_EXCEPTION;
  }
  
@@ -4582,7 +5144,7 @@
      obj = js_create_from_ctor(ctx, func_obj, JS_CLASS_ASYNC_GENERATOR);
      if (JS_IsException(obj))
          goto fail;
-@@ -21663,6 +25054,22 @@
+@@ -21663,6 +25612,22 @@
      return JS_EXCEPTION;
  }
  
@@ -4605,7 +5167,191 @@
  /* JS parser */
  
  enum {
-@@ -45453,6 +48860,11 @@
+@@ -41966,12 +45931,6 @@
+     return JS_EXCEPTION;
+ }
+ 
+-#define special_every    0
+-#define special_some     1
+-#define special_forEach  2
+-#define special_map      3
+-#define special_filter   4
+-#define special_TA       8
+ 
+ static JSValue js_typed_array___speciesCreate(JSContext *ctx,
+                                               JSValueConst this_val,
+@@ -42041,6 +46000,32 @@
+     }
+     n = 0;
+ 
++    /* TimeTravelJS: with a bytecode callback and an armed call site, hand
++       the loop to the interpreter pump so every callback is parkable. The
++       TA-filter tail (species re-create) keeps the classic path. */
++    if (ctx->rt->tt_pump_ok &&
++        ctx->rt->tt_pump_cfun == (void *)js_array_every &&
++        JS_VALUE_GET_TAG(func) == JS_TAG_OBJECT &&
++        JS_VALUE_GET_OBJ(func)->class_id == JS_CLASS_BYTECODE_FUNCTION &&
++        special != (special_filter | special_TA)) {
++        TTPumpArrayEvery *st = js_malloc(ctx, sizeof(*st));
++        if (st) {
++            st->obj = obj;
++            st->func = JS_DupValue(ctx, func);
++            st->this_arg = JS_DupValue(ctx, this_arg);
++            st->ret = ret;
++            st->special = special;
++            st->len = len;
++            st->k = 0;
++            st->n = 0;
++            ctx->rt->tt_pump_kind = TT_PUMP_ARRAY_EVERY;
++            ctx->rt->tt_pump_state = st;
++            ctx->rt->tt_pump_ok = FALSE;
++            return JS_UNINITIALIZED;
++        }
++        JS_FreeValue(ctx, JS_GetException(ctx));
++    }
++
+     for(k = 0; k < len; k++) {
+         if (special & special_TA) {
+             val = JS_GetPropertyInt64(ctx, obj, k);
+@@ -42131,8 +46116,6 @@
+     return JS_EXCEPTION;
+ }
+ 
+-#define special_reduce       0
+-#define special_reduceRight  1
+ 
+ static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv, int special)
+@@ -42185,6 +46168,28 @@
+             }
+         }
+     }
++    /* TimeTravelJS: pump bytecode reducers in-loop (the accumulator scan
++       above already resolved the starting k) */
++    if (ctx->rt->tt_pump_ok &&
++        ctx->rt->tt_pump_cfun == (void *)js_array_reduce &&
++        JS_VALUE_GET_TAG(func) == JS_TAG_OBJECT &&
++        JS_VALUE_GET_OBJ(func)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++        TTPumpArrayReduce *st = js_malloc(ctx, sizeof(*st));
++        if (st) {
++            st->obj = obj;
++            st->func = JS_DupValue(ctx, func);
++            st->acc = acc;
++            st->special = special;
++            st->len = len;
++            st->k = k;
++            ctx->rt->tt_pump_kind = TT_PUMP_ARRAY_REDUCE;
++            ctx->rt->tt_pump_state = st;
++            ctx->rt->tt_pump_ok = FALSE;
++            return JS_UNINITIALIZED;
++        }
++        JS_FreeValue(ctx, JS_GetException(ctx));
++    }
++
+     for (; k < len; k++) {
+         k1 = (special & special_reduceRight) ? len - k - 1 : k;
+         if (special & special_TA) {
+@@ -42399,12 +46404,6 @@
+     return JS_EXCEPTION;
+ }
+ 
+-enum {
+-    ArrayFind,
+-    ArrayFindIndex,
+-    ArrayFindLast,
+-    ArrayFindLastIndex,
+-};
+ 
+ static JSValue js_array_find(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv, int mode)
+@@ -42438,6 +46437,30 @@
+         end = -1;
+     }
+ 
++    /* TimeTravelJS: pump bytecode predicates in-loop */
++    if (ctx->rt->tt_pump_ok &&
++        ctx->rt->tt_pump_cfun == (void *)js_array_find &&
++        JS_VALUE_GET_TAG(func) == JS_TAG_OBJECT &&
++        JS_VALUE_GET_OBJ(func)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++        TTPumpArrayFind *st = js_malloc(ctx, sizeof(*st));
++        if (st) {
++            st->obj = obj;
++            st->this_val = JS_DupValue(ctx, this_val);
++            st->func = JS_DupValue(ctx, func);
++            st->this_arg = JS_DupValue(ctx, this_arg);
++            st->mode = mode;
++            st->len = len;
++            st->k = k;
++            st->end = end;
++            st->dir = dir;
++            ctx->rt->tt_pump_kind = TT_PUMP_ARRAY_FIND;
++            ctx->rt->tt_pump_state = st;
++            ctx->rt->tt_pump_ok = FALSE;
++            return JS_UNINITIALIZED;
++        }
++        JS_FreeValue(ctx, JS_GetException(ctx));
++    }
++
+     // TODO(bnoordhuis) add fast path for fast arrays
+     for(; k != end; k += dir) {
+         index_val = JS_NewInt64(ctx, k);
+@@ -43208,6 +47231,55 @@
+             goto exception;
+         asc.has_method = 1;
+     }
++    /* TimeTravelJS: a plain fast array with a bytecode comparator sorts
++       through the interpreter pump (stable bottom-up merge; SortCompare
++       NaN handling and the undefined/hole tail per spec), so comparator
++       code is parkable. Anything exotic keeps the classic path. */
++    if (ctx->rt->tt_pump_ok &&
++        ctx->rt->tt_pump_cfun == (void *)js_array_sort && asc.has_method &&
++        JS_VALUE_GET_TAG(asc.method) == JS_TAG_OBJECT &&
++        JS_VALUE_GET_OBJ(asc.method)->class_id == JS_CLASS_BYTECODE_FUNCTION &&
++        JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT &&
++        JS_VALUE_GET_OBJ(this_val)->class_id == JS_CLASS_ARRAY &&
++        JS_VALUE_GET_OBJ(this_val)->fast_array &&
++        JS_VALUE_GET_OBJ(this_val)->shape->proto ==
++            JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY])) {
++        JSObject *ap = JS_VALUE_GET_OBJ(this_val);
++        uint32_t n0 = ap->u.array.count, x;
++        TTPumpArraySort *st = js_malloc(ctx, sizeof(*st));
++        JSValue *items = st ? js_malloc(ctx, sizeof(JSValue) * (n0 + 1)) : NULL;
++        JSValue *tmp = items ? js_malloc(ctx, sizeof(JSValue) * (n0 + 1)) : NULL;
++        if (tmp) {
++            int64_t m = 0, undef = 0;
++            for (x = 0; x < n0; x++) {
++                JSValue v = ap->u.array.u.values[x];
++                if (JS_IsUndefined(v))
++                    undef++;
++                else
++                    items[m++] = JS_DupValue(ctx, v);
++            }
++            st->obj = JS_DupValue(ctx, this_val);
++            st->func = JS_DupValue(ctx, asc.method);
++            st->items = items;
++            st->tmp = tmp;
++            st->m = m;
++            st->undef = undef;
++            st->w = 1;
++            st->lo = 0;
++            st->mid = -1;
++            st->hi = 0;
++            st->i = 0;
++            st->j = 0;
++            st->kk = 0;
++            ctx->rt->tt_pump_kind = TT_PUMP_ARRAY_SORT;
++            ctx->rt->tt_pump_state = st;
++            ctx->rt->tt_pump_ok = FALSE;
++            return JS_UNINITIALIZED;
++        }
++        JS_FreeValue(ctx, JS_GetException(ctx));
++        js_free(ctx, items);
++        js_free(ctx, st);
++    }
+     obj = JS_ToObject(ctx, this_val);
+     if (js_get_length64(ctx, &len, obj))
+         goto exception;
+@@ -45453,6 +49525,11 @@
      JSString *p;
      JSString *p1;
  
@@ -4617,7 +5363,7 @@
      str = JS_ToStringCheckObject(ctx, this_val);
      if (JS_IsException(str))
          return str;
-@@ -45521,6 +48933,12 @@
+@@ -45521,6 +49598,12 @@
      JSString *p;
      JSString *p1;
  
@@ -4630,7 +5376,7 @@
      str = JS_ToStringCheckObject(ctx, this_val);
      if (JS_IsException(str))
          return str;
-@@ -47146,6 +50564,12 @@
+@@ -47146,6 +51229,12 @@
  static void js_random_init(JSContext *ctx)
  {
      struct timeval tv;
@@ -4643,7 +5389,7 @@
      gettimeofday(&tv, NULL);
      ctx->random_state = ((int64_t)tv.tv_sec * 1000000) + tv.tv_usec;
      /* the state must be non zero */
-@@ -50587,8 +54011,15 @@
+@@ -50587,8 +54676,15 @@
      int res;
      JSValueConst args[3];
      JSPropertyDescriptor desc;
@@ -4659,7 +5405,7 @@
      if (!s)
          return JS_EXCEPTION;
      /* Note: recursion is possible thru the prototype of s->target */
-@@ -50599,6 +54030,30 @@
+@@ -50599,6 +54695,30 @@
          JS_FreeValue(ctx, method);
          return JS_EXCEPTION;
      }
@@ -4690,7 +5436,7 @@
      args[0] = s->target;
      args[1] = atom_val;
      args[2] = receiver;
-@@ -50636,8 +54091,14 @@
+@@ -50636,8 +54756,14 @@
      JSValue method, ret1, atom_val;
      int ret, res;
      JSValueConst args[4];
@@ -4705,7 +5451,7 @@
      if (!s)
          return -1;
      if (JS_IsUndefined(method)) {
-@@ -50650,6 +54111,31 @@
+@@ -50650,6 +54776,31 @@
          JS_FreeValue(ctx, method);
          return -1;
      }
@@ -4737,7 +5483,7 @@
      args[0] = s->target;
      args[1] = atom_val;
      args[2] = value;
-@@ -50842,8 +54328,13 @@
+@@ -50842,8 +54993,13 @@
      JSValueConst args[3];
      JSPropertyDescriptor desc;
      BOOL setting_not_configurable;
@@ -4751,7 +5497,7 @@
      if (!s)
          return -1;
      if (JS_IsUndefined(method)) {
-@@ -50860,6 +54351,32 @@
+@@ -50860,6 +55016,32 @@
          JS_FreeValue(ctx, method);
          return -1;
      }
@@ -4784,7 +5530,35 @@
      args[0] = s->target;
      args[1] = prop_val;
      args[2] = desc_val;
-@@ -53280,6 +56797,317 @@
+@@ -52082,6 +56264,27 @@
+         this_arg = JS_UNDEFINED;
+     if (check_function(ctx, func))
+         return JS_EXCEPTION;
++    /* TimeTravelJS: pump bytecode callbacks in-loop (records are locked
++       around each callback exactly like the classic walk) */
++    if (ctx->rt->tt_pump_ok &&
++        ctx->rt->tt_pump_cfun == (void *)js_map_forEach &&
++        JS_VALUE_GET_TAG(func) == JS_TAG_OBJECT &&
++        JS_VALUE_GET_OBJ(func)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++        TTPumpMapForEach *st = js_malloc(ctx, sizeof(*st));
++        if (st) {
++            st->map_obj = JS_DupValue(ctx, this_val);
++            st->func = JS_DupValue(ctx, func);
++            st->this_arg = JS_DupValue(ctx, this_arg);
++            st->cur = NULL;
++            st->ms = s;
++            st->is_set = magic != 0;
++            ctx->rt->tt_pump_kind = TT_PUMP_MAP_FOREACH;
++            ctx->rt->tt_pump_state = st;
++            ctx->rt->tt_pump_ok = FALSE;
++            return JS_UNINITIALIZED;
++        }
++        JS_FreeValue(ctx, JS_GetException(ctx));
++    }
+     /* Note: the list can be modified while traversing it, but the
+        current element is locked */
+     el = s->records.next;
+@@ -53280,6 +57483,317 @@
      return res;
  }
  
@@ -5102,7 +5876,7 @@
  static void js_promise_resolve_function_free_resolved(JSRuntime *rt,
                                                        JSPromiseFunctionDataResolved *sr)
  {
-@@ -55169,6 +58997,10 @@
+@@ -55169,6 +59683,10 @@
  /* OS dependent: return the UTC time in ms since 1970. */
  static int64_t date_now(void) {
      struct timeval tv;
@@ -5113,7 +5887,7 @@
      gettimeofday(&tv, NULL);
      return (int64_t)tv.tv_sec * 1000 + (tv.tv_usec / 1000);
  }
-@@ -61195,3 +65027,3515 @@
+@@ -61195,3 +65713,3515 @@
      JS_FreeValue(ctx, obj);
      return 0;
  }
