@@ -65499,14 +65499,8 @@ EXPORT("tt_dirty_map_size") int tt_dirty_map_size(void) { return TT_DIRTY_PAGES;
 /* state ------------------------------------------------------------------ */
 static JSRuntime *g_rt;
 static JSContext *g_ctx;
-static JSValue g_ser_fn;        /* (value, kind) -> JSON string           */
-static JSValue g_envelope_fn;   /* (isError, value) -> JSON string        */
-static JSValue g_globals_fn;    /* () -> plain object of user globals     */
-static JSValue g_timer_pop_fn;  /* () -> [fn, argsArray, at] | null       */
-static JSValue g_timer_count_fn;/* () -> int                              */
-static JSValue g_rejected_fn;
-static JSValue g_dom_build_fn;   /* (reason) -> void (console error)       */
-static JSValue g_set_url_fn;     /* (href) -> void — session location init */
+static JSValue g_dom_build_fn;   /* interim JS hook: builds the DOM layer  */
+static JSValue g_set_url_fn;     /* interim JS hook: session location init */
 static int g_in_hook;           /* re-entrancy guard for inspect/eval     */
 static char g_arg_buf[65536];
 
@@ -65518,63 +65512,1124 @@ static int g_jobs_count;
 static int pump_jobs_loop(void);
 static int timer_finish(JSValue r);
 
-/* ------------------------------------------------------------------------ */
-static void send_json_value(JSContext *ctx, int kind, JSValueConst val)
-{
-    JSValue args[1];
-    JSValue s;
-    const char *cstr;
-    size_t len;
+/* ==== native serializer =================================================
+   The inspection/console serializer, in C: it walks values with internal
+   accessors (class ids, shape props, map records, typed-array storage) and
+   writes the typed JSON directly into a DynBuf. No JavaScript is injected
+   into the debugged realm and — beyond accessor properties it reports
+   without invoking (shown as getters) and Error name/message reads — no
+   user code runs while inspecting. Proxies serialize opaquely: looking at
+   a value must not fire traps. */
+#define TT_SER_MAXD 4
+#define TT_SER_MAXI 40
+#define TT_SER_MAXK 40
+#define TT_SER_MAXS 200
+#define TT_SER_SEEN 40
 
-    args[0] = (JSValue)val;
-    s = JS_Call(ctx, g_ser_fn, JS_UNDEFINED, 1, (JSValueConst *)args);
-    if (JS_IsException(s)) {
-        JS_FreeValue(ctx, JS_GetException(ctx));
-        tt_host_out(kind, "null", 4);
-        return;
+/* tt-dom.c views for DOM-wrapper serialization (pointer-validated) */
+int tt_dom_has_doc_c(void);
+uint32_t tt_dom_doc_ptr(void);
+int tt_dom_ptr_known(uint32_t h);
+char *tt_dom_serialize_ptr(uint32_t h, int deep, size_t *plen);
+const char *tt_dom_node_name_ptr(uint32_t h, size_t *plen);
+
+static void tt_json_esc(DynBuf *b, const char *s, size_t len)
+{
+    size_t i;
+    dbuf_putc(b, '"');
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+        case '"': dbuf_putstr(b, "\\\""); break;
+        case '\\': dbuf_putstr(b, "\\\\"); break;
+        case '\b': dbuf_putstr(b, "\\b"); break;
+        case '\f': dbuf_putstr(b, "\\f"); break;
+        case '\n': dbuf_putstr(b, "\\n"); break;
+        case '\r': dbuf_putstr(b, "\\r"); break;
+        case '\t': dbuf_putstr(b, "\\t"); break;
+        default:
+            if (c < 0x20)
+                dbuf_printf(b, "\\u%04x", c);
+            else
+                dbuf_putc(b, c);
+        }
     }
-    cstr = JS_ToCStringLen(ctx, &len, s);
-    if (cstr) {
-        tt_host_out(kind, cstr, (int)len);
-        JS_FreeCString(ctx, cstr);
-    } else {
-        JS_FreeValue(ctx, JS_GetException(ctx));
-        tt_host_out(kind, "null", 4);
-    }
-    JS_FreeValue(ctx, s);
+    dbuf_putc(b, '"');
 }
 
-/* Send { stack, frames: [locals…], globals } for the paused position. */
-static void send_inspection(JSContext *ctx)
+/* write v (a primitive number/string/bool) with ECMAScript ToString number
+   formatting; strings escaped, capped at `cap` code units when cap > 0 */
+static void tt_json_str_val(JSContext *ctx, DynBuf *b, JSValueConst v)
 {
-    JSValue obj = JS_NewObject(ctx);
-    JSValue stack = JS_TTBacktrace(ctx);
-    JSValue frames = JS_NewArray(ctx);
-    JSValue globals;
-    int level;
-    int64_t nframes = 0;
+    const char *s;
+    size_t len;
+    s = JS_ToCStringLen(ctx, &len, v);
+    if (!s) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        dbuf_putstr(b, "\"\"");
+        return;
+    }
+    tt_json_esc(b, s, len);
+    JS_FreeCString(ctx, s);
+}
 
-    JS_DefinePropertyValueStr(ctx, obj, "stack", stack, JS_PROP_C_W_E);
+static void tt_json_num(JSContext *ctx, DynBuf *b, double d)
+{
+    JSValue nv;
+    const char *s;
+    size_t len;
+    if (isnan(d) || isinf(d)) { /* not valid JSON — callers pre-filter */
+        dbuf_putstr(b, "null");
+        return;
+    }
+    nv = JS_NewFloat64(ctx, d);
+    s = JS_ToCStringLen(ctx, &len, nv);
+    if (s) {
+        dbuf_put(b, (const uint8_t *)s, len);
+        JS_FreeCString(ctx, s);
+    } else {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        dbuf_putstr(b, "0");
+    }
+    JS_FreeValue(ctx, nv);
+}
+
+/* the constructor name from the immediate prototype, own data props only */
+static void tt_ser_classname(JSContext *ctx, DynBuf *b, JSObject *p)
+{
+    JSValue proto;
+    JSPropertyDescriptor d1, d2;
+    const char *out = "";
+    char tmp[64];
+    size_t outlen = 0;
+
+    proto = JS_GetPrototype(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
+    if (JS_IsNull(proto)) {
+        out = "Object";
+        outlen = 6;
+        goto emit;
+    }
+    if (JS_VALUE_GET_TAG(proto) != JS_TAG_OBJECT)
+        goto emit;
+    if (JS_GetOwnPropertyInternal(ctx, &d1, JS_VALUE_GET_OBJ(proto),
+                                  JS_ATOM_constructor) == 1) {
+        if (!(d1.flags & JS_PROP_GETSET) &&
+            JS_VALUE_GET_TAG(d1.value) == JS_TAG_OBJECT &&
+            JS_GetOwnPropertyInternal(ctx, &d2, JS_VALUE_GET_OBJ(d1.value),
+                                      JS_ATOM_name) == 1) {
+            if (!(d2.flags & JS_PROP_GETSET) && JS_IsString(d2.value)) {
+                const char *s;
+                size_t len;
+                s = JS_ToCStringLen(ctx, &len, d2.value);
+                if (s) {
+                    if (len < sizeof(tmp) && len > 0 &&
+                        !(len == 6 && !memcmp(s, "Object", 6))) {
+                        memcpy(tmp, s, len);
+                        out = tmp;
+                        outlen = len;
+                    }
+                    JS_FreeCString(ctx, s);
+                }
+            }
+            js_free_desc(ctx, &d2);
+        }
+        js_free_desc(ctx, &d1);
+    } else {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+ emit:
+    JS_FreeValue(ctx, proto);
+    tt_json_esc(b, out, outlen);
+}
+
+/* does p's ordinary prototype chain reach a class prototype? */
+static BOOL tt_proto_chain_has(JSContext *ctx, JSObject *p, JSValueConst target)
+{
+    JSObject *t = JS_VALUE_GET_OBJ(target);
+    int guard = 0;
+    while (p && guard++ < 64) {
+        JSShape *sh = p->shape;
+        JSObject *proto = sh ? sh->proto : NULL;
+        if (proto == t)
+            return TRUE;
+        if (proto && proto->class_id == JS_CLASS_PROXY)
+            return FALSE;
+        p = proto;
+    }
+    return FALSE;
+}
+
+static void tt_ser_val(JSContext *ctx, DynBuf *b, JSValueConst v, int depth,
+                       JSObject **seen, int seen_len);
+
+/* [["key", tree], ...] over own enumerable string props (descriptor reads
+   only; accessors reported as getters, never invoked) */
+static void tt_ser_props(JSContext *ctx, DynBuf *b, JSObject *p, int depth,
+                         JSObject **seen, int seen_len, BOOL *more)
+{
+    JSPropertyEnum *tab = NULL;
+    uint32_t count = 0, i, lim;
+
+    *more = FALSE;
+    dbuf_putc(b, '[');
+    if (JS_GetOwnPropertyNamesInternal(ctx, &tab, &count, p,
+                                       JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        dbuf_putc(b, ']');
+        return;
+    }
+    lim = count < TT_SER_MAXK ? count : TT_SER_MAXK;
+    for (i = 0; i < lim; i++) {
+        JSPropertyDescriptor desc;
+        const char *ks;
+        int res;
+        if (i)
+            dbuf_putc(b, ',');
+        dbuf_putc(b, '[');
+        ks = JS_AtomToCString(ctx, tab[i].atom);
+        tt_json_esc(b, ks ? ks : "", ks ? strlen(ks) : 0);
+        if (ks)
+            JS_FreeCString(ctx, ks);
+        dbuf_putc(b, ',');
+        res = JS_GetOwnPropertyInternal(ctx, &desc, p, tab[i].atom);
+        if (res == 1) {
+            if (desc.flags & JS_PROP_GETSET) {
+                dbuf_putstr(b, "{\"t\":\"getter\"}");
+            } else {
+                tt_ser_val(ctx, b, desc.value, depth - 1, seen, seen_len);
+            }
+            js_free_desc(ctx, &desc);
+        } else {
+            if (res < 0)
+                JS_FreeValue(ctx, JS_GetException(ctx));
+            dbuf_putstr(b, "{\"t\":\"undef\"}");
+        }
+        dbuf_putc(b, ']');
+    }
+    dbuf_putc(b, ']');
+    *more = count > lim;
+}
+
+static void tt_ser_val(JSContext *ctx, DynBuf *b, JSValueConst v, int depth,
+                       JSObject **seen, int seen_len)
+{
+    int tag = JS_VALUE_GET_NORM_TAG(v);
+    JSObject *p;
+    int i;
+
+    switch (tag) {
+    case JS_TAG_NULL:
+        dbuf_putstr(b, "{\"t\":\"null\"}");
+        return;
+    case JS_TAG_UNDEFINED:
+        dbuf_putstr(b, "{\"t\":\"undef\"}");
+        return;
+    case JS_TAG_BOOL:
+        dbuf_printf(b, "{\"t\":\"bool\",\"v\":%s}",
+                    JS_VALUE_GET_BOOL(v) ? "true" : "false");
+        return;
+    case JS_TAG_INT:
+        dbuf_printf(b, "{\"t\":\"num\",\"v\":%d}", JS_VALUE_GET_INT(v));
+        return;
+    case JS_TAG_FLOAT64: {
+        double d = JS_VALUE_GET_FLOAT64(v);
+        if (isnan(d)) {
+            dbuf_putstr(b, "{\"t\":\"nan\"}");
+        } else if (isinf(d)) {
+            dbuf_printf(b, "{\"t\":\"num\",\"v\":\"%sInfinity\",\"special\":true}",
+                        d < 0 ? "-" : "");
+        } else {
+            dbuf_putstr(b, "{\"t\":\"num\",\"v\":");
+            tt_json_num(ctx, b, d);
+            dbuf_putc(b, '}');
+        }
+        return;
+    }
+    case JS_TAG_SHORT_BIG_INT:
+    case JS_TAG_BIG_INT: {
+        JSValue s = JS_ToString(ctx, v);
+        dbuf_putstr(b, "{\"t\":\"bigint\",\"v\":");
+        if (JS_IsException(s)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            dbuf_putstr(b, "\"\"");
+        } else {
+            tt_json_str_val(ctx, b, s);
+        }
+        JS_FreeValue(ctx, s);
+        dbuf_putc(b, '}');
+        return;
+    }
+    case JS_TAG_STRING:
+    case JS_TAG_STRING_ROPE: {
+        JSValue sv = JS_ToString(ctx, v); /* flattens ropes; no user code */
+        uint32_t culen;
+        if (JS_IsException(sv)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            dbuf_putstr(b, "{\"t\":\"str\",\"v\":\"\"}");
+            return;
+        }
+        culen = JS_VALUE_GET_STRING(sv)->len;
+        if (culen > TT_SER_MAXS) {
+            JSValue sub = js_sub_string(ctx, JS_VALUE_GET_STRING(sv), 0, TT_SER_MAXS);
+            dbuf_putstr(b, "{\"t\":\"str\",\"v\":");
+            if (JS_IsException(sub)) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                dbuf_putstr(b, "\"\"");
+            } else {
+                tt_json_str_val(ctx, b, sub);
+                JS_FreeValue(ctx, sub);
+            }
+            dbuf_printf(b, ",\"trunc\":%u}", culen);
+        } else {
+            dbuf_putstr(b, "{\"t\":\"str\",\"v\":");
+            tt_json_str_val(ctx, b, sv);
+            dbuf_putc(b, '}');
+        }
+        JS_FreeValue(ctx, sv);
+        return;
+    }
+    case JS_TAG_SYMBOL: {
+        JSValue s = js_symbol_toString(ctx, v, 0, NULL);
+        dbuf_putstr(b, "{\"t\":\"sym\",\"v\":");
+        if (JS_IsException(s)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            dbuf_putstr(b, "\"\"");
+        } else {
+            tt_json_str_val(ctx, b, s);
+        }
+        JS_FreeValue(ctx, s);
+        dbuf_putc(b, '}');
+        return;
+    }
+    case JS_TAG_OBJECT:
+        break;
+    default:
+        dbuf_putstr(b, "{\"t\":\"undef\"}");
+        return;
+    }
+
+    p = JS_VALUE_GET_OBJ(v);
+
+    /* DOM wrapper: own __p data prop naming a pointer tt-dom.c issued */
+    if (tt_dom_has_doc_c()) {
+        JSPropertyDescriptor pd;
+        JSAtom a = JS_NewAtom(ctx, "__p");
+        int res = JS_GetOwnPropertyInternal(ctx, &pd, p, a);
+        JS_FreeAtom(ctx, a);
+        if (res == 1) {
+            uint32_t h = 0;
+            BOOL isdom = FALSE;
+            if (!(pd.flags & JS_PROP_GETSET) &&
+                JS_VALUE_GET_TAG(pd.value) == JS_TAG_INT) {
+                h = (uint32_t)JS_VALUE_GET_INT(pd.value);
+                isdom = tt_dom_ptr_known(h);
+            }
+            js_free_desc(ctx, &pd);
+            if (isdom) {
+                const char *nm;
+                size_t nmlen = 0, hlen = 0;
+                char *html = tt_dom_serialize_ptr(h, 0, &hlen);
+                dbuf_putstr(b, "{\"t\":\"dom\",\"name\":");
+                nm = tt_dom_node_name_ptr(h, &nmlen);
+                tt_json_esc(b, nm ? nm : "", nmlen);
+                dbuf_putstr(b, ",\"html\":");
+                if (html && hlen > 160) {
+                    DynBuf hb;
+                    js_dbuf_init(ctx, &hb);
+                    dbuf_put(&hb, (const uint8_t *)html, 160);
+                    dbuf_put(&hb, (const uint8_t *)"\xe2\x80\xa6", 3);
+                    tt_json_esc(b, (const char *)hb.buf, hb.size);
+                    dbuf_free(&hb);
+                } else {
+                    tt_json_esc(b, html ? html : "", hlen);
+                }
+                free(html);
+                dbuf_putc(b, '}');
+                return;
+            }
+        } else if (res < 0) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        }
+    }
+
+    if (JS_IsFunction(ctx, v)) {
+        JSPropertyDescriptor nd;
+        dbuf_putstr(b, "{\"t\":\"fn\",\"name\":");
+        if (JS_GetOwnPropertyInternal(ctx, &nd, p, JS_ATOM_name) == 1) {
+            if (!(nd.flags & JS_PROP_GETSET) && JS_IsString(nd.value))
+                tt_json_str_val(ctx, b, nd.value);
+            else
+                dbuf_putstr(b, "\"\"");
+            js_free_desc(ctx, &nd);
+        } else {
+            dbuf_putstr(b, "\"\"");
+        }
+        dbuf_putc(b, '}');
+        return;
+    }
+
+    for (i = 0; i < seen_len; i++) {
+        if (seen[i] == p) {
+            dbuf_putstr(b, "{\"t\":\"ref\"}");
+            return;
+        }
+    }
+    if (depth <= 0 || seen_len >= TT_SER_SEEN) {
+        dbuf_putstr(b, "{\"t\":\"more\",\"cls\":");
+        tt_ser_classname(ctx, b, p);
+        dbuf_putc(b, '}');
+        return;
+    }
+    seen[seen_len++] = p;
+
+    switch (p->class_id) {
+    case JS_CLASS_PROXY:
+        /* inspecting must never fire traps */
+        dbuf_putstr(b, "{\"t\":\"obj\",\"cls\":\"Proxy\",\"props\":[],\"more\":true}");
+        return;
+    case JS_CLASS_ARRAY: {
+        int64_t n = 0, lim, k;
+        JSValue lenv = JS_GetPropertyStr(ctx, (JSValue)v, "length");
+        JS_ToInt64(ctx, &n, lenv);
+        JS_FreeValue(ctx, lenv);
+        lim = n < TT_SER_MAXI ? n : TT_SER_MAXI;
+        dbuf_printf(b, "{\"t\":\"arr\",\"n\":%" PRId64 ",\"items\":[", n);
+        for (k = 0; k < lim; k++) {
+            JSPropertyDescriptor ed;
+            JSAtom ka = JS_NewAtomUInt32(ctx, (uint32_t)k);
+            int res = JS_GetOwnPropertyInternal(ctx, &ed, p, ka);
+            JS_FreeAtom(ctx, ka);
+            if (k)
+                dbuf_putc(b, ',');
+            if (res == 1) {
+                if (ed.flags & JS_PROP_GETSET)
+                    dbuf_putstr(b, "{\"t\":\"getter\"}");
+                else
+                    tt_ser_val(ctx, b, ed.value, depth - 1, seen, seen_len);
+                js_free_desc(ctx, &ed);
+            } else {
+                if (res < 0)
+                    JS_FreeValue(ctx, JS_GetException(ctx));
+                dbuf_putstr(b, "{\"t\":\"hole\"}");
+            }
+        }
+        dbuf_printf(b, "],\"more\":%s}", n > lim ? "true" : "false");
+        return;
+    }
+    case JS_CLASS_DATE: {
+        double d = 0;
+        JSValue dv = JS_DupValue(ctx, p->u.object_data);
+        JS_ToFloat64Free(ctx, &d, dv);
+        dbuf_putstr(b, "{\"t\":\"date\",\"v\":\"virtual+");
+        tt_json_num(ctx, b, isnan(d) ? 0 : d);
+        dbuf_putstr(b, "ms\"}");
+        return;
+    }
+    case JS_CLASS_REGEXP: {
+        JSRegExp *re = &p->u.regexp;
+        const char *ps;
+        size_t plen2;
+        int fl = lre_get_flags(re->bytecode->u.str8);
+        char flags[8];
+        int nf = 0;
+        DynBuf rb;
+        if (fl & LRE_FLAG_INDICES) flags[nf++] = 'd';
+        if (fl & LRE_FLAG_GLOBAL) flags[nf++] = 'g';
+        if (fl & LRE_FLAG_IGNORECASE) flags[nf++] = 'i';
+        if (fl & LRE_FLAG_MULTILINE) flags[nf++] = 'm';
+        if (fl & LRE_FLAG_DOTALL) flags[nf++] = 's';
+        if (fl & LRE_FLAG_UNICODE) flags[nf++] = 'u';
+        if (fl & LRE_FLAG_UNICODE_SETS) flags[nf++] = 'v';
+        if (fl & LRE_FLAG_STICKY) flags[nf++] = 'y';
+        ps = JS_ToCStringLen(ctx, &plen2, JS_MKPTR(JS_TAG_STRING, re->pattern));
+        js_dbuf_init(ctx, &rb);
+        dbuf_putc(&rb, '/');
+        if (ps)
+            dbuf_put(&rb, (const uint8_t *)ps, plen2);
+        dbuf_putc(&rb, '/');
+        dbuf_put(&rb, (const uint8_t *)flags, nf);
+        if (ps)
+            JS_FreeCString(ctx, ps);
+        dbuf_putstr(b, "{\"t\":\"regexp\",\"v\":");
+        tt_json_esc(b, (const char *)rb.buf, rb.size);
+        dbuf_free(&rb);
+        dbuf_putc(b, '}');
+        return;
+    }
+    case JS_CLASS_MAP:
+    case JS_CLASS_SET: {
+        JSMapState *ms = JS_GetOpaque((JSValue)v, p->class_id);
+        BOOL is_map = p->class_id == JS_CLASS_MAP;
+        struct list_head *el;
+        uint32_t n = ms ? ms->record_count : 0, shown = 0;
+        dbuf_printf(b, "{\"t\":\"%s\",\"n\":%u,\"%s\":[",
+                    is_map ? "map" : "set", n, is_map ? "entries" : "items");
+        if (ms) {
+            list_for_each(el, &ms->records) {
+                JSMapRecord *mr = list_entry(el, JSMapRecord, link);
+                if (mr->empty)
+                    continue;
+                if (shown >= 20)
+                    break;
+                if (shown)
+                    dbuf_putc(b, ',');
+                if (is_map) {
+                    dbuf_putc(b, '[');
+                    tt_ser_val(ctx, b, mr->key, depth - 1, seen, seen_len);
+                    dbuf_putc(b, ',');
+                    tt_ser_val(ctx, b, mr->value, depth - 1, seen, seen_len);
+                    dbuf_putc(b, ']');
+                } else {
+                    tt_ser_val(ctx, b, mr->key, depth - 1, seen, seen_len);
+                }
+                shown++;
+            }
+        }
+        dbuf_printf(b, "],\"more\":%s}", n > 20 ? "true" : "false");
+        return;
+    }
+    default:
+        break;
+    }
+
+    if (p->class_id >= JS_CLASS_UINT8C_ARRAY &&
+        p->class_id <= JS_CLASS_FLOAT64_ARRAY) {
+        uint32_t n = p->u.array.count, lim = n < 20 ? n : 20, k;
+        dbuf_putstr(b, "{\"t\":\"typed\",\"cls\":");
+        {
+            const char *cn = JS_AtomToCString(ctx, ctx->rt->class_array[p->class_id].class_name);
+            tt_json_esc(b, cn ? cn : "", cn ? strlen(cn) : 0);
+            if (cn)
+                JS_FreeCString(ctx, cn);
+        }
+        dbuf_printf(b, ",\"n\":%u,\"items\":[", n);
+        for (k = 0; k < lim; k++) {
+            JSValue ev = JS_GetPropertyUint32(ctx, (JSValue)v, k);
+            double d = 0;
+            if (k)
+                dbuf_putc(b, ',');
+            if (JS_IsException(ev)) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                dbuf_putstr(b, "null");
+            } else if (JS_VALUE_GET_TAG(ev) == JS_TAG_SHORT_BIG_INT ||
+                       JS_VALUE_GET_TAG(ev) == JS_TAG_BIG_INT) {
+                JSValue s = JS_ToString(ctx, ev);
+                if (JS_IsException(s)) {
+                    JS_FreeValue(ctx, JS_GetException(ctx));
+                    dbuf_putstr(b, "null");
+                } else {
+                    tt_json_str_val(ctx, b, s);
+                }
+                JS_FreeValue(ctx, s);
+                JS_FreeValue(ctx, ev);
+            } else {
+                JS_ToFloat64Free(ctx, &d, ev);
+                if (isnan(d) || isinf(d))
+                    dbuf_putstr(b, "null");
+                else
+                    tt_json_num(ctx, b, d);
+            }
+        }
+        dbuf_printf(b, "],\"more\":%s}", n > lim ? "true" : "false");
+        return;
+    }
+
+    /* Error instances: class ERROR or an ordinary chain to Error.prototype */
+    if (p->class_id == JS_CLASS_ERROR ||
+        tt_proto_chain_has(ctx, p, ctx->class_proto[JS_CLASS_ERROR])) {
+        JSValue nv2 = JS_GetPropertyStr(ctx, (JSValue)v, "name");
+        JSValue mv = JS_GetPropertyStr(ctx, (JSValue)v, "message");
+        dbuf_putstr(b, "{\"t\":\"error\",\"name\":");
+        if (JS_IsException(nv2)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            nv2 = JS_UNDEFINED;
+        }
+        if (JS_IsException(mv)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            mv = JS_UNDEFINED;
+        }
+        if (JS_IsString(nv2))
+            tt_json_str_val(ctx, b, nv2);
+        else
+            dbuf_putstr(b, "\"Error\"");
+        dbuf_putstr(b, ",\"msg\":");
+        {
+            JSValue msv = JS_ToString(ctx, mv);
+            if (JS_IsException(msv)) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                dbuf_putstr(b, "\"\"");
+            } else {
+                tt_json_str_val(ctx, b, msv);
+                JS_FreeValue(ctx, msv);
+            }
+        }
+        JS_FreeValue(ctx, nv2);
+        JS_FreeValue(ctx, mv);
+        dbuf_putc(b, '}');
+        return;
+    }
+
     {
+        BOOL more = FALSE;
+        dbuf_putstr(b, "{\"t\":\"obj\",\"cls\":");
+        tt_ser_classname(ctx, b, p);
+        dbuf_putstr(b, ",\"props\":");
+        tt_ser_props(ctx, b, p, depth, seen, seen_len, &more);
+        dbuf_printf(b, ",\"more\":%s}", more ? "true" : "false");
+    }
+}
+
+static void tt_ser_root(JSContext *ctx, DynBuf *b, JSValueConst v, int depth)
+{
+    JSObject *seen[TT_SER_SEEN];
+    tt_ser_val(ctx, b, v, depth, seen, 0);
+}
+
+/* ==== console / envelopes =============================================== */
+static void tt_emit_buf(int kind, DynBuf *b)
+{
+    tt_host_out(kind, (const char *)b->buf, (int)b->size);
+    dbuf_free(b);
+}
+
+static JSValue js_tt_console_native(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv, int magic)
+{
+    DynBuf b;
+    int i, level = magic, first = 0;
+    (void)this_val;
+    if (magic == 4) { /* console.assert */
+        if (argc >= 1 && JS_ToBool(ctx, argv[0]))
+            return JS_UNDEFINED;
+        level = 3;
+        first = 1;
+    }
+    js_dbuf_init(ctx, &b);
+    dbuf_printf(&b, "{\"level\":%d,\"parts\":[", level);
+    if (magic == 4)
+        dbuf_putstr(&b, "{\"t\":\"str\",\"v\":\"Assertion failed\"}");
+    for (i = first; i < argc; i++) {
+        if (i > first || magic == 4)
+            dbuf_putc(&b, ',');
+        tt_ser_root(ctx, &b, argv[i], 3);
+    }
+    dbuf_putstr(&b, "]}");
+    tt_emit_buf(0, &b);
+    return JS_UNDEFINED;
+}
+
+/* "Unhandled promise rejection:" + reason through the console channel */
+static void tt_emit_rejection(JSContext *ctx, JSValueConst reason)
+{
+    DynBuf b;
+    js_dbuf_init(ctx, &b);
+    dbuf_putstr(&b, "{\"level\":3,\"parts\":[{\"t\":\"str\",\"v\":\"Unhandled promise rejection:\"},");
+    tt_ser_root(ctx, &b, reason, 3);
+    dbuf_putstr(&b, "]}");
+    tt_emit_buf(0, &b);
+}
+
+/* {"ok": tree} / {"error": tree} for eval results, to `kind` */
+static void tt_emit_envelope(JSContext *ctx, int kind, int is_error,
+                             JSValueConst value)
+{
+    DynBuf b;
+    js_dbuf_init(ctx, &b);
+    dbuf_putstr(&b, is_error ? "{\"error\":" : "{\"ok\":");
+    tt_ser_root(ctx, &b, value, TT_SER_MAXD);
+    dbuf_putc(&b, '}');
+    tt_emit_buf(kind, &b);
+}
+
+/* ==== inspection ======================================================== */
+/* baseline: global own property names present before user code ran */
+static JSAtom *g_baseline;
+static int g_baseline_len, g_baseline_cap;
+
+static void tt_baseline_clear(void)
+{
+    int i;
+    for (i = 0; i < g_baseline_len; i++)
+        JS_FreeAtomRT(g_rt, g_baseline[i]);
+    free(g_baseline);
+    g_baseline = NULL;
+    g_baseline_len = g_baseline_cap = 0;
+}
+
+static void tt_baseline_capture(JSContext *ctx)
+{
+    JSValue glob = JS_GetGlobalObject(ctx);
+    JSPropertyEnum *tab = NULL;
+    uint32_t count = 0, i;
+
+    tt_baseline_clear();
+    if (!JS_GetOwnPropertyNamesInternal(ctx, &tab, &count,
+                                        JS_VALUE_GET_OBJ(glob),
+                                        JS_GPN_STRING_MASK)) {
+        g_baseline = malloc(sizeof(JSAtom) * (count ? count : 1));
+        if (g_baseline) {
+            g_baseline_cap = (int)count;
+            for (i = 0; i < count; i++)
+                g_baseline[g_baseline_len++] = JS_DupAtom(ctx, tab[i].atom);
+        }
+        JS_FreePropertyEnum(ctx, tab, count);
+    }
+    JS_FreeValue(ctx, glob);
+}
+
+static BOOL tt_baseline_has(JSAtom a)
+{
+    int i;
+    for (i = 0; i < g_baseline_len; i++)
+        if (g_baseline[i] == a)
+            return TRUE;
+    return FALSE;
+}
+
+/* [["name", tree], ...] of globals the program added; getter globals are
+   invoked like the live program would (stepping is off here) */
+static void tt_ser_user_globals(JSContext *ctx, DynBuf *b, int depth)
+{
+    JSValue glob = JS_GetGlobalObject(ctx);
+    JSPropertyEnum *tab = NULL;
+    uint32_t count = 0, i;
+    int emitted = 0;
+
+    dbuf_putc(b, '[');
+    if (!JS_GetOwnPropertyNamesInternal(ctx, &tab, &count,
+                                        JS_VALUE_GET_OBJ(glob),
+                                        JS_GPN_STRING_MASK)) {
+        for (i = 0; i < count; i++) {
+            JSValue pv;
+            const char *ks;
+            if (tt_baseline_has(tab[i].atom))
+                continue;
+            pv = JS_GetPropertyInternal(ctx, glob, tab[i].atom, glob, 0);
+            if (JS_IsException(pv)) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                continue;
+            }
+            if (emitted++)
+                dbuf_putc(b, ',');
+            dbuf_putc(b, '[');
+            ks = JS_AtomToCString(ctx, tab[i].atom);
+            tt_json_esc(b, ks ? ks : "", ks ? strlen(ks) : 0);
+            if (ks)
+                JS_FreeCString(ctx, ks);
+            dbuf_putc(b, ',');
+            tt_ser_root(ctx, b, pv, depth);
+            dbuf_putc(b, ']');
+            JS_FreeValue(ctx, pv);
+        }
+        JS_FreePropertyEnum(ctx, tab, count);
+    }
+    JS_FreeValue(ctx, glob);
+    dbuf_putc(b, ']');
+    (void)emitted;
+}
+
+/* one locals frame object ({ name -> value, "<uninitialized>": [names] })
+   as [["name", tree], ..., ["tdzName", {"t":"tdz"}], ...] */
+static void tt_ser_locals_frame(JSContext *ctx, DynBuf *b, JSValueConst frame)
+{
+    JSPropertyEnum *tab = NULL;
+    uint32_t count = 0, i;
+    int emitted = 0;
+    JSValue tdz;
+
+    dbuf_putc(b, '[');
+    if (JS_VALUE_GET_TAG(frame) == JS_TAG_OBJECT &&
+        !JS_GetOwnPropertyNamesInternal(ctx, &tab, &count,
+                                        JS_VALUE_GET_OBJ(frame),
+                                        JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
+        for (i = 0; i < count; i++) {
+            const char *ks = JS_AtomToCString(ctx, tab[i].atom);
+            JSValue pv;
+            if (ks && !strcmp(ks, "<uninitialized>")) {
+                JS_FreeCString(ctx, ks);
+                continue;
+            }
+            pv = JS_GetPropertyInternal(ctx, frame, tab[i].atom, frame, 0);
+            if (JS_IsException(pv)) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                if (ks)
+                    JS_FreeCString(ctx, ks);
+                continue;
+            }
+            if (emitted++)
+                dbuf_putc(b, ',');
+            dbuf_putc(b, '[');
+            tt_json_esc(b, ks ? ks : "", ks ? strlen(ks) : 0);
+            if (ks)
+                JS_FreeCString(ctx, ks);
+            dbuf_putc(b, ',');
+            tt_ser_root(ctx, b, pv, TT_SER_MAXD);
+            dbuf_putc(b, ']');
+            JS_FreeValue(ctx, pv);
+        }
+        JS_FreePropertyEnum(ctx, tab, count);
+    }
+    tdz = JS_GetPropertyStr(ctx, frame, "<uninitialized>");
+    if (JS_VALUE_GET_TAG(tdz) == JS_TAG_OBJECT) {
+        int64_t n = 0, k;
+        JSValue lenv = JS_GetPropertyStr(ctx, tdz, "length");
+        JS_ToInt64(ctx, &n, lenv);
+        JS_FreeValue(ctx, lenv);
+        for (k = 0; k < n; k++) {
+            JSValue nv = JS_GetPropertyUint32(ctx, tdz, (uint32_t)k);
+            if (JS_IsString(nv)) {
+                if (emitted++)
+                    dbuf_putc(b, ',');
+                dbuf_putc(b, '[');
+                tt_json_str_val(ctx, b, nv);
+                dbuf_putstr(b, ",{\"t\":\"tdz\"}]");
+            }
+            JS_FreeValue(ctx, nv);
+        }
+    } else if (JS_IsException(tdz)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    JS_FreeValue(ctx, tdz);
+    dbuf_putc(b, ']');
+}
+
+/* the backtrace array of {name, line, col} plain objects, verbatim JSON */
+static void tt_ser_stack(JSContext *ctx, DynBuf *b, JSValueConst stack)
+{
+    int64_t n = 0, i;
+    JSValue lenv = JS_GetPropertyStr(ctx, stack, "length");
+    JS_ToInt64(ctx, &n, lenv);
+    JS_FreeValue(ctx, lenv);
+    dbuf_putc(b, '[');
+    for (i = 0; i < n; i++) {
+        JSValue fo = JS_GetPropertyUint32(ctx, stack, (uint32_t)i);
+        JSValue nm, ln, cl;
+        if (i)
+            dbuf_putc(b, ',');
+        nm = JS_GetPropertyStr(ctx, fo, "name");
+        ln = JS_GetPropertyStr(ctx, fo, "line");
+        cl = JS_GetPropertyStr(ctx, fo, "col");
+        dbuf_putstr(b, "{\"name\":");
+        if (JS_IsString(nm))
+            tt_json_str_val(ctx, b, nm);
+        else
+            dbuf_putstr(b, "\"\"");
+        {
+            int32_t lni = 0, cli = 0;
+            JS_ToInt32(ctx, &lni, ln);
+            JS_ToInt32(ctx, &cli, cl);
+            dbuf_printf(b, ",\"line\":%d,\"col\":%d}", lni, cli);
+        }
+        JS_FreeValue(ctx, nm);
+        JS_FreeValue(ctx, ln);
+        JS_FreeValue(ctx, cl);
+        JS_FreeValue(ctx, fo);
+    }
+    dbuf_putc(b, ']');
+}
+
+/* the merged globals array: user globals first, then script lexicals not
+   shadowed by them, then lexical TDZ names */
+static void tt_ser_globals_merged(JSContext *ctx, DynBuf *b)
+{
+    JSValue lex = JS_TTGlobalLexicals(ctx);
+    JSPropertyEnum *tab = NULL;
+    uint32_t count = 0, i;
+    DynBuf gb;
+    int emitted;
+
+    /* user globals into a sub-buffer so we can count/emit cleanly */
+    js_dbuf_init(ctx, &gb);
+    tt_ser_user_globals(ctx, &gb, 3);
+    /* gb holds "[...]" — splice its contents */
+    dbuf_put(b, gb.buf, gb.size ? gb.size - 1 : 0); /* drop closing ] */
+    emitted = gb.size > 2; /* more than "[]" */
+    dbuf_free(&gb);
+
+    if (JS_VALUE_GET_TAG(lex) == JS_TAG_OBJECT &&
+        !JS_GetOwnPropertyNamesInternal(ctx, &tab, &count,
+                                        JS_VALUE_GET_OBJ(lex),
+                                        JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
+        JSValue glob = JS_GetGlobalObject(ctx);
+        for (i = 0; i < count; i++) {
+            const char *ks = JS_AtomToCString(ctx, tab[i].atom);
+            JSValue pv;
+            int shadowed;
+            if (ks && !strcmp(ks, "<uninitialized>")) {
+                JS_FreeCString(ctx, ks);
+                continue;
+            }
+            /* a user global of the same name wins (own props only) */
+            shadowed = !tt_baseline_has(tab[i].atom) &&
+                JS_GetOwnPropertyInternal(ctx, NULL, JS_VALUE_GET_OBJ(glob),
+                                          tab[i].atom) == 1;
+            if (shadowed) {
+                if (ks)
+                    JS_FreeCString(ctx, ks);
+                continue;
+            }
+            pv = JS_GetPropertyInternal(ctx, lex, tab[i].atom, lex, 0);
+            if (JS_IsException(pv)) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                if (ks)
+                    JS_FreeCString(ctx, ks);
+                continue;
+            }
+            if (emitted++)
+                dbuf_putc(b, ',');
+            dbuf_putc(b, '[');
+            tt_json_esc(b, ks ? ks : "", ks ? strlen(ks) : 0);
+            if (ks)
+                JS_FreeCString(ctx, ks);
+            dbuf_putc(b, ',');
+            tt_ser_root(ctx, b, pv, 3);
+            dbuf_putc(b, ']');
+            JS_FreeValue(ctx, pv);
+        }
+        JS_FreeValue(ctx, glob);
+        JS_FreePropertyEnum(ctx, tab, count);
+    }
+    {
+        JSValue tdz = JS_GetPropertyStr(ctx, lex, "<uninitialized>");
+        if (JS_VALUE_GET_TAG(tdz) == JS_TAG_OBJECT) {
+            int64_t n = 0, k;
+            JSValue lenv = JS_GetPropertyStr(ctx, tdz, "length");
+            JS_ToInt64(ctx, &n, lenv);
+            JS_FreeValue(ctx, lenv);
+            for (k = 0; k < n; k++) {
+                JSValue nv = JS_GetPropertyUint32(ctx, tdz, (uint32_t)k);
+                if (JS_IsString(nv)) {
+                    if (emitted++)
+                        dbuf_putc(b, ',');
+                    dbuf_putc(b, '[');
+                    tt_json_str_val(ctx, b, nv);
+                    dbuf_putstr(b, ",{\"t\":\"tdz\"}]");
+                }
+                JS_FreeValue(ctx, nv);
+            }
+        } else if (JS_IsException(tdz)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        }
+        JS_FreeValue(ctx, tdz);
+    }
+    JS_FreeValue(ctx, lex);
+    dbuf_putc(b, ']');
+}
+
+/* full paused-position inspection JSON to kind=1 */
+static void tt_emit_inspection(JSContext *ctx, int with_frames)
+{
+    DynBuf b;
+    JSValue stack;
+    int64_t nframes = 0;
+    int level;
+
+    js_dbuf_init(ctx, &b);
+    dbuf_putstr(&b, "{\"stack\":");
+    stack = with_frames ? JS_TTBacktrace(ctx) : JS_NewArray(ctx);
+    tt_ser_stack(ctx, &b, stack);
+    dbuf_putstr(&b, ",\"frames\":[");
+    if (with_frames) {
         JSValue lenv = JS_GetPropertyStr(ctx, stack, "length");
         JS_ToInt64(ctx, &nframes, lenv);
         JS_FreeValue(ctx, lenv);
+        if (nframes > 32)
+            nframes = 32;
+        for (level = 0; level < (int)nframes; level++) {
+            JSValue frame = JS_TTLocals(ctx, level);
+            if (level)
+                dbuf_putc(&b, ',');
+            if (JS_IsException(frame)) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                dbuf_putstr(&b, "[]");
+            } else {
+                tt_ser_locals_frame(ctx, &b, frame);
+            }
+            JS_FreeValue(ctx, frame);
+        }
     }
-    if (nframes > 32) nframes = 32;
-    for (level = 0; level < (int)nframes; level++) {
-        JS_DefinePropertyValueUint32(ctx, frames, level, JS_TTLocals(ctx, level), JS_PROP_C_W_E);
+    dbuf_putstr(&b, "],\"globals\":");
+    tt_ser_globals_merged(ctx, &b);
+    if (tt_dom_has_doc_c()) {
+        size_t hlen = 0;
+        char *html = tt_dom_serialize_ptr(tt_dom_doc_ptr(), 0, &hlen);
+        dbuf_putstr(&b, ",\"dom\":");
+        tt_json_esc(&b, html ? html : "", hlen);
+        free(html);
     }
-    JS_DefinePropertyValueStr(ctx, obj, "frames", frames, JS_PROP_C_W_E);
-    globals = JS_Call(ctx, g_globals_fn, JS_UNDEFINED, 0, NULL);
-    if (JS_IsException(globals)) {
-        JS_FreeValue(ctx, JS_GetException(ctx));
-        globals = JS_NewObject(ctx);
+    dbuf_putc(&b, '}');
+    JS_FreeValue(ctx, stack);
+    tt_emit_buf(1, &b);
+}
+
+/* ==== timers ============================================================ */
+typedef struct {
+    int id;
+    double at;
+    JSValue fn;
+    JSValue args; /* JS array of extra arguments */
+} TTTimer;
+
+static TTTimer *g_timer_list;
+static int g_timer_len, g_timer_cap, g_timer_seq = 1;
+
+static void tt_timers_clear(JSContext *ctx)
+{
+    int i;
+    for (i = 0; i < g_timer_len; i++) {
+        JS_FreeValue(ctx, g_timer_list[i].fn);
+        JS_FreeValue(ctx, g_timer_list[i].args);
     }
-    JS_DefinePropertyValueStr(ctx, obj, "globals", globals, JS_PROP_C_W_E);
-    JS_DefinePropertyValueStr(ctx, obj, "lexicals", JS_TTGlobalLexicals(ctx), JS_PROP_C_W_E);
-    JS_DefinePropertyValueStr(ctx, obj, "__ttInspect", JS_TRUE, 0);
-    send_json_value(ctx, 1, obj);
-    JS_FreeValue(ctx, obj);
+    free(g_timer_list);
+    g_timer_list = NULL;
+    g_timer_len = g_timer_cap = 0;
+    g_timer_seq = 1;
+}
+
+static JSValue js_tt_set_timeout(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv)
+{
+    double ms = 0;
+    TTTimer *t;
+    JSValue args;
+    int i;
+    (void)this_val;
+    if (argc < 1 || !JS_IsFunction(ctx, argv[0]))
+        return JS_NewInt32(ctx, 0);
+    if (argc >= 2) {
+        if (JS_ToFloat64(ctx, &ms, argv[1]))
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        if (!(ms > 0))
+            ms = 0;
+        ms = floor(ms);
+    }
+    if (g_timer_len >= g_timer_cap) {
+        int ncap = g_timer_cap ? g_timer_cap * 2 : 8;
+        TTTimer *nl = realloc(g_timer_list, sizeof(*nl) * ncap);
+        if (!nl)
+            return JS_NewInt32(ctx, 0);
+        g_timer_list = nl;
+        g_timer_cap = ncap;
+    }
+    args = JS_NewArray(ctx);
+    for (i = 2; i < argc; i++)
+        JS_DefinePropertyValueUint32(ctx, args, i - 2,
+                                     JS_DupValue(ctx, argv[i]), JS_PROP_C_W_E);
+    t = &g_timer_list[g_timer_len++];
+    t->id = g_timer_seq++;
+    t->at = JS_TTGetVirtualTime() + ms;
+    t->fn = JS_DupValue(ctx, argv[0]);
+    t->args = args;
+    return JS_NewInt32(ctx, t->id);
+}
+
+static JSValue js_tt_clear_timeout(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    int i;
+    double idd;
+    (void)this_val;
+    if (argc < 1)
+        return JS_UNDEFINED;
+    if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT)
+        idd = JS_VALUE_GET_INT(argv[0]);
+    else if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(argv[0])))
+        idd = JS_VALUE_GET_FLOAT64(argv[0]);
+    else
+        return JS_UNDEFINED; /* identity semantics: no coercion */
+    for (i = 0; i < g_timer_len; i++) {
+        if ((double)g_timer_list[i].id == idd) {
+            JS_FreeValue(ctx, g_timer_list[i].fn);
+            JS_FreeValue(ctx, g_timer_list[i].args);
+            memmove(&g_timer_list[i], &g_timer_list[i + 1],
+                    sizeof(TTTimer) * (g_timer_len - i - 1));
+            g_timer_len--;
+            return JS_UNDEFINED;
+        }
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue js_tt_set_interval(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv)
+{
+    JSValue err = JS_NewError(ctx);
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    JS_DefinePropertyValueStr(ctx, err, "message",
+                              JS_NewString(ctx, "setInterval is not supported (use setTimeout)"),
+                              JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    return JS_Throw(ctx, err);
+}
+
+static JSValue js_tt_perf_now(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    return JS_NewFloat64(ctx, JS_TTGetVirtualTime());
+}
+
+static JSValue tt_microtask_job(JSContext *ctx, int argc, JSValueConst *argv)
+{
+    JSValue r = JS_Call(ctx, argv[0], JS_UNDEFINED, 0, NULL);
+    if (JS_IsException(r))
+        return r;
+    JS_FreeValue(ctx, r);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_tt_queue_microtask(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    if (argc >= 1 && JS_IsFunction(ctx, argv[0]))
+        JS_EnqueueJob(ctx, tt_microtask_job, 1, argv);
+    return JS_UNDEFINED;
+}
+
+/* register console/timers/performance/queueMicrotask on a fresh context */
+static void tt_register_substrate(JSContext *ctx)
+{
+    JSValue glob = JS_GetGlobalObject(ctx);
+    JSValue cons = JS_NewObject(ctx);
+    static const struct { const char *n; int magic; } CN[] = {
+        { "log", 0 }, { "info", 1 }, { "warn", 2 }, { "error", 3 },
+        { "debug", 0 }, { "trace", 0 }, { "assert", 4 },
+    };
+    size_t i;
+    for (i = 0; i < sizeof(CN) / sizeof(CN[0]); i++)
+        JS_SetPropertyStr(ctx, cons, CN[i].n,
+                          JS_NewCFunctionMagic(ctx, js_tt_console_native,
+                                               CN[i].n, 1,
+                                               JS_CFUNC_generic_magic,
+                                               CN[i].magic));
+    JS_SetPropertyStr(ctx, glob, "console", cons);
+    JS_SetPropertyStr(ctx, glob, "setTimeout",
+                      JS_NewCFunction(ctx, js_tt_set_timeout, "setTimeout", 2));
+    JS_SetPropertyStr(ctx, glob, "clearTimeout",
+                      JS_NewCFunction(ctx, js_tt_clear_timeout, "clearTimeout", 1));
+    JS_SetPropertyStr(ctx, glob, "setInterval",
+                      JS_NewCFunction(ctx, js_tt_set_interval, "setInterval", 2));
+    JS_SetPropertyStr(ctx, glob, "clearInterval",
+                      JS_NewCFunction(ctx, js_tt_clear_timeout, "clearInterval", 1));
+    JS_SetPropertyStr(ctx, glob, "queueMicrotask",
+                      JS_NewCFunction(ctx, js_tt_queue_microtask, "queueMicrotask", 1));
+    {
+        JSValue perf = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, perf, "now",
+                          JS_NewCFunction(ctx, js_tt_perf_now, "now", 0));
+        JS_SetPropertyStr(ctx, glob, "performance", perf);
+    }
+    JS_FreeValue(ctx, glob);
+}
+
+/* Send { stack, frames, globals, dom? } for the paused position. */
+static void send_inspection(JSContext *ctx)
+{
+    tt_emit_inspection(ctx, 1);
 }
 
 /* Evaluate a console expression at the paused position. The innermost
@@ -65586,9 +66641,7 @@ static const char EVAL_WRAPPER_SRC[] =
 static void eval_at_pause_mode(JSContext *ctx, int write_back)
 {
     int len = tt_host_arg(g_arg_buf, (int)sizeof(g_arg_buf) - 1);
-    JSValue v, env, args[2];
-    const char *cstr;
-    size_t slen;
+    JSValue v;
 
     if (len <= 0 || len >= (int)sizeof(g_arg_buf)) {
         tt_host_out(2, "null", 4);
@@ -65631,28 +66684,13 @@ static void eval_at_pause_mode(JSContext *ctx, int write_back)
         }
     }
     if (JS_IsException(v)) {
-        args[0] = JS_TRUE;
-        args[1] = JS_GetException(ctx);
+        JSValue exc = JS_GetException(ctx);
+        tt_emit_envelope(ctx, 2, 1, exc);
+        JS_FreeValue(ctx, exc);
     } else {
-        args[0] = JS_FALSE;
-        args[1] = v;
+        tt_emit_envelope(ctx, 2, 0, v);
+        JS_FreeValue(ctx, v);
     }
-    env = JS_Call(ctx, g_envelope_fn, JS_UNDEFINED, 2, (JSValueConst *)args);
-    JS_FreeValue(ctx, args[1]);
-    if (JS_IsException(env)) {
-        JS_FreeValue(ctx, JS_GetException(ctx));
-        tt_host_out(2, "null", 4);
-        return;
-    }
-    cstr = JS_ToCStringLen(ctx, &slen, env);
-    if (cstr) {
-        tt_host_out(2, cstr, (int)slen);
-        JS_FreeCString(ctx, cstr);
-    } else {
-        JS_FreeValue(ctx, JS_GetException(ctx));
-        tt_host_out(2, "null", 4);
-    }
-    JS_FreeValue(ctx, env);
 }
 
 static void eval_at_pause(JSContext *ctx)
@@ -65711,36 +66749,11 @@ static int tt_interrupt_handler(JSRuntime *rt, void *opaque)
 static void tt_rejection_tracker(JSContext *ctx, JSValueConst promise,
                                  JSValueConst reason, JS_BOOL is_handled, void *opaque)
 {
-    JSValue args[1];
-    JSValue r;
     (void)promise;
     (void)opaque;
     if (is_handled)
         return;
-    args[0] = (JSValue)reason;
-    r = JS_Call(ctx, g_rejected_fn, JS_UNDEFINED, 1, (JSValueConst *)args);
-    if (JS_IsException(r))
-        JS_FreeValue(ctx, JS_GetException(ctx));
-    JS_FreeValue(ctx, r);
-}
-
-/* console bridge: level + pre-serialized JSON parts from the setup script */
-static JSValue js_tt_console(JSContext *ctx, JSValueConst this_val,
-                             int argc, JSValueConst *argv)
-{
-    int32_t level = 0;
-    const char *json;
-    size_t len;
-    (void)this_val;
-    if (argc < 2)
-        return JS_UNDEFINED;
-    JS_ToInt32(ctx, &level, argv[0]);
-    json = JS_ToCStringLen(ctx, &len, argv[1]);
-    if (json) {
-        tt_host_out(0, json, (int)len);
-        JS_FreeCString(ctx, json);
-    }
-    return JS_UNDEFINED;
+    tt_emit_rejection(ctx, reason);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -65764,15 +66777,12 @@ static int eval_setup_slot(int slot)
         JS_FreeValue(g_ctx, JS_GetException(g_ctx));
         return 1;
     }
-    g_ser_fn = JS_GetPropertyStr(g_ctx, setup, "serTop");
-    g_envelope_fn = JS_GetPropertyStr(g_ctx, setup, "envelope");
-    g_globals_fn = JS_GetPropertyStr(g_ctx, setup, "userGlobals");
-    g_timer_count_fn = JS_GetPropertyStr(g_ctx, setup, "timerCount");
-    g_timer_pop_fn = JS_GetPropertyStr(g_ctx, setup, "timerPop");
-    g_rejected_fn = JS_GetPropertyStr(g_ctx, setup, "rejected");
     g_dom_build_fn = JS_GetPropertyStr(g_ctx, setup, "buildDOM");
     g_set_url_fn = JS_GetPropertyStr(g_ctx, setup, "setURL");
     JS_FreeValue(g_ctx, setup);
+    /* everything user-visible is registered now — snapshot the baseline
+       for user-global diffing */
+    tt_baseline_capture(g_ctx);
     return 0;
 }
 
@@ -65798,8 +66808,6 @@ EXPORT("tt_load_setup") int tt_load_setup(int slot, const char *src, int len)
 /* ------------------------------------------------------------------------ */
 EXPORT("tt_init") int tt_init(void)
 {
-    JSValue glob, natfn;
-
     JS_TTSetVirtualTime(0, 1); /* must precede context creation (random seed) */
     g_rt = JS_NewRuntime();
     if (!g_rt)
@@ -65810,16 +66818,11 @@ EXPORT("tt_init") int tt_init(void)
     if (!g_ctx)
         return 2;
 
-    g_ser_fn = g_envelope_fn = g_globals_fn = JS_UNDEFINED;
-    g_timer_count_fn = g_timer_pop_fn = g_rejected_fn = JS_UNDEFINED;
     g_dom_build_fn = g_set_url_fn = JS_UNDEFINED;
-    glob = JS_GetGlobalObject(g_ctx);
-    natfn = JS_NewCFunction(g_ctx, js_tt_console, "__tt_nat_console", 2);
-    JS_SetPropertyStr(g_ctx, glob, "__tt_nat_console", natfn);
-    JS_FreeValue(g_ctx, glob);
     tt_dom_register(g_ctx);
+    tt_register_substrate(g_ctx);
 
-    /* the host now delivers src/vm/tt-setup.js and src/vm/tt-delegates.js
+    /* the host delivers the remaining JS substrate (src/vm/tt-setup.js)
        through tt_load_setup before the first evaluation */
     JS_TTSetStepHandler(g_rt, tt_host_step_handler, NULL);
     JS_TTSetStepFilename(g_ctx, "program.js");
@@ -65831,28 +66834,14 @@ EXPORT("tt_init") int tt_init(void)
 /* Emit the kind=3 completion envelope for the program value/exception. */
 static void emit_eval_done(JSValue v)
 {
-    JSValue env, args[2];
-    const char *cstr;
-    size_t slen;
-
     if (JS_IsException(v)) {
-        args[0] = JS_TRUE;
-        args[1] = JS_GetException(g_ctx);
+        JSValue exc = JS_GetException(g_ctx);
+        tt_emit_envelope(g_ctx, 3, 1, exc);
+        JS_FreeValue(g_ctx, exc);
     } else {
-        args[0] = JS_FALSE;
-        args[1] = v;
+        tt_emit_envelope(g_ctx, 3, 0, v);
+        JS_FreeValue(g_ctx, v);
     }
-    env = JS_Call(g_ctx, g_envelope_fn, JS_UNDEFINED, 2, (JSValueConst *)args);
-    JS_FreeValue(g_ctx, args[1]);
-    cstr = JS_ToCStringLen(g_ctx, &slen, env);
-    if (cstr) {
-        tt_host_out(3, cstr, (int)slen);
-        JS_FreeCString(g_ctx, cstr);
-    } else {
-        JS_FreeValue(g_ctx, JS_GetException(g_ctx));
-        tt_host_out(3, "null", 4);
-    }
-    JS_FreeValue(g_ctx, env);
 }
 
 /* Run the user program. Compiles once, then executes under the park-by-
@@ -65977,12 +66966,7 @@ EXPORT("tt_run_jobs") int tt_run_jobs(void)
 
 EXPORT("tt_timer_count") int tt_timer_count(void)
 {
-    JSValue v;
-    int32_t n = 0;
-    v = JS_Call(g_ctx, g_timer_count_fn, JS_UNDEFINED, 0, NULL);
-    JS_ToInt32(g_ctx, &n, v);
-    JS_FreeValue(g_ctx, v);
-    return n;
+    return g_timer_len;
 }
 
 /* parked-timer continuation (statics live in the snapshot) */
@@ -65998,11 +66982,7 @@ static int timer_finish(JSValue r)
 
     if (JS_IsException(r)) {
         JSValue exc = JS_GetException(g_ctx);
-        JSValue args2[1];
-        JSValue rr;
-        args2[0] = exc;
-        rr = JS_Call(g_ctx, g_rejected_fn, JS_UNDEFINED, 1, (JSValueConst *)args2);
-        JS_FreeValue(g_ctx, rr);
+        tt_emit_rejection(g_ctx, exc);
         JS_FreeValue(g_ctx, exc);
     }
     JS_FreeValue(g_ctx, r);
@@ -66021,23 +67001,27 @@ static int timer_finish(JSValue r)
    return). Emits kind=5 when done. Returns 1 while parked. */
 EXPORT("tt_fire_timer") int tt_fire_timer(void)
 {
-    JSValue tuple, fnargs, atv, r;
+    JSValue fnargs, r;
     int64_t i, alen = 0;
-    int parked = 0;
+    int parked = 0, best, bi;
 
-    tuple = JS_Call(g_ctx, g_timer_pop_fn, JS_UNDEFINED, 0, NULL);
-    if (!JS_IsObject(tuple)) {
-        JS_FreeValue(g_ctx, tuple);
+    if (g_timer_len == 0) {
         tt_host_out(5, "{\"idle\":true}", 13);
         return 0;
     }
-    g_timer_at = 0;
-    g_timer_fn = JS_GetPropertyUint32(g_ctx, tuple, 0);
-    fnargs = JS_GetPropertyUint32(g_ctx, tuple, 1);
-    atv = JS_GetPropertyUint32(g_ctx, tuple, 2);
-    JS_ToFloat64(g_ctx, &g_timer_at, atv);
-    JS_FreeValue(g_ctx, atv);
-    JS_FreeValue(g_ctx, tuple);
+    best = 0;
+    for (bi = 1; bi < g_timer_len; bi++) {
+        if (g_timer_list[bi].at < g_timer_list[best].at ||
+            (g_timer_list[bi].at == g_timer_list[best].at &&
+             g_timer_list[bi].id < g_timer_list[best].id))
+            best = bi;
+    }
+    g_timer_at = g_timer_list[best].at;
+    g_timer_fn = g_timer_list[best].fn;
+    fnargs = g_timer_list[best].args;
+    memmove(&g_timer_list[best], &g_timer_list[best + 1],
+            sizeof(TTTimer) * (g_timer_len - best - 1));
+    g_timer_len--;
 
     if (g_timer_at > JS_TTGetVirtualTime())
         JS_TTSetVirtualTime(g_timer_at, 1);
@@ -66077,20 +67061,7 @@ EXPORT("tt_vtime") double tt_vtime_get(void)
 /* Inspection for the idle (finished) position: globals only, no frames. */
 EXPORT("tt_inspect_idle") void tt_inspect_idle(void)
 {
-    JSValue obj = JS_NewObject(g_ctx);
-    JSValue globals;
-    JS_DefinePropertyValueStr(g_ctx, obj, "stack", JS_NewArray(g_ctx), JS_PROP_C_W_E);
-    JS_DefinePropertyValueStr(g_ctx, obj, "frames", JS_NewArray(g_ctx), JS_PROP_C_W_E);
-    globals = JS_Call(g_ctx, g_globals_fn, JS_UNDEFINED, 0, NULL);
-    if (JS_IsException(globals)) {
-        JS_FreeValue(g_ctx, JS_GetException(g_ctx));
-        globals = JS_NewObject(g_ctx);
-    }
-    JS_DefinePropertyValueStr(g_ctx, obj, "globals", globals, JS_PROP_C_W_E);
-    JS_DefinePropertyValueStr(g_ctx, obj, "lexicals", JS_TTGlobalLexicals(g_ctx), JS_PROP_C_W_E);
-    JS_DefinePropertyValueStr(g_ctx, obj, "__ttInspect", JS_TRUE, 0);
-    send_json_value(g_ctx, 1, obj);
-    JS_FreeValue(g_ctx, obj);
+    tt_emit_inspection(g_ctx, 0);
 }
 
 /* Console evaluation against the idle (finished) state. */
@@ -66102,16 +67073,10 @@ EXPORT("tt_eval_idle") void tt_eval_idle(void)
 /* Fresh context for a new debugging session (the runtime survives). */
 EXPORT("tt_reset") int tt_reset(void)
 {
-    JSValue glob, natfn;
-
-    JS_FreeValue(g_ctx, g_ser_fn);
-    JS_FreeValue(g_ctx, g_envelope_fn);
-    JS_FreeValue(g_ctx, g_globals_fn);
-    JS_FreeValue(g_ctx, g_timer_count_fn);
-    JS_FreeValue(g_ctx, g_timer_pop_fn);
-    JS_FreeValue(g_ctx, g_rejected_fn);
     JS_FreeValue(g_ctx, g_dom_build_fn);
     JS_FreeValue(g_ctx, g_set_url_fn);
+    tt_timers_clear(g_ctx);
+    tt_baseline_clear();
     JS_TTCmpClear(g_rt);
     tt_dom_destroy();
     JS_FreeContext(g_ctx);
@@ -66123,14 +67088,9 @@ EXPORT("tt_reset") int tt_reset(void)
     g_exec_kind = TT_EXEC_SCRIPT;
     g_timer_fn = JS_UNDEFINED; /* abandoned parked-timer state, if any */
     g_timer_alen = 0;
-    g_ser_fn = g_envelope_fn = g_globals_fn = JS_UNDEFINED;
-    g_timer_count_fn = g_timer_pop_fn = g_rejected_fn = JS_UNDEFINED;
     g_dom_build_fn = g_set_url_fn = JS_UNDEFINED;
-    glob = JS_GetGlobalObject(g_ctx);
-    natfn = JS_NewCFunction(g_ctx, js_tt_console, "__tt_nat_console", 2);
-    JS_SetPropertyStr(g_ctx, glob, "__tt_nat_console", natfn);
-    JS_FreeValue(g_ctx, glob);
     tt_dom_register(g_ctx);
+    tt_register_substrate(g_ctx);
     if (eval_setup_slot(0))
         return 3;
     JS_TTSetStepFilename(g_ctx, "program.js");

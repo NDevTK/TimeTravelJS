@@ -1,137 +1,6 @@
 (function () {
   'use strict';
-  const MAXD = 4, MAXI = 40, MAXK = 40, MAXS = 200;
-  function className(v) {
-    try {
-      const p = Object.getPrototypeOf(v);
-      if (p === null) return 'Object';
-      const n = p.constructor && p.constructor.name;
-      return n && n !== 'Object' ? n : '';
-    } catch (e) { return ''; }
-  }
-  function ser(v, depth, seen) {
-    const t = typeof v;
-    if (v === null) return { t: 'null' };
-    if (DomNode && v instanceof DomNode) {
-      let h = ''; try { h = DOM.serialize(v.__p, 0); } catch (e) {}
-      return { t: 'dom', name: String(DOM.nodeName(v.__p)), html: h.length > 160 ? h.slice(0, 160) + '…' : h };
-    }
-    if (t === 'undefined') return { t: 'undef' };
-    if (t === 'number') {
-      if (v !== v) return { t: 'nan' };
-      if (v === Infinity) return { t: 'num', v: 'Infinity', special: true };
-      if (v === -Infinity) return { t: 'num', v: '-Infinity', special: true };
-      return { t: 'num', v: v };
-    }
-    if (t === 'boolean') return { t: 'bool', v: v };
-    if (t === 'bigint') return { t: 'bigint', v: String(v) };
-    if (t === 'string') return v.length > MAXS ? { t: 'str', v: v.slice(0, MAXS), trunc: v.length } : { t: 'str', v: v };
-    if (t === 'symbol') return { t: 'sym', v: String(v) };
-    if (t === 'function') return { t: 'fn', name: v.name || '' };
-    if (seen.indexOf(v) >= 0) return { t: 'ref' };
-    if (depth <= 0) return { t: 'more', cls: className(v) };
-    seen.push(v);
-    try {
-      if (Array.isArray(v)) {
-        const items = [];
-        const lim = Math.min(v.length, MAXI);
-        for (let i = 0; i < lim; i++) items.push(i in v ? ser(v[i], depth - 1, seen) : { t: 'hole' });
-        return { t: 'arr', n: v.length, items: items, more: v.length > lim };
-      }
-      if (v instanceof Date) return { t: 'date', v: 'virtual+' + v.getTime() + 'ms' };
-      if (v instanceof RegExp) return { t: 'regexp', v: String(v) };
-      if (v instanceof Error) return { t: 'error', name: v.name, msg: String(v.message) };
-      if (v instanceof Map) {
-        const entries = [];
-        let i = 0;
-        for (const [k, val] of v) { if (i++ >= 20) break; entries.push([ser(k, depth - 1, seen), ser(val, depth - 1, seen)]); }
-        return { t: 'map', n: v.size, entries: entries, more: v.size > 20 };
-      }
-      if (v instanceof Set) {
-        const items = [];
-        let i = 0;
-        for (const val of v) { if (i++ >= 20) break; items.push(ser(val, depth - 1, seen)); }
-        return { t: 'set', n: v.size, items: items, more: v.size > 20 };
-      }
-      if (ArrayBuffer.isView(v)) {
-        const n = v.length === undefined ? 0 : v.length;
-        const lim = Math.min(n, 20);
-        const items = [];
-        for (let i = 0; i < lim; i++) items.push(v[i]);
-        return { t: 'typed', cls: className(v), n: n, items: items, more: n > lim };
-      }
-      const props = [];
-      const keys = Object.keys(v);
-      const lim = Math.min(keys.length, MAXK);
-      for (let k = 0; k < lim; k++) {
-        const key = keys[k];
-        const desc = Object.getOwnPropertyDescriptor(v, key);
-        if (desc && desc.get) props.push([key, { t: 'getter' }]);
-        else if (desc) props.push([key, ser(desc.value, depth - 1, seen)]);
-      }
-      return { t: 'obj', cls: className(v), props: props, more: keys.length > lim };
-    } finally { seen.pop(); }
-  }
-  function serTop(value) {
-    if (value && value.__ttInspect) {
-      const out = { stack: value.stack, frames: [], globals: [] };
-      if (DOM && DOM.hasDoc()) out.dom = DOM.serialize(DOM.doc(), 0);
-      for (const frame of value.frames) {
-        const locals = [];
-        const tdz = frame['<uninitialized>'] || [];
-        for (const key of Object.keys(frame)) {
-          if (key === '<uninitialized>') continue;
-          locals.push([key, ser(frame[key], MAXD, [])]);
-        }
-        for (const name of tdz) locals.push([name, { t: 'tdz' }]);
-        out.frames.push(locals);
-      }
-      for (const key of Object.keys(value.globals)) out.globals.push([key, ser(value.globals[key], 3, [])]);
-      if (value.lexicals) {
-        const seenNames = new Set(out.globals.map((g) => g[0]));
-        const ltdz = value.lexicals['<uninitialized>'] || [];
-        for (const key of Object.keys(value.lexicals)) {
-          if (key === '<uninitialized>' || seenNames.has(key)) continue;
-          out.globals.push([key, ser(value.lexicals[key], 3, [])]);
-        }
-        for (const name of ltdz) if (!seenNames.has(name)) out.globals.push([name, { t: 'tdz' }]);
-      }
-      return JSON.stringify(out);
-    }
-    return JSON.stringify(ser(value, MAXD, []));
-  }
   const G = globalThis;
-  const natConsole = G.__tt_nat_console;
-  delete G.__tt_nat_console;
-  function consoleOut(level, args) {
-    const parts = [];
-    for (let i = 0; i < args.length; i++) parts.push(ser(args[i], 3, []));
-    natConsole(level, JSON.stringify({ level: level, parts: parts }));
-  }
-  G.console = {
-    log: function () { consoleOut(0, arguments); },
-    info: function () { consoleOut(1, arguments); },
-    warn: function () { consoleOut(2, arguments); },
-    error: function () { consoleOut(3, arguments); },
-    debug: function () { consoleOut(0, arguments); },
-    trace: function () { consoleOut(0, arguments); },
-    assert: function (cond) { if (!cond) consoleOut(3, ['Assertion failed'].concat(Array.prototype.slice.call(arguments, 1))); },
-  };
-  let timerSeq = 1;
-  const timers = [];
-  G.setTimeout = function (fn, ms) {
-    if (typeof fn !== 'function') return 0;
-    const id = timerSeq++;
-    timers.push({ id: id, fn: fn, at: Date.now() + (ms > 0 ? Math.floor(ms) : 0), args: Array.prototype.slice.call(arguments, 2) });
-    return id;
-  };
-  G.clearTimeout = function (id) {
-    for (let i = 0; i < timers.length; i++) if (timers[i].id === id) { timers.splice(i, 1); return; }
-  };
-  G.setInterval = function () { throw new Error('setInterval is not supported (use setTimeout)'); };
-  G.clearInterval = G.clearTimeout;
-  G.queueMicrotask = function (fn) { Promise.resolve().then(fn); };
-  G.performance = { now: function () { return Date.now(); } };
   /* Debug-runtime self-hosted callback builtins: user callbacks run from
      bytecode, so the stackless interpreter can suspend inside them. Plain
      arrays with function callbacks take the JS path; anything exotic
@@ -481,29 +350,6 @@
     dp(TTPromise, 'race', function (it) { return OrigPromise.race.call(this, toArr(it)); }, 1);
     dp(TTPromise, 'any', function (it) { return OrigPromise.any.call(this, toArr(it)); }, 1);
   })();
-  const baseline = new Set(Object.getOwnPropertyNames(G));
-  function timerCount() { return timers.length; }
-  function timerPop() {
-    if (!timers.length) return null;
-    let best = 0;
-    for (let i = 1; i < timers.length; i++) {
-      if (timers[i].at < timers[best].at || (timers[i].at === timers[best].at && timers[i].id < timers[best].id)) best = i;
-    }
-    const t = timers.splice(best, 1)[0];
-    return [t.fn, t.args, t.at];
-  }
-  function userGlobals() {
-    const out = {};
-    for (const name of Object.getOwnPropertyNames(G)) {
-      if (baseline.has(name)) continue;
-      try { out[name] = G[name]; } catch (e) {}
-    }
-    return out;
-  }
-  function envelope(isError, value) {
-    return JSON.stringify(isError ? { error: ser(value, MAXD, []) } : { ok: ser(value, MAXD, []) });
-  }
-  function rejected(reason) { consoleOut(3, ['Unhandled promise rejection:', reason]); }
   /* ---- web-platform substrate: URL, location, storage -----------------
      Self-hosted IN the machine so it snapshots, scrubs and forks with
      everything else. Read registries record which URL parameters and
@@ -616,8 +462,6 @@
   G.location = new Location();
   G.localStorage = makeStorage();
   G.sessionStorage = makeStorage();
-  for (const n of ['URL', 'URLSearchParams', 'location', 'localStorage', 'sessionStorage'])
-    baseline.add(n);
   function setURL(href) { loc.u = new URL(String(href)); }
   /* ---- postMessage: an external input channel -------------------------
      Messages queue in-machine and every handler sees every message
@@ -671,8 +515,6 @@
     });
   };
   G.window = G;
-  for (const n of ['postMessage', 'addEventListener', 'removeEventListener', 'onmessage', '__messageStats', '__msgProbe', 'window'])
-    baseline.add(n);
   /* ---- DOM self-host over the __dom leaf primitives (Lexbor) ----------
      Everything here is bytecode: user event handlers, callbacks touching
      the DOM, style reads — all park like any other code. The C layer only
@@ -783,7 +625,7 @@
             if (l.once) { const k = arr.indexOf(l); if (k >= 0) arr.splice(k, 1); }
             ev.__phase = phase; ev.__current = node;
             try { l.fn.call(node, ev); }
-            catch (e) { consoleOut(3, [e]); }
+            catch (e) { console.error(e); }
           }
         };
         for (let i = path.length - 1; i >= 0; i--) { if (ev.__stop) break; fire(path[i], 1); }
@@ -985,5 +827,5 @@
       return out;
     };
   }
-  return { serTop: serTop, envelope: envelope, userGlobals: userGlobals, timerCount: timerCount, timerPop: timerPop, rejected: rejected, buildDOM: buildDOM, setURL: setURL };
+  return { buildDOM: buildDOM, setURL: setURL };
 })()

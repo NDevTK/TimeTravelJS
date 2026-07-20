@@ -91,9 +91,107 @@ static lxb_dom_node_t *tt_dom_node_arg(JSContext *ctx, JSValueConst v)
     return (lxb_dom_node_t *)(uintptr_t)u;
 }
 
+/* every node pointer ever handed to JS, so the engine-side serializer can
+   tell a real wrapper from a forged { __p } object before dereferencing.
+   Open-addressed set; cleared with the document. */
+static uint32_t *g_dom_issued;
+static size_t g_dom_issued_cap;
+static size_t g_dom_issued_len;
+
+static void tt_dom_issue(uint32_t h)
+{
+    size_t i, mask;
+    if (!h)
+        return;
+    if (g_dom_issued_len * 2 >= g_dom_issued_cap) {
+        size_t ncap = g_dom_issued_cap ? g_dom_issued_cap * 2 : 256;
+        uint32_t *nt = calloc(ncap, sizeof(*nt));
+        if (!nt)
+            return;
+        for (i = 0; i < g_dom_issued_cap; i++) {
+            uint32_t v = g_dom_issued[i];
+            if (v) {
+                size_t j = (v * 2654435761u) & (ncap - 1);
+                while (nt[j])
+                    j = (j + 1) & (ncap - 1);
+                nt[j] = v;
+            }
+        }
+        free(g_dom_issued);
+        g_dom_issued = nt;
+        g_dom_issued_cap = ncap;
+    }
+    mask = g_dom_issued_cap - 1;
+    i = (h * 2654435761u) & mask;
+    while (g_dom_issued[i]) {
+        if (g_dom_issued[i] == h)
+            return;
+        i = (i + 1) & mask;
+    }
+    g_dom_issued[i] = h;
+    g_dom_issued_len++;
+}
+
+int tt_dom_ptr_known(uint32_t h)
+{
+    size_t i, mask;
+    if (!h || !g_dom_issued_cap)
+        return 0;
+    mask = g_dom_issued_cap - 1;
+    i = (h * 2654435761u) & mask;
+    while (g_dom_issued[i]) {
+        if (g_dom_issued[i] == h)
+            return 1;
+        i = (i + 1) & mask;
+    }
+    return 0;
+}
+
 static JSValue tt_dom_node_ret(JSContext *ctx, void *node)
 {
+    tt_dom_issue((uint32_t)(uintptr_t)node);
     return JS_NewUint32(ctx, (uint32_t)(uintptr_t)node);
+}
+
+/* ---- C-side views for the engine's native serializer ------------------ */
+int tt_dom_has_doc_c(void)
+{
+    return g_dom_doc != NULL;
+}
+
+uint32_t tt_dom_doc_ptr(void)
+{
+    tt_dom_issue((uint32_t)(uintptr_t)g_dom_doc);
+    return (uint32_t)(uintptr_t)g_dom_doc;
+}
+
+/* malloc'd serialization of a node (deep = children only, else the whole
+   subtree including the node) — mirrors js_dom_serialize */
+char *tt_dom_serialize_ptr(uint32_t h, int deep, size_t *plen)
+{
+    lxb_dom_node_t *node = (lxb_dom_node_t *)(uintptr_t)h;
+    tt_buf_t buf = { 0 };
+    *plen = 0;
+    if (!node || !tt_dom_ptr_known(h))
+        return NULL;
+    if (deep)
+        lxb_html_serialize_deep_cb(node, tt_buf_cb, &buf);
+    else
+        lxb_html_serialize_tree_cb(node, tt_buf_cb, &buf);
+    if (!buf.p)
+        return NULL;
+    buf.p[buf.len] = 0;
+    *plen = buf.len;
+    return buf.p;
+}
+
+const char *tt_dom_node_name_ptr(uint32_t h, size_t *plen)
+{
+    lxb_dom_node_t *node = (lxb_dom_node_t *)(uintptr_t)h;
+    *plen = 0;
+    if (!node || !tt_dom_ptr_known(h))
+        return NULL;
+    return (const char *)lxb_dom_node_name(node, plen);
 }
 
 static const char *tt_dom_str_arg(JSContext *ctx, JSValueConst v, size_t *len)
@@ -113,6 +211,9 @@ void tt_dom_destroy(void)
         lxb_html_document_destroy(g_dom_doc);
         g_dom_doc = NULL;
     }
+    free(g_dom_issued);
+    g_dom_issued = NULL;
+    g_dom_issued_cap = g_dom_issued_len = 0;
 }
 
 int tt_dom_load_html(const char *html, size_t len)
