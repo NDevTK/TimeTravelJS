@@ -18302,6 +18302,21 @@ static void tt_pump_abort(JSContext *ctx, TTPump *pu)
     pu->state = NULL;
 }
 
+/* Free a staged-but-unconsumed pump request (protocol violation, OOM at
+   the call site, or a host-API caller that cannot pump). */
+static void tt_pump_drop_staged(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    TTPump tmp;
+    if (!rt->tt_pump_state)
+        return;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.kind = rt->tt_pump_kind;
+    tmp.state = rt->tt_pump_state;
+    rt->tt_pump_state = NULL;
+    tt_pump_abort(ctx, &tmp);
+}
+
 /* Continue a pumped builtin. cb_result is owned (ignored when first).
    Returns 0 = next callback staged in pu->args / *pfunc / *pthis,
    1 = builtin finished with *pres, -1 = exception (state freed). */
@@ -19006,15 +19021,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
    (ret_val replaced, control falls through to the classic completion), or
    raises. Uses the surrounding locals of JS_CallInternal. */
 #define TT_PUMP_TRY_START(basev, tailv)                                     \
-    if (unlikely(JS_VALUE_GET_TAG(ret_val) == JS_TAG_UNINITIALIZED &&       \
-                 rt->tt_pump_state != NULL)) {                              \
+    if (unlikely(rt->tt_pump_state != NULL)) {                              \
         TTPump *pu;                                                         \
         JSValue pfn, pth, pres;                                             \
         int pact;                                                           \
+        if (unlikely(JS_VALUE_GET_TAG(ret_val) != JS_TAG_UNINITIALIZED)) {  \
+            /* staged state must pair with the sentinel return; anything    \
+               else is a protocol violation — fail loudly, leak nothing */  \
+            tt_pump_drop_staged(ctx);                                       \
+            JS_FreeValue(ctx, ret_val);                                     \
+            JS_ThrowInternalError(ctx, "pump staged without sentinel");     \
+            goto exception;                                                 \
+        }                                                                   \
         pu = (TTPump *)tt_arena_alloc_vals(rt,                              \
             (sizeof(TTPump) + sizeof(JSValue) - 1) / sizeof(JSValue));      \
         if (unlikely(!pu)) {                                                \
-            rt->tt_pump_state = NULL;                                       \
+            tt_pump_drop_staged(ctx);                                       \
             JS_ThrowStackOverflow(caller_ctx);                              \
             goto exception;                                                 \
         }                                                                   \

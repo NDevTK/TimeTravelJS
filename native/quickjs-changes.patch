@@ -693,7 +693,7 @@
  static __exception int js_for_await_of_next(JSContext *ctx, JSValue *sp)
  {
      JSValue obj, iter, next;
-@@ -17584,6 +18119,626 @@
+@@ -17584,6 +18119,641 @@
  
  #define JS_CALL_FLAG_COPY_ARGV   (1 << 1)
  #define JS_CALL_FLAG_GENERATOR   (1 << 2)
@@ -878,6 +878,21 @@
 +    }
 +    js_free_rt(ctx->rt, pu->state);
 +    pu->state = NULL;
++}
++
++/* Free a staged-but-unconsumed pump request (protocol violation, OOM at
++   the call site, or a host-API caller that cannot pump). */
++static void tt_pump_drop_staged(JSContext *ctx)
++{
++    JSRuntime *rt = ctx->rt;
++    TTPump tmp;
++    if (!rt->tt_pump_state)
++        return;
++    memset(&tmp, 0, sizeof(tmp));
++    tmp.kind = rt->tt_pump_kind;
++    tmp.state = rt->tt_pump_state;
++    rt->tt_pump_state = NULL;
++    tt_pump_abort(ctx, &tmp);
 +}
 +
 +/* Continue a pumped builtin. cb_result is owned (ignored when first).
@@ -1320,7 +1335,7 @@
  
  static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                                    JSValueConst this_obj,
-@@ -17593,6 +18748,10 @@
+@@ -17593,6 +18763,10 @@
      JSCFunctionType func;
      JSObject *p;
      JSStackFrame sf_s, *sf = &sf_s, *prev_sf;
@@ -1331,7 +1346,7 @@
      JSValue ret_val;
      JSValueConst *arg_buf;
      int arg_count, i;
-@@ -17777,15 +18936,287 @@
+@@ -17777,15 +18951,294 @@
      JSContext *ctx;
      JSObject *p;
      JSFunctionBytecode *b;
@@ -1408,15 +1423,22 @@
 +   (ret_val replaced, control falls through to the classic completion), or
 +   raises. Uses the surrounding locals of JS_CallInternal. */
 +#define TT_PUMP_TRY_START(basev, tailv)                                     \
-+    if (unlikely(JS_VALUE_GET_TAG(ret_val) == JS_TAG_UNINITIALIZED &&       \
-+                 rt->tt_pump_state != NULL)) {                              \
++    if (unlikely(rt->tt_pump_state != NULL)) {                              \
 +        TTPump *pu;                                                         \
 +        JSValue pfn, pth, pres;                                             \
 +        int pact;                                                           \
++        if (unlikely(JS_VALUE_GET_TAG(ret_val) != JS_TAG_UNINITIALIZED)) {  \
++            /* staged state must pair with the sentinel return; anything    \
++               else is a protocol violation — fail loudly, leak nothing */  \
++            tt_pump_drop_staged(ctx);                                       \
++            JS_FreeValue(ctx, ret_val);                                     \
++            JS_ThrowInternalError(ctx, "pump staged without sentinel");     \
++            goto exception;                                                 \
++        }                                                                   \
 +        pu = (TTPump *)tt_arena_alloc_vals(rt,                              \
 +            (sizeof(TTPump) + sizeof(JSValue) - 1) / sizeof(JSValue));      \
 +        if (unlikely(!pu)) {                                                \
-+            rt->tt_pump_state = NULL;                                       \
++            tt_pump_drop_staged(ctx);                                       \
 +            JS_ThrowStackOverflow(caller_ctx);                              \
 +            goto exception;                                                 \
 +        }                                                                   \
@@ -1623,7 +1645,7 @@
  #define CASE(op)        case op
  #define DEFAULT         default
  #define BREAK           break
-@@ -17800,7 +19231,7 @@
+@@ -17800,7 +19253,7 @@
  #include "quickjs-opcode.h"
          [ OP_COUNT ... 255 ] = &&case_default
      };
@@ -1632,7 +1654,7 @@
  #ifdef OPCODE_ASM_LABEL
  #define CASE(op)        case_ ## op: asm volatile("label_" #op ":\n.globl label_" #op); dummy_case_ ## op
  #else
-@@ -17810,21 +19241,44 @@
+@@ -17810,21 +19263,44 @@
  #define BREAK           SWITCH(pc)
  #endif
  
@@ -1685,7 +1707,7 @@
              sp = sf->cur_sp;
              sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
              pc = sf->cur_pc;
-@@ -17849,58 +19303,93 @@
+@@ -17849,58 +19325,93 @@
          return call_func(caller_ctx, func_obj, this_obj, argc,
                           (JSValueConst *)argv, flags);
      }
@@ -1824,7 +1846,7 @@
          SWITCH(pc) {
          CASE(OP_push_i32):
              *sp++ = JS_NewInt32(ctx, get_u32(pc));
-@@ -18214,8 +19703,89 @@
+@@ -18214,8 +19725,89 @@
              has_call_argc:
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1914,7 +1936,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call)
-@@ -18232,6 +19802,52 @@
+@@ -18232,6 +19824,52 @@
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1967,7 +1989,7 @@
                  ret_val = JS_CallConstructorInternal(ctx, call_argv[-2],
                                                       call_argv[-1],
                                                       call_argc, call_argv, 0);
-@@ -18250,8 +19866,251 @@
+@@ -18250,8 +19888,251 @@
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -2219,7 +2241,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call_method)
-@@ -18325,6 +20184,53 @@
+@@ -18325,6 +20206,53 @@
                  super = JS_GetPrototype(ctx, func_obj);
                  if (JS_IsException(super))
                      goto exception;
@@ -2273,7 +2295,7 @@
                  ret = JS_CallConstructor2(ctx, super, new_target, argc, (JSValueConst *)argv);
                  JS_FreeValue(ctx, super);
                  if (JS_IsException(ret))
-@@ -18994,17 +20900,148 @@
+@@ -18994,17 +20922,148 @@
              sp += 2;
              BREAK;
          CASE(OP_for_of_start):
@@ -2427,7 +2449,7 @@
                  if (js_for_of_next(ctx, sp, offset))
                      goto exception;
                  sp += 2;
-@@ -19042,9 +21079,93 @@
+@@ -19042,9 +21101,93 @@
              JS_FreeValue(ctx, sp[-1]); /* drop the next method */
              sp--;
              if (!JS_IsUndefined(sp[-1])) {
@@ -2522,7 +2544,7 @@
                  JS_FreeValue(ctx, sp[-1]);
              }
              sp--;
-@@ -19072,6 +21193,109 @@
+@@ -19072,6 +21215,109 @@
              {
                  JSValue ret;
                  sf->cur_pc = pc;
@@ -2632,7 +2654,7 @@
                  ret = JS_Call(ctx, sp[-3], sp[-4],
                                1, (JSValueConst *)(sp - 1));
                  if (JS_IsException(ret))
-@@ -19096,6 +21320,78 @@
+@@ -19096,6 +21342,78 @@
                  if (JS_IsUndefined(method) || JS_IsNull(method)) {
                      ret_flag = TRUE;
                  } else {
@@ -2711,7 +2733,7 @@
                      if (flags & 2) {
                          /* no argument */
                          ret = JS_CallFree(ctx, method, sp[-4],
-@@ -19173,9 +21469,33 @@
+@@ -19173,9 +21491,33 @@
                  } else {                                                \
                  name ## _slow_path:                                     \
                      sf->cur_pc = pc;                                    \
@@ -2745,7 +2767,7 @@
                  }                                                       \
                  if (keep) {                                             \
                      *sp++ = val;                                        \
-@@ -19230,8 +21550,35 @@
+@@ -19230,8 +21572,35 @@
                  } else {
                  put_field_slow_path:
                      sf->cur_pc = pc;
@@ -2781,7 +2803,7 @@
                      JS_FreeValue(ctx, obj);
                      sp -= 2;
                      if (unlikely(ret < 0))
-@@ -19299,8 +21646,32 @@
+@@ -19299,8 +21668,32 @@
                  atom = get_u32(pc);
                  pc += 4;
  
@@ -2814,7 +2836,7 @@
                  sp--;
                  if (unlikely(ret < 0))
                      goto exception;
-@@ -19439,7 +21810,18 @@
+@@ -19439,7 +21832,18 @@
                  } else {                                                \
                      name ## _slow_path:                                 \
                      sf->cur_pc = pc;                                    \
@@ -2833,7 +2855,7 @@
                      if (unlikely(JS_IsException(val))) {                \
                          if (keep)                                       \
                              sp[-1] = JS_UNDEFINED;                      \
-@@ -19447,6 +21829,28 @@
+@@ -19447,6 +21851,28 @@
                              sp--;                                       \
                          goto exception;                                 \
                      }                                                   \
@@ -2862,7 +2884,7 @@
                  }                                                       \
                  if (keep) {                                             \
                      sp[-1] = val;                                       \
-@@ -19495,6 +21899,8 @@
+@@ -19495,6 +21921,8 @@
                              goto exception;
                          }
                          sf->cur_pc = pc;
@@ -2871,7 +2893,7 @@
                          ret_val = JS_ToPropertyKey(ctx, sp[-1]);
                          if (JS_IsException(ret_val))
                              goto exception;
-@@ -19610,7 +22016,39 @@
+@@ -19610,7 +22038,39 @@
                  } else {
                  put_array_el_slow_path:
                      sf->cur_pc = pc;
@@ -2911,7 +2933,7 @@
                      JS_FreeValue(ctx, sp[-3]);
                      sp -= 3;
                      if (unlikely(ret < 0))
-@@ -19685,8 +22123,30 @@
+@@ -19685,8 +22145,30 @@
          CASE(OP_define_array_el):
              {
                  int ret;
@@ -2942,7 +2964,7 @@
                  sp -= 1;
                  if (unlikely(ret < 0))
                      goto exception;
-@@ -19695,10 +22155,55 @@
+@@ -19695,10 +22177,55 @@
  
          CASE(OP_append):    /* array pos enumobj -- array pos */
              {
@@ -3000,7 +3022,7 @@
              }
              BREAK;
  
-@@ -19760,6 +22265,7 @@
+@@ -19760,6 +22287,7 @@
                  } else {
                  add_slow_case:
                      sf->cur_pc = pc;
@@ -3008,7 +3030,7 @@
                      if (js_add_slow(ctx, sp))
                          goto exception;
                      sp--;
-@@ -19942,6 +22448,7 @@
+@@ -19942,6 +22470,7 @@
          CASE(OP_pow):
          binary_arith_slow:
              sf->cur_pc = pc;
@@ -3016,7 +3038,7 @@
              if (js_binary_arith_slow(ctx, sp, opcode))
                  goto exception;
              sp--;
-@@ -19958,6 +22465,8 @@
+@@ -19958,6 +22487,8 @@
                      sp[-1] = JS_NewInt32(ctx, JS_VALUE_GET_INT(op1));
                  } else {
                      sf->cur_pc = pc;
@@ -3025,7 +3047,7 @@
                      if (js_unary_arith_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -19991,6 +22500,8 @@
+@@ -19991,6 +22522,8 @@
                      sp[-1] = __JS_NewFloat64(ctx, d);
                  } else {
                      sf->cur_pc = pc;
@@ -3034,7 +3056,7 @@
                      if (js_unary_arith_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -20009,6 +22520,8 @@
+@@ -20009,6 +22542,8 @@
                  } else {
                  inc_slow:
                      sf->cur_pc = pc;
@@ -3043,7 +3065,7 @@
                      if (js_unary_arith_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -20027,6 +22540,8 @@
+@@ -20027,6 +22562,8 @@
                  } else {
                  dec_slow:
                      sf->cur_pc = pc;
@@ -3052,7 +3074,7 @@
                      if (js_unary_arith_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -20045,6 +22560,8 @@
+@@ -20045,6 +22582,8 @@
                  } else {
                  post_inc_slow:
                      sf->cur_pc = pc;
@@ -3061,7 +3083,7 @@
                      if (js_post_inc_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -20064,6 +22581,8 @@
+@@ -20064,6 +22603,8 @@
                  } else {
                  post_dec_slow:
                      sf->cur_pc = pc;
@@ -3070,7 +3092,7 @@
                      if (js_post_inc_slow(ctx, sp, opcode))
                          goto exception;
                  }
-@@ -20130,6 +22649,8 @@
+@@ -20130,6 +22671,8 @@
                      sp[-1] = JS_NewInt32(ctx, ~JS_VALUE_GET_INT(op1));
                  } else {
                      sf->cur_pc = pc;
@@ -3079,7 +3101,7 @@
                      if (js_not_slow(ctx, sp))
                          goto exception;
                  }
-@@ -20150,6 +22671,7 @@
+@@ -20150,6 +22693,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -3087,7 +3109,7 @@
                      if (js_binary_logic_slow(ctx, sp, opcode))
                          goto exception;
                      sp--;
-@@ -20171,6 +22693,7 @@
+@@ -20171,6 +22715,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -3095,7 +3117,7 @@
                      if (js_shr_slow(ctx, sp))
                          goto exception;
                      sp--;
-@@ -20191,6 +22714,7 @@
+@@ -20191,6 +22736,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -3103,7 +3125,7 @@
                      if (js_binary_logic_slow(ctx, sp, opcode))
                          goto exception;
                      sp--;
-@@ -20209,6 +22733,7 @@
+@@ -20209,6 +22755,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -3111,7 +3133,7 @@
                      if (js_binary_logic_slow(ctx, sp, opcode))
                          goto exception;
                      sp--;
-@@ -20227,6 +22752,7 @@
+@@ -20227,6 +22774,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -3119,7 +3141,7 @@
                      if (js_binary_logic_slow(ctx, sp, opcode))
                          goto exception;
                      sp--;
-@@ -20245,6 +22771,7 @@
+@@ -20245,6 +22793,7 @@
                      sp--;
                  } else {
                      sf->cur_pc = pc;
@@ -3127,7 +3149,7 @@
                      if (js_binary_logic_slow(ctx, sp, opcode))
                          goto exception;
                      sp--;
-@@ -20253,7 +22780,7 @@
+@@ -20253,7 +22802,7 @@
              BREAK;
  
  
@@ -3136,7 +3158,7 @@
              CASE(opcode):                                 \
                  {                                         \
                  JSValue op1, op2;                         \
-@@ -20264,6 +22791,13 @@
+@@ -20264,6 +22813,13 @@
                      sp--;                                               \
                  } else {                                                \
                      sf->cur_pc = pc;                                    \
@@ -3150,7 +3172,7 @@
                      if (slow_call)                                      \
                          goto exception;                                 \
                      sp--;                                               \
-@@ -20271,14 +22805,14 @@
+@@ -20271,14 +22827,14 @@
                  }                                                       \
              BREAK
  
@@ -3173,7 +3195,7 @@
  
          CASE(OP_in):
              sf->cur_pc = pc;
-@@ -20293,10 +22827,59 @@
+@@ -20293,10 +22849,59 @@
              sp--;
              BREAK;
          CASE(OP_instanceof):
@@ -3237,7 +3259,7 @@
              BREAK;
          CASE(OP_typeof):
              {
-@@ -20350,6 +22933,10 @@
+@@ -20350,6 +22955,10 @@
                  break;
              default:
                  sf->cur_pc = pc;
@@ -3248,7 +3270,7 @@
                  ret_val = JS_ToPropertyKey(ctx, sp[-1]);
                  if (JS_IsException(ret_val))
                      goto exception;
-@@ -20411,9 +22998,37 @@
+@@ -20411,9 +23020,37 @@
                              } 
                              val = JS_UNDEFINED;
                          } else {
@@ -3287,7 +3309,7 @@
                          }
                          set_value(ctx, &sp[-1], val);
                          break;
-@@ -20426,10 +23041,38 @@
+@@ -20426,10 +23063,38 @@
                              if (is_strict_mode(ctx)) {
                                  JS_ThrowReferenceErrorNotDefined(ctx, atom);
                                  goto exception;
@@ -3327,7 +3349,7 @@
                          JS_FreeValue(ctx, sp[-1]);
                          sp -= 2;
                          if (unlikely(ret < 0))
-@@ -20455,9 +23098,34 @@
+@@ -20455,9 +23120,34 @@
                          if (!ret) {
                              val = JS_UNDEFINED;
                          } else {
@@ -3363,7 +3385,7 @@
                          }
                          *sp++ = val;
                          break;
-@@ -20578,8 +23246,228 @@
+@@ -20578,8 +23268,228 @@
      done_generator:
          sf->cur_pc = pc;
          sf->cur_sp = sp;
@@ -3594,7 +3616,7 @@
          if (unlikely(b->var_ref_count != 0)) {
              /* variable references reference the stack: must close them */
              close_var_refs(rt, b, sf);
-@@ -20588,9 +23476,918 @@
+@@ -20588,9 +23498,918 @@
          for(pval = local_buf; pval < sp; pval++) {
              JS_FreeValue(ctx, *pval);
          }
@@ -4515,7 +4537,7 @@
  }
  
  #ifdef OPCODE_ASM_LABEL
-@@ -20803,6 +24600,19 @@
+@@ -20803,6 +24622,19 @@
      sf->arg_count = arg_buf_len;
      sf->var_buf = sf->arg_buf + arg_buf_len;
      sf->cur_sp = sf->var_buf + b->var_count;
@@ -4535,7 +4557,7 @@
      sf->var_refs = (JSVarRef **)(sf->cur_sp + b->stack_size);
      for(i = 0; i < b->var_ref_count; i++)
          sf->var_refs[i] = NULL;
-@@ -20831,28 +24641,22 @@
+@@ -20831,28 +24663,22 @@
      JS_FreeValueRT(rt, s->this_val);
  }
  
@@ -4571,7 +4593,7 @@
          if (JS_IsUndefined(ret)) {
              ret = sf->cur_sp[-1];
              sf->cur_sp[-1] = JS_UNDEFINED;
-@@ -20862,12 +24666,29 @@
+@@ -20862,12 +24688,29 @@
  
          /* close the closure variables. */
          close_var_refs(rt, b, sf);
@@ -4602,7 +4624,7 @@
  static void __async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
  {
      /* cannot close the closure variables here because it would
-@@ -20915,6 +24736,12 @@
+@@ -20915,6 +24758,12 @@
      JSAsyncFunctionState *func_state;
  } JSGeneratorData;
  
@@ -4615,7 +4637,7 @@
  static void free_generator_stack_rt(JSRuntime *rt, JSGeneratorData *s)
  {
      if (s->state == JS_GENERATOR_STATE_COMPLETED)
-@@ -20952,26 +24779,27 @@
+@@ -20952,26 +24801,27 @@
      mark_func(rt, &s->func_state->header);
  }
  
@@ -4655,7 +4677,7 @@
          if (magic == GEN_MAGIC_NEXT) {
              goto exec_no_arg;
          } else {
-@@ -20983,7 +24811,7 @@
+@@ -20983,7 +24833,7 @@
      case JS_GENERATOR_STATE_SUSPENDED_YIELD:
          sf = &s->func_state->frame;
          /* cur_sp[-1] was set to JS_UNDEFINED in the previous call */
@@ -4664,7 +4686,7 @@
          if (magic == GEN_MAGIC_THROW &&
              s->state == JS_GENERATOR_STATE_SUSPENDED_YIELD) {
              JS_Throw(ctx, ret);
-@@ -20996,26 +24824,7 @@
+@@ -20996,26 +24846,7 @@
              s->func_state->throw_flag = FALSE;
          }
          s->state = JS_GENERATOR_STATE_EXECUTING;
@@ -4692,7 +4714,7 @@
      case JS_GENERATOR_STATE_COMPLETED:
      done:
          /* execution is finished */
-@@ -21025,10 +24834,10 @@
+@@ -21025,10 +24856,10 @@
              ret = JS_UNDEFINED;
              break;
          case GEN_MAGIC_RETURN:
@@ -4705,7 +4727,7 @@
              break;
          }
          break;
-@@ -21036,33 +24845,88 @@
+@@ -21036,33 +24867,88 @@
          ret = JS_ThrowTypeError(ctx, "cannot invoke a running generator");
          break;
      }
@@ -4804,7 +4826,7 @@
      obj = js_create_from_ctor(ctx, func_obj, JS_CLASS_GENERATOR);
      if (JS_IsException(obj))
          goto fail;
-@@ -21074,6 +24938,22 @@
+@@ -21074,6 +24960,22 @@
      return JS_EXCEPTION;
  }
  
@@ -4827,7 +4849,7 @@
  /* AsyncFunction */
  
  static void js_async_function_resolve_finalizer(JSRuntime *rt, JSValue val)
-@@ -21118,11 +24998,14 @@
+@@ -21118,11 +25020,14 @@
      return 0;
  }
  
@@ -4845,7 +4867,7 @@
      if (s->is_completed) {
          if (JS_IsException(func_ret)) {
              JSValue error;
-@@ -21173,6 +25056,11 @@
+@@ -21173,6 +25078,11 @@
      }
  }
  
@@ -4857,7 +4879,7 @@
  static JSValue js_async_function_resolve_call(JSContext *ctx,
                                                JSValueConst func_obj,
                                                JSValueConst this_obj,
-@@ -21448,25 +25336,38 @@
+@@ -21448,25 +25358,38 @@
      return res;
  }
  
@@ -4903,7 +4925,7 @@
              } else {
                  js_async_generator_complete(ctx, s);
              }
-@@ -21480,7 +25381,7 @@
+@@ -21480,7 +25403,7 @@
              } else {
                  js_async_generator_reject(ctx, s, next->result);
              }
@@ -4912,7 +4934,7 @@
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD:
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
              value = JS_DupValue(ctx, next->result);
-@@ -21495,59 +25396,78 @@
+@@ -21495,59 +25418,78 @@
                  s->func_state->frame.cur_sp[0] =
                      JS_NewInt32(ctx, next->completion_type);
                  s->func_state->frame.cur_sp++;
@@ -5036,7 +5058,7 @@
  }
  
  static JSValue js_async_generator_resolve_function(JSContext *ctx,
-@@ -21586,14 +25506,19 @@
+@@ -21586,14 +25528,19 @@
  }
  
  /* magic = GEN_MAGIC_x */
@@ -5059,7 +5081,7 @@
      promise = JS_NewPromiseCapability(ctx, resolving_funcs);
      if (JS_IsException(promise))
          return JS_EXCEPTION;
-@@ -21613,14 +25538,13 @@
+@@ -21613,14 +25560,13 @@
      if (!req)
          goto fail;
      req->completion_type = magic;
@@ -5077,7 +5099,7 @@
      return promise;
   fail:
      JS_FreeValue(ctx, resolving_funcs[0]);
-@@ -21629,29 +25553,54 @@
+@@ -21629,29 +25575,54 @@
      return JS_EXCEPTION;
  }
  
@@ -5144,7 +5166,7 @@
      obj = js_create_from_ctor(ctx, func_obj, JS_CLASS_ASYNC_GENERATOR);
      if (JS_IsException(obj))
          goto fail;
-@@ -21663,6 +25612,22 @@
+@@ -21663,6 +25634,22 @@
      return JS_EXCEPTION;
  }
  
@@ -5167,7 +5189,7 @@
  /* JS parser */
  
  enum {
-@@ -41966,12 +45931,6 @@
+@@ -41966,12 +45953,6 @@
      return JS_EXCEPTION;
  }
  
@@ -5180,7 +5202,7 @@
  
  static JSValue js_typed_array___speciesCreate(JSContext *ctx,
                                                JSValueConst this_val,
-@@ -42041,6 +46000,32 @@
+@@ -42041,6 +46022,32 @@
      }
      n = 0;
  
@@ -5213,7 +5235,7 @@
      for(k = 0; k < len; k++) {
          if (special & special_TA) {
              val = JS_GetPropertyInt64(ctx, obj, k);
-@@ -42131,8 +46116,6 @@
+@@ -42131,8 +46138,6 @@
      return JS_EXCEPTION;
  }
  
@@ -5222,7 +5244,7 @@
  
  static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv, int special)
-@@ -42185,6 +46168,28 @@
+@@ -42185,6 +46190,28 @@
              }
          }
      }
@@ -5251,7 +5273,7 @@
      for (; k < len; k++) {
          k1 = (special & special_reduceRight) ? len - k - 1 : k;
          if (special & special_TA) {
-@@ -42399,12 +46404,6 @@
+@@ -42399,12 +46426,6 @@
      return JS_EXCEPTION;
  }
  
@@ -5264,7 +5286,7 @@
  
  static JSValue js_array_find(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int mode)
-@@ -42438,6 +46437,30 @@
+@@ -42438,6 +46459,30 @@
          end = -1;
      }
  
@@ -5295,7 +5317,7 @@
      // TODO(bnoordhuis) add fast path for fast arrays
      for(; k != end; k += dir) {
          index_val = JS_NewInt64(ctx, k);
-@@ -43208,6 +47231,55 @@
+@@ -43208,6 +47253,55 @@
              goto exception;
          asc.has_method = 1;
      }
@@ -5351,7 +5373,7 @@
      obj = JS_ToObject(ctx, this_val);
      if (js_get_length64(ctx, &len, obj))
          goto exception;
-@@ -45453,6 +49525,11 @@
+@@ -45453,6 +49547,11 @@
      JSString *p;
      JSString *p1;
  
@@ -5363,7 +5385,7 @@
      str = JS_ToStringCheckObject(ctx, this_val);
      if (JS_IsException(str))
          return str;
-@@ -45521,6 +49598,12 @@
+@@ -45521,6 +49620,12 @@
      JSString *p;
      JSString *p1;
  
@@ -5376,7 +5398,7 @@
      str = JS_ToStringCheckObject(ctx, this_val);
      if (JS_IsException(str))
          return str;
-@@ -47146,6 +51229,12 @@
+@@ -47146,6 +51251,12 @@
  static void js_random_init(JSContext *ctx)
  {
      struct timeval tv;
@@ -5389,7 +5411,7 @@
      gettimeofday(&tv, NULL);
      ctx->random_state = ((int64_t)tv.tv_sec * 1000000) + tv.tv_usec;
      /* the state must be non zero */
-@@ -50587,8 +54676,15 @@
+@@ -50587,8 +54698,15 @@
      int res;
      JSValueConst args[3];
      JSPropertyDescriptor desc;
@@ -5405,7 +5427,7 @@
      if (!s)
          return JS_EXCEPTION;
      /* Note: recursion is possible thru the prototype of s->target */
-@@ -50599,6 +54695,30 @@
+@@ -50599,6 +54717,30 @@
          JS_FreeValue(ctx, method);
          return JS_EXCEPTION;
      }
@@ -5436,7 +5458,7 @@
      args[0] = s->target;
      args[1] = atom_val;
      args[2] = receiver;
-@@ -50636,8 +54756,14 @@
+@@ -50636,8 +54778,14 @@
      JSValue method, ret1, atom_val;
      int ret, res;
      JSValueConst args[4];
@@ -5451,7 +5473,7 @@
      if (!s)
          return -1;
      if (JS_IsUndefined(method)) {
-@@ -50650,6 +54776,31 @@
+@@ -50650,6 +54798,31 @@
          JS_FreeValue(ctx, method);
          return -1;
      }
@@ -5483,7 +5505,7 @@
      args[0] = s->target;
      args[1] = atom_val;
      args[2] = value;
-@@ -50842,8 +54993,13 @@
+@@ -50842,8 +55015,13 @@
      JSValueConst args[3];
      JSPropertyDescriptor desc;
      BOOL setting_not_configurable;
@@ -5497,7 +5519,7 @@
      if (!s)
          return -1;
      if (JS_IsUndefined(method)) {
-@@ -50860,6 +55016,32 @@
+@@ -50860,6 +55038,32 @@
          JS_FreeValue(ctx, method);
          return -1;
      }
@@ -5530,7 +5552,7 @@
      args[0] = s->target;
      args[1] = prop_val;
      args[2] = desc_val;
-@@ -52082,6 +56264,27 @@
+@@ -52082,6 +56286,27 @@
          this_arg = JS_UNDEFINED;
      if (check_function(ctx, func))
          return JS_EXCEPTION;
@@ -5558,7 +5580,7 @@
      /* Note: the list can be modified while traversing it, but the
         current element is locked */
      el = s->records.next;
-@@ -53280,6 +57483,317 @@
+@@ -53280,6 +57505,317 @@
      return res;
  }
  
@@ -5876,7 +5898,7 @@
  static void js_promise_resolve_function_free_resolved(JSRuntime *rt,
                                                        JSPromiseFunctionDataResolved *sr)
  {
-@@ -55169,6 +59683,10 @@
+@@ -55169,6 +59705,10 @@
  /* OS dependent: return the UTC time in ms since 1970. */
  static int64_t date_now(void) {
      struct timeval tv;
@@ -5887,7 +5909,7 @@
      gettimeofday(&tv, NULL);
      return (int64_t)tv.tv_sec * 1000 + (tv.tv_usec / 1000);
  }
-@@ -61195,3 +65713,3515 @@
+@@ -61195,3 +65735,3515 @@
      JS_FreeValue(ctx, obj);
      return 0;
  }
