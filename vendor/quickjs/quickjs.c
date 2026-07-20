@@ -65500,7 +65500,6 @@ EXPORT("tt_dirty_map_size") int tt_dirty_map_size(void) { return TT_DIRTY_PAGES;
 static JSRuntime *g_rt;
 static JSContext *g_ctx;
 static JSValue g_dom_build_fn;   /* interim JS hook: builds the DOM layer  */
-static JSValue g_set_url_fn;     /* interim JS hook: session location init */
 static int g_in_hook;           /* re-entrancy guard for inspect/eval     */
 static char g_arg_buf[65536];
 
@@ -66590,6 +66589,1356 @@ static JSValue js_tt_queue_microtask(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/* ==== web-platform substrate: storage, URLSearchParams, URL, location ===
+   All state lives in C structs in linear memory, so it snapshots, scrubs
+   and forks with the machine. Read registries (which URL parameters and
+   storage keys the program consulted) feed the engine's input search. */
+
+typedef struct {
+    char **items;
+    int len, cap;
+} TTStrSet;
+
+static void tt_strset_add(TTStrSet *s, const char *k)
+{
+    int i;
+    for (i = 0; i < s->len; i++)
+        if (!strcmp(s->items[i], k))
+            return;
+    if (s->len >= s->cap) {
+        int ncap = s->cap ? s->cap * 2 : 8;
+        char **ni = realloc(s->items, sizeof(char *) * ncap);
+        if (!ni)
+            return;
+        s->items = ni;
+        s->cap = ncap;
+    }
+    s->items[s->len] = strdup(k);
+    if (s->items[s->len])
+        s->len++;
+}
+
+static void tt_strset_clear(TTStrSet *s)
+{
+    int i;
+    for (i = 0; i < s->len; i++)
+        free(s->items[i]);
+    free(s->items);
+    s->items = NULL;
+    s->len = s->cap = 0;
+}
+
+static JSValue tt_strset_to_array(JSContext *ctx, TTStrSet *s)
+{
+    JSValue arr = JS_NewArray(ctx);
+    int i;
+    for (i = 0; i < s->len; i++)
+        JS_DefinePropertyValueUint32(ctx, arr, i, JS_NewString(ctx, s->items[i]),
+                                     JS_PROP_C_W_E);
+    return arr;
+}
+
+/* ASCII classifiers (the wasi shim sysroot has no ctype.h) */
+static int tt_isdigit_c(int c) { return c >= '0' && c <= '9'; }
+static int tt_isalpha_c(int c) { return (c | 32) >= 'a' && (c | 32) <= 'z'; }
+static int tt_isalnum_c(int c) { return tt_isalpha_c(c) || tt_isdigit_c(c); }
+static int tt_isxdigit_c(int c) { return tt_isdigit_c(c) || ((c | 32) >= 'a' && (c | 32) <= 'f'); }
+
+/* every URLSearchParams read funnels here (module-wide, like the JS did) */
+static TTStrSet g_param_reads;
+
+/* ---- Storage ---- */
+typedef struct {
+    char **keys;
+    char **vals;
+    int len, cap;
+    TTStrSet reads;
+} TTStorage;
+
+static JSClassID tt_storage_class_id;
+
+static void tt_storage_finalizer(JSRuntime *rt, JSValue val)
+{
+    TTStorage *st = JS_GetOpaque(val, tt_storage_class_id);
+    int i;
+    (void)rt;
+    if (!st)
+        return;
+    for (i = 0; i < st->len; i++) {
+        free(st->keys[i]);
+        free(st->vals[i]);
+    }
+    free(st->keys);
+    free(st->vals);
+    tt_strset_clear(&st->reads);
+    free(st);
+}
+
+static JSClassDef tt_storage_class = {
+    "Storage",
+    .finalizer = tt_storage_finalizer,
+};
+
+static int tt_storage_find(TTStorage *st, const char *k)
+{
+    int i;
+    for (i = 0; i < st->len; i++)
+        if (!strcmp(st->keys[i], k))
+            return i;
+    return -1;
+}
+
+static JSValue js_tt_storage_get_item(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv)
+{
+    TTStorage *st = JS_GetOpaque2(ctx, this_val, tt_storage_class_id);
+    const char *k;
+    int i;
+    JSValue r;
+    if (!st)
+        return JS_EXCEPTION;
+    k = JS_ToCString(ctx, argc >= 1 ? argv[0] : JS_UNDEFINED);
+    if (!k)
+        return JS_EXCEPTION;
+    tt_strset_add(&st->reads, k);
+    i = tt_storage_find(st, k);
+    r = i >= 0 ? JS_NewString(ctx, st->vals[i]) : JS_NULL;
+    JS_FreeCString(ctx, k);
+    return r;
+}
+
+static JSValue js_tt_storage_set_item(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv)
+{
+    TTStorage *st = JS_GetOpaque2(ctx, this_val, tt_storage_class_id);
+    const char *k, *v;
+    int i;
+    if (!st)
+        return JS_EXCEPTION;
+    k = JS_ToCString(ctx, argc >= 1 ? argv[0] : JS_UNDEFINED);
+    if (!k)
+        return JS_EXCEPTION;
+    v = JS_ToCString(ctx, argc >= 2 ? argv[1] : JS_UNDEFINED);
+    if (!v) {
+        JS_FreeCString(ctx, k);
+        return JS_EXCEPTION;
+    }
+    i = tt_storage_find(st, k);
+    if (i >= 0) {
+        char *nv = strdup(v);
+        if (nv) {
+            free(st->vals[i]);
+            st->vals[i] = nv;
+        }
+    } else {
+        if (st->len >= st->cap) {
+            int ncap = st->cap ? st->cap * 2 : 8;
+            char **nk = realloc(st->keys, sizeof(char *) * ncap);
+            char **nv2 = nk ? realloc(st->vals, sizeof(char *) * ncap) : NULL;
+            if (nk)
+                st->keys = nk;
+            if (nv2) {
+                st->vals = nv2;
+                st->cap = ncap;
+            }
+        }
+        if (st->len < st->cap) {
+            st->keys[st->len] = strdup(k);
+            st->vals[st->len] = strdup(v);
+            if (st->keys[st->len] && st->vals[st->len])
+                st->len++;
+        }
+    }
+    JS_FreeCString(ctx, k);
+    JS_FreeCString(ctx, v);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_tt_storage_remove_item(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv)
+{
+    TTStorage *st = JS_GetOpaque2(ctx, this_val, tt_storage_class_id);
+    const char *k;
+    int i;
+    if (!st)
+        return JS_EXCEPTION;
+    k = JS_ToCString(ctx, argc >= 1 ? argv[0] : JS_UNDEFINED);
+    if (!k)
+        return JS_EXCEPTION;
+    i = tt_storage_find(st, k);
+    if (i >= 0) {
+        free(st->keys[i]);
+        free(st->vals[i]);
+        memmove(&st->keys[i], &st->keys[i + 1], sizeof(char *) * (st->len - i - 1));
+        memmove(&st->vals[i], &st->vals[i + 1], sizeof(char *) * (st->len - i - 1));
+        st->len--;
+    }
+    JS_FreeCString(ctx, k);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_tt_storage_clear(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    TTStorage *st = JS_GetOpaque2(ctx, this_val, tt_storage_class_id);
+    int i;
+    (void)argc;
+    (void)argv;
+    if (!st)
+        return JS_EXCEPTION;
+    for (i = 0; i < st->len; i++) {
+        free(st->keys[i]);
+        free(st->vals[i]);
+    }
+    st->len = 0;
+    return JS_UNDEFINED;
+}
+
+static JSValue js_tt_storage_key(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv)
+{
+    TTStorage *st = JS_GetOpaque2(ctx, this_val, tt_storage_class_id);
+    int32_t i = -1;
+    if (!st)
+        return JS_EXCEPTION;
+    if (argc >= 1 && JS_ToInt32(ctx, &i, argv[0]))
+        return JS_EXCEPTION;
+    if (i >= 0 && i < st->len)
+        return JS_NewString(ctx, st->keys[i]);
+    return JS_NULL;
+}
+
+static JSValue js_tt_storage_length(JSContext *ctx, JSValueConst this_val)
+{
+    TTStorage *st = JS_GetOpaque2(ctx, this_val, tt_storage_class_id);
+    if (!st)
+        return JS_EXCEPTION;
+    return JS_NewInt32(ctx, st->len);
+}
+
+static JSValue js_tt_storage_reads(JSContext *ctx, JSValueConst this_val)
+{
+    TTStorage *st = JS_GetOpaque2(ctx, this_val, tt_storage_class_id);
+    if (!st)
+        return JS_EXCEPTION;
+    return tt_strset_to_array(ctx, &st->reads);
+}
+
+static JSValue js_tt_storage_keys(JSContext *ctx, JSValueConst this_val)
+{
+    TTStorage *st = JS_GetOpaque2(ctx, this_val, tt_storage_class_id);
+    JSValue arr;
+    int i;
+    if (!st)
+        return JS_EXCEPTION;
+    arr = JS_NewArray(ctx);
+    for (i = 0; i < st->len; i++)
+        JS_DefinePropertyValueUint32(ctx, arr, i, JS_NewString(ctx, st->keys[i]),
+                                     JS_PROP_C_W_E);
+    return arr;
+}
+
+static const JSCFunctionListEntry tt_storage_proto_funcs[] = {
+    JS_CFUNC_DEF("getItem", 1, js_tt_storage_get_item),
+    JS_CFUNC_DEF("setItem", 2, js_tt_storage_set_item),
+    JS_CFUNC_DEF("removeItem", 1, js_tt_storage_remove_item),
+    JS_CFUNC_DEF("clear", 0, js_tt_storage_clear),
+    JS_CFUNC_DEF("key", 1, js_tt_storage_key),
+    JS_CGETSET_DEF("length", js_tt_storage_length, NULL),
+    JS_CGETSET_DEF("__reads", js_tt_storage_reads, NULL),
+    JS_CGETSET_DEF("__keys", js_tt_storage_keys, NULL),
+};
+
+static JSValue tt_new_storage(JSContext *ctx)
+{
+    JSValue obj = JS_NewObjectClass(ctx, tt_storage_class_id);
+    TTStorage *st;
+    if (JS_IsException(obj))
+        return obj;
+    st = calloc(1, sizeof(*st));
+    if (!st) {
+        JS_FreeValue(ctx, obj);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    JS_SetOpaque(obj, st);
+    return obj;
+}
+
+/* ---- URLSearchParams ---- */
+typedef struct {
+    char **keys;
+    char **vals;
+    int len, cap;
+} TTParams;
+
+static JSClassID tt_params_class_id;
+
+static void tt_params_push(TTParams *ps, char *k, char *v)
+{
+    if (ps->len >= ps->cap) {
+        int ncap = ps->cap ? ps->cap * 2 : 8;
+        char **nk = realloc(ps->keys, sizeof(char *) * ncap);
+        char **nv = nk ? realloc(ps->vals, sizeof(char *) * ncap) : NULL;
+        if (!nk || !nv) {
+            free(k);
+            free(v);
+            if (nk)
+                ps->keys = nk;
+            return;
+        }
+        ps->keys = nk;
+        ps->vals = nv;
+        ps->cap = ncap;
+    }
+    ps->keys[ps->len] = k;
+    ps->vals[ps->len] = v;
+    ps->len++;
+}
+
+static void tt_params_free(TTParams *ps)
+{
+    int i;
+    for (i = 0; i < ps->len; i++) {
+        free(ps->keys[i]);
+        free(ps->vals[i]);
+    }
+    free(ps->keys);
+    free(ps->vals);
+    free(ps);
+}
+
+static void tt_params_finalizer(JSRuntime *rt, JSValue val)
+{
+    TTParams *ps = JS_GetOpaque(val, tt_params_class_id);
+    (void)rt;
+    if (ps)
+        tt_params_free(ps);
+}
+
+static JSClassDef tt_params_class = {
+    "URLSearchParams",
+    .finalizer = tt_params_finalizer,
+};
+
+/* application/x-www-form-urlencoded decode of one component in place */
+static char *tt_form_decode(const char *s, size_t len)
+{
+    char *out = malloc(len + 1);
+    size_t i, w = 0;
+    if (!out)
+        return NULL;
+    for (i = 0; i < len; i++) {
+        char c = s[i];
+        if (c == '+') {
+            out[w++] = ' ';
+        } else if (c == '%' && i + 2 < len &&
+                   tt_isxdigit_c((unsigned char)s[i + 1]) &&
+                   tt_isxdigit_c((unsigned char)s[i + 2])) {
+            int hi = s[i + 1], lo = s[i + 2];
+            hi = hi <= '9' ? hi - '0' : (hi | 32) - 'a' + 10;
+            lo = lo <= '9' ? lo - '0' : (lo | 32) - 'a' + 10;
+            out[w++] = (char)((hi << 4) | lo);
+            i += 2;
+        } else {
+            out[w++] = c;
+        }
+    }
+    out[w] = 0;
+    return out;
+}
+
+static void tt_form_encode(DynBuf *b, const char *s)
+{
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (tt_isalnum_c(c) || strchr("-_.!~*'()", c))
+            dbuf_putc(b, c);
+        else
+            dbuf_printf(b, "%%%02X", c);
+    }
+}
+
+static void tt_params_parse(TTParams *ps, const char *qs)
+{
+    const char *p = qs;
+    if (*p == '?')
+        p++;
+    while (*p) {
+        const char *amp = strchr(p, '&');
+        size_t plen = amp ? (size_t)(amp - p) : strlen(p);
+        if (plen) {
+            const char *eq = memchr(p, '=', plen);
+            size_t klen = eq ? (size_t)(eq - p) : plen;
+            char *k = tt_form_decode(p, klen);
+            char *v = eq ? tt_form_decode(eq + 1, plen - klen - 1)
+                         : strdup("");
+            if (k && v)
+                tt_params_push(ps, k, v);
+            else {
+                free(k);
+                free(v);
+            }
+        }
+        if (!amp)
+            break;
+        p = amp + 1;
+    }
+}
+
+static JSValue tt_new_params(JSContext *ctx, TTParams *ps);
+
+static JSValue js_tt_params_ctor(JSContext *ctx, JSValueConst new_target,
+                                 int argc, JSValueConst *argv)
+{
+    TTParams *ps = calloc(1, sizeof(*ps));
+    JSValueConst init = argc >= 1 ? argv[0] : JS_UNDEFINED;
+    (void)new_target;
+    if (!ps)
+        return JS_ThrowOutOfMemory(ctx);
+    if (JS_IsString(init)) {
+        const char *s = JS_ToCString(ctx, init);
+        if (s) {
+            tt_params_parse(ps, s);
+            JS_FreeCString(ctx, s);
+        }
+    } else if (JS_VALUE_GET_TAG(init) == JS_TAG_OBJECT) {
+        TTParams *other = JS_GetOpaque(init, tt_params_class_id);
+        if (other) {
+            int i;
+            for (i = 0; i < other->len; i++)
+                tt_params_push(ps, strdup(other->keys[i]), strdup(other->vals[i]));
+        } else if (JS_IsArray(ctx, init)) {
+            int64_t n = 0, i;
+            JSValue lenv = JS_GetPropertyStr(ctx, init, "length");
+            JS_ToInt64(ctx, &n, lenv);
+            JS_FreeValue(ctx, lenv);
+            for (i = 0; i < n; i++) {
+                JSValue pair = JS_GetPropertyUint32(ctx, init, (uint32_t)i);
+                JSValue kv0 = JS_GetPropertyUint32(ctx, pair, 0);
+                JSValue kv1 = JS_GetPropertyUint32(ctx, pair, 1);
+                const char *k = JS_ToCString(ctx, kv0);
+                const char *v = JS_ToCString(ctx, kv1);
+                if (k && v)
+                    tt_params_push(ps, strdup(k), strdup(v));
+                if (k)
+                    JS_FreeCString(ctx, k);
+                if (v)
+                    JS_FreeCString(ctx, v);
+                JS_FreeValue(ctx, kv0);
+                JS_FreeValue(ctx, kv1);
+                JS_FreeValue(ctx, pair);
+            }
+        } else {
+            JSPropertyEnum *tab = NULL;
+            uint32_t count = 0, i;
+            if (!JS_GetOwnPropertyNamesInternal(ctx, &tab, &count,
+                                                JS_VALUE_GET_OBJ(init),
+                                                JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
+                for (i = 0; i < count; i++) {
+                    JSValue pv = JS_GetPropertyInternal(ctx, init, tab[i].atom, init, 0);
+                    const char *k = JS_AtomToCString(ctx, tab[i].atom);
+                    const char *v = JS_ToCString(ctx, pv);
+                    if (k && v)
+                        tt_params_push(ps, strdup(k), strdup(v));
+                    if (k)
+                        JS_FreeCString(ctx, k);
+                    if (v)
+                        JS_FreeCString(ctx, v);
+                    JS_FreeValue(ctx, pv);
+                }
+                JS_FreePropertyEnum(ctx, tab, count);
+            }
+        }
+    }
+    return tt_new_params(ctx, ps);
+}
+
+static JSValue js_tt_params_get(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv)
+{
+    TTParams *ps = JS_GetOpaque2(ctx, this_val, tt_params_class_id);
+    const char *k;
+    int i;
+    JSValue r = JS_NULL;
+    if (!ps)
+        return JS_EXCEPTION;
+    k = JS_ToCString(ctx, argc >= 1 ? argv[0] : JS_UNDEFINED);
+    if (!k)
+        return JS_EXCEPTION;
+    tt_strset_add(&g_param_reads, k);
+    for (i = 0; i < ps->len; i++) {
+        if (!strcmp(ps->keys[i], k)) {
+            r = JS_NewString(ctx, ps->vals[i]);
+            break;
+        }
+    }
+    JS_FreeCString(ctx, k);
+    return r;
+}
+
+static JSValue js_tt_params_get_all(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv)
+{
+    TTParams *ps = JS_GetOpaque2(ctx, this_val, tt_params_class_id);
+    const char *k;
+    int i, n = 0;
+    JSValue arr;
+    if (!ps)
+        return JS_EXCEPTION;
+    k = JS_ToCString(ctx, argc >= 1 ? argv[0] : JS_UNDEFINED);
+    if (!k)
+        return JS_EXCEPTION;
+    tt_strset_add(&g_param_reads, k);
+    arr = JS_NewArray(ctx);
+    for (i = 0; i < ps->len; i++)
+        if (!strcmp(ps->keys[i], k))
+            JS_DefinePropertyValueUint32(ctx, arr, n++,
+                                         JS_NewString(ctx, ps->vals[i]),
+                                         JS_PROP_C_W_E);
+    JS_FreeCString(ctx, k);
+    return arr;
+}
+
+static JSValue js_tt_params_has(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv)
+{
+    TTParams *ps = JS_GetOpaque2(ctx, this_val, tt_params_class_id);
+    const char *k;
+    int i, found = 0;
+    if (!ps)
+        return JS_EXCEPTION;
+    k = JS_ToCString(ctx, argc >= 1 ? argv[0] : JS_UNDEFINED);
+    if (!k)
+        return JS_EXCEPTION;
+    tt_strset_add(&g_param_reads, k);
+    for (i = 0; i < ps->len; i++)
+        if (!strcmp(ps->keys[i], k)) {
+            found = 1;
+            break;
+        }
+    JS_FreeCString(ctx, k);
+    return JS_NewBool(ctx, found);
+}
+
+static JSValue js_tt_params_set(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv)
+{
+    TTParams *ps = JS_GetOpaque2(ctx, this_val, tt_params_class_id);
+    const char *k, *v;
+    int i, w = 0;
+    if (!ps)
+        return JS_EXCEPTION;
+    k = JS_ToCString(ctx, argc >= 1 ? argv[0] : JS_UNDEFINED);
+    if (!k)
+        return JS_EXCEPTION;
+    v = JS_ToCString(ctx, argc >= 2 ? argv[1] : JS_UNDEFINED);
+    if (!v) {
+        JS_FreeCString(ctx, k);
+        return JS_EXCEPTION;
+    }
+    /* drop all entries with the key, append the new one (JS parity) */
+    for (i = 0; i < ps->len; i++) {
+        if (!strcmp(ps->keys[i], k)) {
+            free(ps->keys[i]);
+            free(ps->vals[i]);
+        } else {
+            ps->keys[w] = ps->keys[i];
+            ps->vals[w] = ps->vals[i];
+            w++;
+        }
+    }
+    ps->len = w;
+    tt_params_push(ps, strdup(k), strdup(v));
+    JS_FreeCString(ctx, k);
+    JS_FreeCString(ctx, v);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_tt_params_append(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    TTParams *ps = JS_GetOpaque2(ctx, this_val, tt_params_class_id);
+    const char *k, *v;
+    if (!ps)
+        return JS_EXCEPTION;
+    k = JS_ToCString(ctx, argc >= 1 ? argv[0] : JS_UNDEFINED);
+    if (!k)
+        return JS_EXCEPTION;
+    v = JS_ToCString(ctx, argc >= 2 ? argv[1] : JS_UNDEFINED);
+    if (!v) {
+        JS_FreeCString(ctx, k);
+        return JS_EXCEPTION;
+    }
+    tt_params_push(ps, strdup(k), strdup(v));
+    JS_FreeCString(ctx, k);
+    JS_FreeCString(ctx, v);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_tt_params_delete(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    TTParams *ps = JS_GetOpaque2(ctx, this_val, tt_params_class_id);
+    const char *k;
+    int i, w = 0;
+    if (!ps)
+        return JS_EXCEPTION;
+    k = JS_ToCString(ctx, argc >= 1 ? argv[0] : JS_UNDEFINED);
+    if (!k)
+        return JS_EXCEPTION;
+    for (i = 0; i < ps->len; i++) {
+        if (!strcmp(ps->keys[i], k)) {
+            free(ps->keys[i]);
+            free(ps->vals[i]);
+        } else {
+            ps->keys[w] = ps->keys[i];
+            ps->vals[w] = ps->vals[i];
+            w++;
+        }
+    }
+    ps->len = w;
+    JS_FreeCString(ctx, k);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_tt_params_to_string(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv)
+{
+    TTParams *ps = JS_GetOpaque2(ctx, this_val, tt_params_class_id);
+    DynBuf b;
+    JSValue r;
+    int i;
+    (void)argc;
+    (void)argv;
+    if (!ps)
+        return JS_EXCEPTION;
+    js_dbuf_init(ctx, &b);
+    for (i = 0; i < ps->len; i++) {
+        if (i)
+            dbuf_putc(&b, '&');
+        tt_form_encode(&b, ps->keys[i]);
+        dbuf_putc(&b, '=');
+        tt_form_encode(&b, ps->vals[i]);
+    }
+    r = JS_NewStringLen(ctx, (const char *)b.buf, b.size);
+    dbuf_free(&b);
+    return r;
+}
+
+/* keys()/values()/entries()/@@iterator/forEach via materialized arrays;
+   the callback in forEach is invoked with (value, key, this) */
+static JSValue js_tt_params_iter(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv, int magic)
+{
+    TTParams *ps = JS_GetOpaque2(ctx, this_val, tt_params_class_id);
+    JSValue arr, it;
+    int i;
+    (void)argc;
+    (void)argv;
+    if (!ps)
+        return JS_EXCEPTION;
+    arr = JS_NewArray(ctx);
+    for (i = 0; i < ps->len; i++) {
+        JSValue el;
+        if (magic == 0) {
+            el = JS_NewString(ctx, ps->keys[i]);
+        } else if (magic == 1) {
+            el = JS_NewString(ctx, ps->vals[i]);
+        } else {
+            el = JS_NewArray(ctx);
+            JS_DefinePropertyValueUint32(ctx, el, 0, JS_NewString(ctx, ps->keys[i]), JS_PROP_C_W_E);
+            JS_DefinePropertyValueUint32(ctx, el, 1, JS_NewString(ctx, ps->vals[i]), JS_PROP_C_W_E);
+        }
+        JS_DefinePropertyValueUint32(ctx, arr, i, el, JS_PROP_C_W_E);
+    }
+    it = JS_GetProperty(ctx, arr, JS_ATOM_Symbol_iterator);
+    if (!JS_IsException(it)) {
+        JSValue r = JS_Call(ctx, it, arr, 0, NULL);
+        JS_FreeValue(ctx, it);
+        JS_FreeValue(ctx, arr);
+        return r;
+    }
+    JS_FreeValue(ctx, arr);
+    return it;
+}
+
+static JSValue js_tt_params_for_each(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    TTParams *ps = JS_GetOpaque2(ctx, this_val, tt_params_class_id);
+    JSValueConst self;
+    int i;
+    if (!ps)
+        return JS_EXCEPTION;
+    if (argc < 1 || !JS_IsFunction(ctx, argv[0]))
+        return JS_ThrowTypeError(ctx, "not a function");
+    self = argc >= 2 ? argv[1] : JS_UNDEFINED;
+    for (i = 0; i < ps->len; i++) {
+        JSValue call_args[3];
+        JSValue r;
+        call_args[0] = JS_NewString(ctx, ps->vals[i]);
+        call_args[1] = JS_NewString(ctx, ps->keys[i]);
+        call_args[2] = JS_DupValue(ctx, this_val);
+        r = JS_Call(ctx, argv[0], self, 3, (JSValueConst *)call_args);
+        JS_FreeValue(ctx, call_args[0]);
+        JS_FreeValue(ctx, call_args[1]);
+        JS_FreeValue(ctx, call_args[2]);
+        if (JS_IsException(r))
+            return r;
+        JS_FreeValue(ctx, r);
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue js_tt_params_size(JSContext *ctx, JSValueConst this_val)
+{
+    TTParams *ps = JS_GetOpaque2(ctx, this_val, tt_params_class_id);
+    if (!ps)
+        return JS_EXCEPTION;
+    return JS_NewInt32(ctx, ps->len);
+}
+
+static const JSCFunctionListEntry tt_params_proto_funcs[] = {
+    JS_CFUNC_DEF("get", 1, js_tt_params_get),
+    JS_CFUNC_DEF("getAll", 1, js_tt_params_get_all),
+    JS_CFUNC_DEF("has", 1, js_tt_params_has),
+    JS_CFUNC_DEF("set", 2, js_tt_params_set),
+    JS_CFUNC_DEF("append", 2, js_tt_params_append),
+    JS_CFUNC_DEF("delete", 1, js_tt_params_delete),
+    JS_CFUNC_DEF("toString", 0, js_tt_params_to_string),
+    JS_CFUNC_MAGIC_DEF("keys", 0, js_tt_params_iter, 0),
+    JS_CFUNC_MAGIC_DEF("values", 0, js_tt_params_iter, 1),
+    JS_CFUNC_MAGIC_DEF("entries", 0, js_tt_params_iter, 2),
+    JS_ALIAS_DEF("[Symbol.iterator]", "entries"),
+    JS_CFUNC_DEF("forEach", 1, js_tt_params_for_each),
+    JS_CGETSET_DEF("size", js_tt_params_size, NULL),
+};
+
+static JSValue tt_new_params(JSContext *ctx, TTParams *ps)
+{
+    JSValue obj = JS_NewObjectClass(ctx, tt_params_class_id);
+    if (JS_IsException(obj)) {
+        tt_params_free(ps);
+        return obj;
+    }
+    JS_SetOpaque(obj, ps);
+    return obj;
+}
+
+/* ---- URL ---- */
+typedef struct {
+    char *protocol; /* "https:" */
+    char *host;     /* "example.test:8080" */
+    char *pathname; /* "/x/y" */
+    char *hash;     /* "#frag" or "" */
+    JSValue sp;     /* the URLSearchParams instance */
+} TTURL;
+
+static JSClassID tt_url_class_id;
+
+static void tt_url_finalizer(JSRuntime *rt, JSValue val)
+{
+    TTURL *u = JS_GetOpaque(val, tt_url_class_id);
+    if (!u)
+        return;
+    free(u->protocol);
+    free(u->host);
+    free(u->pathname);
+    free(u->hash);
+    JS_FreeValueRT(rt, u->sp);
+    free(u);
+}
+
+static void tt_url_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
+{
+    TTURL *u = JS_GetOpaque(val, tt_url_class_id);
+    if (u)
+        JS_MarkValue(rt, u->sp, mark_func);
+}
+
+static JSClassDef tt_url_class = {
+    "URL",
+    .finalizer = tt_url_finalizer,
+    .gc_mark = tt_url_mark,
+};
+
+static int tt_is_abs_url(const char *s)
+{
+    const char *p = s;
+    if (!tt_isalpha_c((unsigned char)*p))
+        return 0;
+    p++;
+    while (tt_isalnum_c((unsigned char)*p) || *p == '+' || *p == '.' || *p == '-')
+        p++;
+    return *p == ':';
+}
+
+/* parse scheme://host[/path][?query][#hash] into a fresh TTURL (NULL if
+   invalid) — mirrors the setup-layer regex exactly */
+static TTURL *tt_url_parse(JSContext *ctx, const char *h)
+{
+    const char *p = h, *scheme_end, *host_start, *host_end;
+    const char *path_end, *q, *hash;
+    TTURL *u;
+
+    if (!tt_isalpha_c((unsigned char)*p))
+        return NULL;
+    p++;
+    while (tt_isalnum_c((unsigned char)*p) || *p == '+' || *p == '.' || *p == '-')
+        p++;
+    if (p[0] != ':' || p[1] != '/' || p[2] != '/')
+        return NULL;
+    scheme_end = p;
+    host_start = p + 3;
+    host_end = host_start;
+    while (*host_end && *host_end != '/' && *host_end != '?' && *host_end != '#')
+        host_end++;
+    path_end = host_end;
+    while (*path_end && *path_end != '?' && *path_end != '#')
+        path_end++;
+    q = NULL;
+    if (*path_end == '?') {
+        q = path_end;
+        while (*path_end && *path_end != '#')
+            path_end++;
+    }
+    hash = *path_end == '#' ? path_end : NULL;
+
+    u = calloc(1, sizeof(*u));
+    if (!u)
+        return NULL;
+    u->protocol = malloc((size_t)(scheme_end - h) + 2);
+    if (u->protocol) {
+        memcpy(u->protocol, h, (size_t)(scheme_end - h));
+        u->protocol[scheme_end - h] = ':';
+        u->protocol[scheme_end - h + 1] = 0;
+    }
+    u->host = malloc((size_t)(host_end - host_start) + 1);
+    if (u->host) {
+        memcpy(u->host, host_start, (size_t)(host_end - host_start));
+        u->host[host_end - host_start] = 0;
+    }
+    {
+        const char *ps = host_end;
+        const char *pe = q ? q : (hash ? hash : path_end);
+        if (hash && !q)
+            pe = hash;
+        if (pe == ps) {
+            u->pathname = strdup("/");
+        } else {
+            u->pathname = malloc((size_t)(pe - ps) + 1);
+            if (u->pathname) {
+                memcpy(u->pathname, ps, (size_t)(pe - ps));
+                u->pathname[pe - ps] = 0;
+            }
+        }
+    }
+    u->hash = hash ? strdup(hash) : strdup("");
+    {
+        TTParams *sp = calloc(1, sizeof(*sp));
+        if (sp && q) {
+            const char *qe = hash ? hash : q + strlen(q);
+            char *qs = malloc((size_t)(qe - q) + 1);
+            if (qs) {
+                memcpy(qs, q, (size_t)(qe - q));
+                qs[qe - q] = 0;
+                tt_params_parse(sp, qs);
+                free(qs);
+            }
+        }
+        u->sp = sp ? tt_new_params(ctx, sp) : JS_UNDEFINED;
+    }
+    if (!u->protocol || !u->host || !u->pathname || !u->hash) {
+        free(u->protocol);
+        free(u->host);
+        free(u->pathname);
+        free(u->hash);
+        JS_FreeValue(ctx, u->sp);
+        free(u);
+        return NULL;
+    }
+    return u;
+}
+
+static void tt_url_href(JSContext *ctx, DynBuf *b, TTURL *u)
+{
+    TTParams *sp = JS_GetOpaque(u->sp, tt_params_class_id);
+    dbuf_putstr(b, u->protocol);
+    dbuf_putstr(b, "//");
+    dbuf_putstr(b, u->host);
+    dbuf_putstr(b, u->pathname);
+    if (sp && sp->len) {
+        int i;
+        dbuf_putc(b, '?');
+        for (i = 0; i < sp->len; i++) {
+            if (i)
+                dbuf_putc(b, '&');
+            tt_form_encode(b, sp->keys[i]);
+            dbuf_putc(b, '=');
+            tt_form_encode(b, sp->vals[i]);
+        }
+    }
+    dbuf_putstr(b, u->hash);
+}
+
+/* resolve href (possibly relative) against base (may be NULL) — returns a
+   parsed TTURL or NULL */
+static TTURL *tt_url_resolve(JSContext *ctx, const char *href, TTURL *base)
+{
+    TTURL *u;
+    if (tt_is_abs_url(href) || !base)
+        return tt_url_parse(ctx, href);
+    {
+        DynBuf b;
+        char *joined;
+        js_dbuf_init(ctx, &b);
+        dbuf_putstr(&b, base->protocol);
+        dbuf_putstr(&b, "//");
+        dbuf_putstr(&b, base->host);
+        if (href[0] == '/') {
+            dbuf_putstr(&b, href);
+        } else {
+            const char *slash = strrchr(base->pathname, '/');
+            if (slash)
+                dbuf_put(&b, (const uint8_t *)base->pathname,
+                         (size_t)(slash - base->pathname) + 1);
+            else
+                dbuf_putc(&b, '/');
+            dbuf_putstr(&b, href);
+        }
+        dbuf_putc(&b, 0);
+        joined = (char *)b.buf;
+        u = tt_url_parse(ctx, joined);
+        dbuf_free(&b);
+    }
+    return u;
+}
+
+static JSValue tt_new_url_obj(JSContext *ctx, TTURL *u)
+{
+    JSValue obj = JS_NewObjectClass(ctx, tt_url_class_id);
+    if (JS_IsException(obj)) {
+        free(u->protocol);
+        free(u->host);
+        free(u->pathname);
+        free(u->hash);
+        JS_FreeValue(ctx, u->sp);
+        free(u);
+        return obj;
+    }
+    JS_SetOpaque(obj, u);
+    return obj;
+}
+
+static JSValue js_tt_url_ctor(JSContext *ctx, JSValueConst new_target,
+                              int argc, JSValueConst *argv)
+{
+    const char *href;
+    TTURL *base = NULL, *u;
+    char *base_owned = NULL;
+    (void)new_target;
+    href = JS_ToCString(ctx, argc >= 1 ? argv[0] : JS_UNDEFINED);
+    if (!href)
+        return JS_EXCEPTION;
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        base = JS_GetOpaque(argv[1], tt_url_class_id);
+        if (!base) {
+            const char *bs = JS_ToCString(ctx, argv[1]);
+            if (!bs) {
+                JS_FreeCString(ctx, href);
+                return JS_EXCEPTION;
+            }
+            base = tt_url_parse(ctx, bs);
+            JS_FreeCString(ctx, bs);
+            if (base)
+                base_owned = (char *)base; /* marker: we own it */
+            if (!base) {
+                JS_FreeCString(ctx, href);
+                return JS_ThrowTypeError(ctx, "Invalid base URL");
+            }
+        }
+    }
+    u = tt_url_resolve(ctx, href, base);
+    if (base_owned) {
+        TTURL *bo = (TTURL *)base_owned;
+        free(bo->protocol);
+        free(bo->host);
+        free(bo->pathname);
+        free(bo->hash);
+        JS_FreeValue(ctx, bo->sp);
+        free(bo);
+    }
+    if (!u) {
+        JSValue r = JS_ThrowTypeError(ctx, "Invalid URL: %s", href);
+        JS_FreeCString(ctx, href);
+        return r;
+    }
+    JS_FreeCString(ctx, href);
+    return tt_new_url_obj(ctx, u);
+}
+
+enum {
+    TT_URL_PROTOCOL, TT_URL_HOST, TT_URL_PATHNAME, TT_URL_HASH,
+    TT_URL_ORIGIN, TT_URL_HOSTNAME, TT_URL_PORT, TT_URL_HREF,
+    TT_URL_SEARCH, TT_URL_SEARCHPARAMS,
+};
+
+static JSValue js_tt_url_get(JSContext *ctx, JSValueConst this_val, int magic)
+{
+    TTURL *u = JS_GetOpaque2(ctx, this_val, tt_url_class_id);
+    if (!u)
+        return JS_EXCEPTION;
+    switch (magic) {
+    case TT_URL_PROTOCOL:
+        return JS_NewString(ctx, u->protocol);
+    case TT_URL_HOST:
+        return JS_NewString(ctx, u->host);
+    case TT_URL_PATHNAME:
+        return JS_NewString(ctx, u->pathname);
+    case TT_URL_HASH:
+        return JS_NewString(ctx, u->hash);
+    case TT_URL_ORIGIN: {
+        DynBuf b;
+        JSValue r;
+        js_dbuf_init(ctx, &b);
+        dbuf_putstr(&b, u->protocol);
+        dbuf_putstr(&b, "//");
+        dbuf_putstr(&b, u->host);
+        r = JS_NewStringLen(ctx, (const char *)b.buf, b.size);
+        dbuf_free(&b);
+        return r;
+    }
+    case TT_URL_HOSTNAME: {
+        const char *colon = strrchr(u->host, ':');
+        if (colon) {
+            const char *c2 = colon + 1;
+            int digits = *c2 != 0;
+            while (*c2) {
+                if (!tt_isdigit_c((unsigned char)*c2)) {
+                    digits = 0;
+                    break;
+                }
+                c2++;
+            }
+            if (digits)
+                return JS_NewStringLen(ctx, u->host, (size_t)(colon - u->host));
+        }
+        return JS_NewString(ctx, u->host);
+    }
+    case TT_URL_PORT: {
+        const char *colon = strchr(u->host, ':');
+        return colon ? JS_NewString(ctx, colon + 1) : JS_NewString(ctx, "");
+    }
+    case TT_URL_HREF: {
+        DynBuf b;
+        JSValue r;
+        js_dbuf_init(ctx, &b);
+        tt_url_href(ctx, &b, u);
+        r = JS_NewStringLen(ctx, (const char *)b.buf, b.size);
+        dbuf_free(&b);
+        return r;
+    }
+    case TT_URL_SEARCH: {
+        TTParams *sp = JS_GetOpaque(u->sp, tt_params_class_id);
+        DynBuf b;
+        JSValue r;
+        if (!sp || !sp->len)
+            return JS_NewString(ctx, "");
+        js_dbuf_init(ctx, &b);
+        dbuf_putc(&b, '?');
+        {
+            int i;
+            for (i = 0; i < sp->len; i++) {
+                if (i)
+                    dbuf_putc(&b, '&');
+                tt_form_encode(&b, sp->keys[i]);
+                dbuf_putc(&b, '=');
+                tt_form_encode(&b, sp->vals[i]);
+            }
+        }
+        r = JS_NewStringLen(ctx, (const char *)b.buf, b.size);
+        dbuf_free(&b);
+        return r;
+    }
+    case TT_URL_SEARCHPARAMS:
+        return JS_DupValue(ctx, u->sp);
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue js_tt_url_set(JSContext *ctx, JSValueConst this_val,
+                             JSValueConst val, int magic)
+{
+    TTURL *u = JS_GetOpaque2(ctx, this_val, tt_url_class_id);
+    const char *s;
+    if (!u)
+        return JS_EXCEPTION;
+    s = JS_ToCString(ctx, val);
+    if (!s)
+        return JS_EXCEPTION;
+    switch (magic) {
+    case TT_URL_PROTOCOL: {
+        char *ns = strdup(s);
+        if (ns) {
+            free(u->protocol);
+            u->protocol = ns;
+        }
+        break;
+    }
+    case TT_URL_HOST: {
+        char *ns = strdup(s);
+        if (ns) {
+            free(u->host);
+            u->host = ns;
+        }
+        break;
+    }
+    case TT_URL_PATHNAME: {
+        char *ns = strdup(s);
+        if (ns) {
+            free(u->pathname);
+            u->pathname = ns;
+        }
+        break;
+    }
+    case TT_URL_HASH: {
+        char *ns = strdup(s);
+        if (ns) {
+            free(u->hash);
+            u->hash = ns;
+        }
+        break;
+    }
+    case TT_URL_SEARCH: {
+        TTParams *nsp = calloc(1, sizeof(*nsp));
+        if (nsp) {
+            JSValue spv;
+            tt_params_parse(nsp, s);
+            spv = tt_new_params(ctx, nsp);
+            if (!JS_IsException(spv)) {
+                JS_FreeValue(ctx, u->sp);
+                u->sp = spv;
+            }
+        }
+        break;
+    }
+    case TT_URL_HREF: {
+        TTURL *nu = tt_url_parse(ctx, s);
+        if (!nu) {
+            JS_FreeCString(ctx, s);
+            return JS_ThrowTypeError(ctx, "Invalid URL");
+        }
+        free(u->protocol);
+        free(u->host);
+        free(u->pathname);
+        free(u->hash);
+        JS_FreeValue(ctx, u->sp);
+        u->protocol = nu->protocol;
+        u->host = nu->host;
+        u->pathname = nu->pathname;
+        u->hash = nu->hash;
+        u->sp = nu->sp;
+        free(nu);
+        break;
+    }
+    }
+    JS_FreeCString(ctx, s);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_tt_url_to_string(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    (void)argc;
+    (void)argv;
+    return js_tt_url_get(ctx, this_val, TT_URL_HREF);
+}
+
+static const JSCFunctionListEntry tt_url_proto_funcs[] = {
+    JS_CGETSET_MAGIC_DEF("protocol", js_tt_url_get, js_tt_url_set, TT_URL_PROTOCOL),
+    JS_CGETSET_MAGIC_DEF("host", js_tt_url_get, js_tt_url_set, TT_URL_HOST),
+    JS_CGETSET_MAGIC_DEF("pathname", js_tt_url_get, js_tt_url_set, TT_URL_PATHNAME),
+    JS_CGETSET_MAGIC_DEF("hash", js_tt_url_get, js_tt_url_set, TT_URL_HASH),
+    JS_CGETSET_MAGIC_DEF("origin", js_tt_url_get, NULL, TT_URL_ORIGIN),
+    JS_CGETSET_MAGIC_DEF("hostname", js_tt_url_get, NULL, TT_URL_HOSTNAME),
+    JS_CGETSET_MAGIC_DEF("port", js_tt_url_get, NULL, TT_URL_PORT),
+    JS_CGETSET_MAGIC_DEF("href", js_tt_url_get, js_tt_url_set, TT_URL_HREF),
+    JS_CGETSET_MAGIC_DEF("search", js_tt_url_get, js_tt_url_set, TT_URL_SEARCH),
+    JS_CGETSET_MAGIC_DEF("searchParams", js_tt_url_get, NULL, TT_URL_SEARCHPARAMS),
+    JS_CFUNC_DEF("toString", 0, js_tt_url_to_string),
+    JS_CFUNC_DEF("toJSON", 0, js_tt_url_to_string),
+};
+
+/* ---- location ---- */
+static JSValue g_location_url; /* a URL instance (C-held root) */
+
+static TTURL *tt_loc(JSContext *ctx)
+{
+    (void)ctx;
+    return JS_GetOpaque(g_location_url, tt_url_class_id);
+}
+
+static JSValue js_tt_loc_get(JSContext *ctx, JSValueConst this_val, int magic)
+{
+    (void)this_val;
+    if (JS_VALUE_GET_TAG(g_location_url) != JS_TAG_OBJECT)
+        return JS_UNDEFINED;
+    return js_tt_url_get(ctx, g_location_url, magic);
+}
+
+static JSValue js_tt_loc_set(JSContext *ctx, JSValueConst this_val,
+                             JSValueConst val, int magic)
+{
+    TTURL *u = tt_loc(ctx);
+    (void)this_val;
+    if (!u)
+        return JS_UNDEFINED;
+    if (magic == TT_URL_HREF) {
+        const char *s = JS_ToCString(ctx, val);
+        TTURL *nu;
+        if (!s)
+            return JS_EXCEPTION;
+        nu = tt_url_resolve(ctx, s, u);
+        JS_FreeCString(ctx, s);
+        if (!nu)
+            return JS_ThrowTypeError(ctx, "Invalid URL");
+        {
+            JSValue obj = tt_new_url_obj(ctx, nu);
+            if (!JS_IsException(obj)) {
+                JS_FreeValue(ctx, g_location_url);
+                g_location_url = obj;
+            }
+        }
+        return JS_UNDEFINED;
+    }
+    if (magic == TT_URL_HASH) {
+        const char *s = JS_ToCString(ctx, val);
+        char *ns;
+        if (!s)
+            return JS_EXCEPTION;
+        if (s[0] && s[0] != '#') {
+            ns = malloc(strlen(s) + 2);
+            if (ns) {
+                ns[0] = '#';
+                strcpy(ns + 1, s);
+            }
+        } else {
+            ns = strdup(s);
+        }
+        JS_FreeCString(ctx, s);
+        if (ns) {
+            free(u->hash);
+            u->hash = ns;
+        }
+        return JS_UNDEFINED;
+    }
+    return js_tt_url_set(ctx, g_location_url, val, magic);
+}
+
+static JSValue js_tt_loc_navigate(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv)
+{
+    return js_tt_loc_set(ctx, this_val,
+                         argc >= 1 ? argv[0] : JS_UNDEFINED, TT_URL_HREF);
+}
+
+static JSValue js_tt_loc_reload(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv)
+{
+    (void)ctx;
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    return JS_UNDEFINED;
+}
+
+static JSValue js_tt_loc_param_reads(JSContext *ctx, JSValueConst this_val)
+{
+    (void)this_val;
+    return tt_strset_to_array(ctx, &g_param_reads);
+}
+
+static const JSCFunctionListEntry tt_loc_funcs[] = {
+    JS_CGETSET_MAGIC_DEF("href", js_tt_loc_get, js_tt_loc_set, TT_URL_HREF),
+    JS_CGETSET_MAGIC_DEF("origin", js_tt_loc_get, NULL, TT_URL_ORIGIN),
+    JS_CGETSET_MAGIC_DEF("protocol", js_tt_loc_get, NULL, TT_URL_PROTOCOL),
+    JS_CGETSET_MAGIC_DEF("host", js_tt_loc_get, NULL, TT_URL_HOST),
+    JS_CGETSET_MAGIC_DEF("hostname", js_tt_loc_get, NULL, TT_URL_HOSTNAME),
+    JS_CGETSET_MAGIC_DEF("port", js_tt_loc_get, NULL, TT_URL_PORT),
+    JS_CGETSET_MAGIC_DEF("pathname", js_tt_loc_get, js_tt_loc_set, TT_URL_PATHNAME),
+    JS_CGETSET_MAGIC_DEF("search", js_tt_loc_get, js_tt_loc_set, TT_URL_SEARCH),
+    JS_CGETSET_MAGIC_DEF("hash", js_tt_loc_get, js_tt_loc_set, TT_URL_HASH),
+    JS_CFUNC_DEF("assign", 1, js_tt_loc_navigate),
+    JS_CFUNC_DEF("replace", 1, js_tt_loc_navigate),
+    JS_CFUNC_DEF("reload", 0, js_tt_loc_reload),
+    JS_CGETSET_DEF("__paramReads", js_tt_loc_param_reads, NULL),
+};
+
+static JSValue js_tt_loc_to_string(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    (void)argc;
+    (void)argv;
+    return js_tt_loc_get(ctx, this_val, TT_URL_HREF);
+}
+
+static void tt_web_register(JSContext *ctx)
+{
+    JSValue glob = JS_GetGlobalObject(ctx);
+    JSValue proto, ctor, loc;
+
+    if (!JS_IsRegisteredClass(ctx->rt, tt_storage_class_id)) {
+        JS_NewClassID(&tt_storage_class_id);
+        JS_NewClass(ctx->rt, tt_storage_class_id, &tt_storage_class);
+    }
+    if (!JS_IsRegisteredClass(ctx->rt, tt_params_class_id)) {
+        JS_NewClassID(&tt_params_class_id);
+        JS_NewClass(ctx->rt, tt_params_class_id, &tt_params_class);
+    }
+    if (!JS_IsRegisteredClass(ctx->rt, tt_url_class_id)) {
+        JS_NewClassID(&tt_url_class_id);
+        JS_NewClass(ctx->rt, tt_url_class_id, &tt_url_class);
+    }
+
+    proto = JS_NewObject(ctx);
+    JS_SetPropertyFunctionList(ctx, proto, tt_storage_proto_funcs,
+                               sizeof(tt_storage_proto_funcs) / sizeof(tt_storage_proto_funcs[0]));
+    JS_SetClassProto(ctx, tt_storage_class_id, proto);
+
+    proto = JS_NewObject(ctx);
+    JS_SetPropertyFunctionList(ctx, proto, tt_params_proto_funcs,
+                               sizeof(tt_params_proto_funcs) / sizeof(tt_params_proto_funcs[0]));
+    JS_SetClassProto(ctx, tt_params_class_id, proto);
+    ctor = JS_NewCFunction2(ctx, js_tt_params_ctor, "URLSearchParams", 1,
+                            JS_CFUNC_constructor, 0);
+    JS_SetConstructor(ctx, ctor, proto);
+    JS_SetPropertyStr(ctx, glob, "URLSearchParams", ctor);
+
+    proto = JS_NewObject(ctx);
+    JS_SetPropertyFunctionList(ctx, proto, tt_url_proto_funcs,
+                               sizeof(tt_url_proto_funcs) / sizeof(tt_url_proto_funcs[0]));
+    JS_SetClassProto(ctx, tt_url_class_id, proto);
+    ctor = JS_NewCFunction2(ctx, js_tt_url_ctor, "URL", 1,
+                            JS_CFUNC_constructor, 0);
+    JS_SetConstructor(ctx, ctor, proto);
+    JS_SetPropertyStr(ctx, glob, "URL", ctor);
+
+    {
+        TTURL *u = tt_url_parse(ctx, "https://example.test/");
+        g_location_url = u ? tt_new_url_obj(ctx, u) : JS_UNDEFINED;
+    }
+    loc = JS_NewObject(ctx);
+    JS_SetPropertyFunctionList(ctx, loc, tt_loc_funcs,
+                               sizeof(tt_loc_funcs) / sizeof(tt_loc_funcs[0]));
+    JS_SetPropertyStr(ctx, loc, "toString",
+                      JS_NewCFunction(ctx, js_tt_loc_to_string, "toString", 0));
+    JS_SetPropertyStr(ctx, glob, "location", loc);
+
+    JS_SetPropertyStr(ctx, glob, "localStorage", tt_new_storage(ctx));
+    JS_SetPropertyStr(ctx, glob, "sessionStorage", tt_new_storage(ctx));
+    JS_FreeValue(ctx, glob);
+}
+
 /* register console/timers/performance/queueMicrotask on a fresh context */
 static void tt_register_substrate(JSContext *ctx)
 {
@@ -66624,6 +67973,7 @@ static void tt_register_substrate(JSContext *ctx)
         JS_SetPropertyStr(ctx, glob, "performance", perf);
     }
     JS_FreeValue(ctx, glob);
+    tt_web_register(ctx);
 }
 
 /* Send { stack, frames, globals, dom? } for the paused position. */
@@ -66778,7 +68128,6 @@ static int eval_setup_slot(int slot)
         return 1;
     }
     g_dom_build_fn = JS_GetPropertyStr(g_ctx, setup, "buildDOM");
-    g_set_url_fn = JS_GetPropertyStr(g_ctx, setup, "setURL");
     JS_FreeValue(g_ctx, setup);
     /* everything user-visible is registered now — snapshot the baseline
        for user-global diffing */
@@ -66818,7 +68167,7 @@ EXPORT("tt_init") int tt_init(void)
     if (!g_ctx)
         return 2;
 
-    g_dom_build_fn = g_set_url_fn = JS_UNDEFINED;
+    g_dom_build_fn = JS_UNDEFINED;
     tt_dom_register(g_ctx);
     tt_register_substrate(g_ctx);
 
@@ -67074,7 +68423,9 @@ EXPORT("tt_eval_idle") void tt_eval_idle(void)
 EXPORT("tt_reset") int tt_reset(void)
 {
     JS_FreeValue(g_ctx, g_dom_build_fn);
-    JS_FreeValue(g_ctx, g_set_url_fn);
+    JS_FreeValue(g_ctx, g_location_url);
+    g_location_url = JS_UNDEFINED;
+    tt_strset_clear(&g_param_reads);
     tt_timers_clear(g_ctx);
     tt_baseline_clear();
     JS_TTCmpClear(g_rt);
@@ -67088,7 +68439,7 @@ EXPORT("tt_reset") int tt_reset(void)
     g_exec_kind = TT_EXEC_SCRIPT;
     g_timer_fn = JS_UNDEFINED; /* abandoned parked-timer state, if any */
     g_timer_alen = 0;
-    g_dom_build_fn = g_set_url_fn = JS_UNDEFINED;
+    g_dom_build_fn = JS_UNDEFINED;
     tt_dom_register(g_ctx);
     tt_register_substrate(g_ctx);
     if (eval_setup_slot(0))
@@ -67152,15 +68503,24 @@ EXPORT("tt_cmp_json") char *tt_cmp_json(void)
    parameters off this. Returns 0 on success, 1 for an unparsable URL. */
 EXPORT("tt_set_url") int tt_set_url(const char *href, int len)
 {
-    JSValue s, r;
-    s = JS_NewStringLen(g_ctx, href, (size_t)len);
-    r = JS_Call(g_ctx, g_set_url_fn, JS_UNDEFINED, 1, &s);
-    JS_FreeValue(g_ctx, s);
-    if (JS_IsException(r)) {
+    char *h = malloc((size_t)len + 1);
+    TTURL *u;
+    JSValue obj;
+    if (!h)
+        return 1;
+    memcpy(h, href, (size_t)len);
+    h[len] = 0;
+    u = tt_url_parse(g_ctx, h);
+    free(h);
+    if (!u)
+        return 1;
+    obj = tt_new_url_obj(g_ctx, u);
+    if (JS_IsException(obj)) {
         JS_FreeValue(g_ctx, JS_GetException(g_ctx));
         return 1;
     }
-    JS_FreeValue(g_ctx, r);
+    JS_FreeValue(g_ctx, g_location_url);
+    g_location_url = obj;
     return 0;
 }
 

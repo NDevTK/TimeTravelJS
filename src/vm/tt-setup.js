@@ -350,119 +350,6 @@
     dp(TTPromise, 'race', function (it) { return OrigPromise.race.call(this, toArr(it)); }, 1);
     dp(TTPromise, 'any', function (it) { return OrigPromise.any.call(this, toArr(it)); }, 1);
   })();
-  /* ---- web-platform substrate: URL, location, storage -----------------
-     Self-hosted IN the machine so it snapshots, scrubs and forks with
-     everything else. Read registries record which URL parameters and
-     storage keys the program actually consulted — the raw material for
-     the engine's parameter search. */
-  const paramReads = new Set();
-  function parseSearch(qs) {
-    const out = [];
-    const s = String(qs == null ? '' : qs).replace(/^\?/, '');
-    if (s) for (const part of s.split('&')) {
-      if (!part) continue;
-      const i = part.indexOf('=');
-      const k = i < 0 ? part : part.slice(0, i);
-      const v = i < 0 ? '' : part.slice(i + 1);
-      out.push([decodeURIComponent(k.replace(/\+/g, ' ')), decodeURIComponent(v.replace(/\+/g, ' '))]);
-    }
-    return out;
-  }
-  class URLSearchParams {
-    constructor(init) {
-      this.__l = typeof init === 'string' ? parseSearch(init)
-        : init instanceof URLSearchParams ? init.__l.map((e) => e.slice())
-        : Array.isArray(init) ? init.map((e) => [String(e[0]), String(e[1])])
-        : init && typeof init === 'object' ? Object.keys(init).map((k) => [k, String(init[k])])
-        : [];
-    }
-    get(k) { paramReads.add(String(k)); const e = this.__l.find((x) => x[0] === String(k)); return e ? e[1] : null; }
-    getAll(k) { paramReads.add(String(k)); return this.__l.filter((x) => x[0] === String(k)).map((x) => x[1]); }
-    has(k) { paramReads.add(String(k)); return this.__l.some((x) => x[0] === String(k)); }
-    set(k, v) { const l = this.__l.filter((x) => x[0] !== String(k)); l.push([String(k), String(v)]); this.__l = l; }
-    append(k, v) { this.__l.push([String(k), String(v)]); }
-    delete(k) { this.__l = this.__l.filter((x) => x[0] !== String(k)); }
-    forEach(fn, self) { for (const e of this.__l.slice()) fn.call(self, e[1], e[0], this); }
-    keys() { return this.__l.map((e) => e[0])[Symbol.iterator](); }
-    values() { return this.__l.map((e) => e[1])[Symbol.iterator](); }
-    entries() { return this.__l.map((e) => e.slice())[Symbol.iterator](); }
-    [Symbol.iterator]() { return this.entries(); }
-    get size() { return this.__l.length; }
-    toString() {
-      return this.__l.map((e) => encodeURIComponent(e[0]) + '=' + encodeURIComponent(e[1])).join('&');
-    }
-  }
-  class URL {
-    constructor(href, base) {
-      let h = String(href);
-      if (base != null && !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(h)) {
-        const b = base instanceof URL ? base : new URL(String(base));
-        h = h.startsWith('/') ? b.origin + h
-          : b.origin + b.pathname.replace(/[^/]*$/, '') + h;
-      }
-      const m = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/.exec(h);
-      if (!m) throw new TypeError('Invalid URL: ' + h);
-      this.protocol = m[1] + ':';
-      this.host = m[2];
-      this.pathname = m[3] || '/';
-      this.hash = m[5] || '';
-      this.__sp = new URLSearchParams(m[4] || '');
-    }
-    get searchParams() { return this.__sp; }
-    get search() { const q = this.__sp.toString(); return q ? '?' + q : ''; }
-    set search(v) { this.__sp = new URLSearchParams(String(v)); }
-    get origin() { return this.protocol + '//' + this.host; }
-    get hostname() { return this.host.replace(/:\d+$/, ''); }
-    get port() { const i = this.host.indexOf(':'); return i < 0 ? '' : this.host.slice(i + 1); }
-    get href() { return this.origin + this.pathname + this.search + this.hash; }
-    set href(v) {
-      const u = new URL(String(v));
-      this.protocol = u.protocol; this.host = u.host; this.pathname = u.pathname;
-      this.hash = u.hash; this.__sp = u.__sp;
-    }
-    toString() { return this.href; }
-    toJSON() { return this.href; }
-  }
-  const loc = { u: new URL('https://example.test/') };
-  class Location {
-    get href() { return loc.u.href; }
-    set href(v) { loc.u = new URL(String(v), loc.u); }
-    get origin() { return loc.u.origin; }
-    get protocol() { return loc.u.protocol; }
-    get host() { return loc.u.host; }
-    get hostname() { return loc.u.hostname; }
-    get port() { return loc.u.port; }
-    get pathname() { return loc.u.pathname; }
-    set pathname(v) { loc.u.pathname = String(v); }
-    get search() { return loc.u.search; }
-    set search(v) { loc.u.search = String(v); }
-    get hash() { return loc.u.hash; }
-    set hash(v) { const s = String(v); loc.u.hash = !s || s.startsWith('#') ? s : '#' + s; }
-    assign(v) { this.href = v; }
-    replace(v) { this.href = v; }
-    reload() {}
-    toString() { return this.href; }
-    get __paramReads() { return Array.from(paramReads); }
-  }
-  function makeStorage() {
-    const m = new Map();
-    const reads = new Set();
-    return {
-      getItem(k) { reads.add(String(k)); return m.has(String(k)) ? m.get(String(k)) : null; },
-      setItem(k, v) { m.set(String(k), String(v)); },
-      removeItem(k) { m.delete(String(k)); },
-      clear() { m.clear(); },
-      key(i) { const a = Array.from(m.keys()); return i >= 0 && i < a.length ? a[i] : null; },
-      get length() { return m.size; },
-      get __reads() { return Array.from(reads); },
-      get __keys() { return Array.from(m.keys()); },
-    };
-  }
-  G.URL = URL; G.URLSearchParams = URLSearchParams;
-  G.location = new Location();
-  G.localStorage = makeStorage();
-  G.sessionStorage = makeStorage();
-  function setURL(href) { loc.u = new URL(String(href)); }
   /* ---- postMessage: an external input channel -------------------------
      Messages queue in-machine and every handler sees every message
      exactly once — so a message posted at a fork anchor (before the
@@ -477,7 +364,7 @@
     for (const h of msgHandlers)
       while (h.seen < msgs.length) {
         const data = msgs[h.seen++];
-        h.fn.call(G, { type: 'message', data: data, origin: loc.u.origin, source: null, lastEventId: '', ports: [] });
+        h.fn.call(G, { type: 'message', data: data, origin: G.location.origin, source: null, lastEventId: '', ports: [] });
       }
   }
   G.postMessage = function (data) { msgs.push(data); msgFlush(); };
@@ -827,5 +714,5 @@
       return out;
     };
   }
-  return { buildDOM: buildDOM, setURL: setURL };
+  return { buildDOM: buildDOM };
 })()
