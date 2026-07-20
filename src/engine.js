@@ -739,23 +739,26 @@ export class TimeTravelEngine {
       const msg = fetch(`JSON.stringify(typeof __messageStats === "function" ? __messageStats() : null)`)
       if (msg && msg.handlers > 0 && msg.posted === 0)
         push(`postMessage("ttprobe0"); postMessage(__msgProbe("ttprobe0"))`)
-      // shared state: storage keys the program actually consulted, with
-      // values LEARNED from the run itself — the comparison journal holds
-      // what each read was tested against ("plain" === "fancy" teaches
-      // "fancy"), so suggestions are values the code demonstrably reacts to
-      const storKeys = fetch(`JSON.stringify(localStorage.__reads.slice(0, 6))`) ?? []
-      if (storKeys.length) {
-        const journal = this.comparisons()
+      // shared state: storage keys the program actually consulted (each
+      // storage object keeps its own read registry), with values LEARNED
+      // from the run itself — the comparison journal holds what each read
+      // was tested against ("plain" === "fancy" teaches "fancy"), so
+      // suggestions are values the code demonstrably reacts to
+      let journal = null
+      for (const store of ["localStorage", "sessionStorage"]) {
+        const storKeys = fetch(`JSON.stringify(${store}.__reads.slice(0, 6))`) ?? []
+        if (!storKeys.length) continue
+        journal ??= this.comparisons()
         for (const k of storKeys) {
-          const asRun = fetch(`JSON.stringify(localStorage.getItem(${JSON.stringify(k)}))`)
+          const asRun = fetch(`JSON.stringify(${store}.getItem(${JSON.stringify(k)}))`)
           const attributed = journal.filter((e) => e.a === asRun || e.b === asRun).map((e) => (e.a === asRun ? e.b : e.a))
           const pool = attributed.length ? attributed : journal.flatMap((e) => [e.a, e.b])
           const vals = [...new Set(pool)]
             .filter((v) => v.length >= 1 && v.length <= 32 && v !== asRun && !storKeys.includes(v))
             .slice(0, 3)
-          for (const v of vals) push(`localStorage.setItem(${JSON.stringify(k)}, ${JSON.stringify(v)})`)
+          for (const v of vals) push(`${store}.setItem(${JSON.stringify(k)}, ${JSON.stringify(v)})`)
         }
-        for (const k of storKeys) push(`localStorage.removeItem(${JSON.stringify(k)})`)
+        for (const k of storKeys) push(`${store}.removeItem(${JSON.stringify(k)})`)
       }
       // structure last
       for (const id of ids) push(`${q(id)}.remove()`)
@@ -962,12 +965,20 @@ export class TimeTravelEngine {
    * "pref:<canary>" → "pref:gold". Message probes deliver a recording
    * payload whose property reads return marked strings, so object
    * protocols reveal their keys ({type:"sync"}, then {type:"sync",
-   * mode:"fast"}) the same way. The debugger also learns from unused
-   * logic: inputs whose handlers never fired as-run are probed first,
-   * children of runs that executed lines the original recording never
-   * reached explore first, and `unlocked` reports which inputs woke
-   * dormant code. Every example is execution-verified and jumpable via
-   * switchTo(example.branch, example.firstTrue).
+   * mode:"fast"}) the same way. Attribution is case-insensitive — a
+   * program that upper/lower-cases its input before comparing still
+   * carries the canary, and the learned constant is emitted in both its
+   * literal and lower-case spellings so the goal picks the raw form it
+   * needs. The input set itself is dynamic: registries are re-read at
+   * every fork's end, so a storage key or message handler consulted only
+   * inside a branch some candidate unlocked joins the search mid-flight,
+   * with the unlocking assignments re-applied as context for all its own
+   * candidates. The debugger also learns from unused logic: inputs whose
+   * handlers never fired as-run are probed first, children of runs that
+   * executed lines the original recording never reached explore first,
+   * and `unlocked` reports which inputs woke dormant code. Every example
+   * is execution-verified and jumpable via switchTo(example.branch,
+   * example.firstTrue).
    */
   async exploreParams({
     goal,
@@ -1008,12 +1019,12 @@ export class TimeTravelEngine {
     // ---- inputs: every external channel the program demonstrably consulted
     const observed = fetch(`JSON.stringify(location.__paramReads.slice(0, 12))`) ?? []
     const baseSearch = fetch(`JSON.stringify(location.search)`) ?? ""
-    const storKeys = fetch(`JSON.stringify(localStorage.__reads.slice(0, 6))`) ?? []
     const msgStats = fetch(`JSON.stringify(typeof __messageStats === "function" ? __messageStats() : null)`)
     const inputs = []
     for (const k of (params ?? observed).slice(0, 8)) inputs.push({ kind: "param", key: k })
     if (!params) {
-      for (const k of storKeys) inputs.push({ kind: "storage", key: k })
+      for (const store of ["localStorage", "sessionStorage"])
+        for (const k of fetch(`JSON.stringify(${store}.__reads.slice(0, 6))`) ?? []) inputs.push({ kind: "storage", key: k, store })
       if (msgStats && msgStats.handlers > 0) inputs.push({ kind: "message", key: null, neverFired: msgStats.posted === 0 })
     }
     if (!inputs.length) {
@@ -1028,7 +1039,7 @@ export class TimeTravelEngine {
         inp.kind === "param"
           ? fetch(`JSON.stringify(new URLSearchParams(location.search).get(${JSON.stringify(inp.key)}))`)
           : inp.kind === "storage"
-            ? fetch(`JSON.stringify(localStorage.getItem(${JSON.stringify(inp.key)}))`)
+            ? fetch(`JSON.stringify(${inp.store}.getItem(${JSON.stringify(inp.key)}))`)
             : null
     }
     // the base run's own journal seeds round 0 for free: everything the
@@ -1042,15 +1053,18 @@ export class TimeTravelEngine {
     while (anchor < len - 1 && !this._entryAt(anchor)?.entry) anchor++
     if (!this._entryAt(anchor)?.entry) throw new Error("no parked step to fork from")
 
-    const searchWith = (overrides) => {
-      const pairs = []
+    const basePairs = []
+    {
       const qs = String(baseSearch).replace(/^\?/, "")
       if (qs)
         for (const part of qs.split("&")) {
           if (!part) continue
           const i = part.indexOf("=")
-          pairs.push([decodeURIComponent(i < 0 ? part : part.slice(0, i)), i < 0 ? "" : decodeURIComponent(part.slice(i + 1))])
+          basePairs.push([decodeURIComponent(i < 0 ? part : part.slice(0, i)), i < 0 ? "" : decodeURIComponent(part.slice(i + 1))])
         }
+    }
+    const searchWith = (overrides) => {
+      const pairs = basePairs.map((p) => p.slice())
       for (const [k, v] of overrides) {
         const at = pairs.findIndex((p) => p[0] === k)
         if (at >= 0) pairs[at] = [k, v]
@@ -1067,7 +1081,7 @@ export class TimeTravelEngine {
       const paramPairs = assignments.filter((a) => a.kind === "param").map((a) => [a.key, a.value])
       if (paramPairs.length) parts.push(`location.search = ${JSON.stringify(searchWith(paramPairs))}`)
       for (const a of assignments) {
-        if (a.kind === "storage") parts.push(`localStorage.setItem(${JSON.stringify(a.key)}, ${JSON.stringify(a.value)})`)
+        if (a.kind === "storage") parts.push(`${a.store ?? "localStorage"}.setItem(${JSON.stringify(a.key)}, ${JSON.stringify(a.value)})`)
         else if (a.kind === "message") {
           if (a.probe) parts.push(`postMessage(${JSON.stringify(a.marker)}); postMessage(__msgProbe(${JSON.stringify(a.marker)}))`)
           else if (a.oprobe) parts.push(`postMessage(__msgProbe(${JSON.stringify(a.marker)}, ${a.overrides}))`)
@@ -1084,6 +1098,9 @@ export class TimeTravelEngine {
     const learned = []
     const learnedSeen = new Set()
     const tried = inputs.map(() => new Set())
+    const MAXI = 12
+    const inputKeyOf = (x) => x.kind + "\0" + (x.key ?? "") + "\0" + (x.store ?? "")
+    const known = new Set(inputs.map(inputKeyOf))
     let explored = 0
     let budgetHit = false
     let round = 0
@@ -1106,6 +1123,7 @@ export class TimeTravelEngine {
         assignments: assignments.map((a) => ({
           kind: a.kind,
           key: a.key ?? null,
+          ...(a.store ? { store: a.store } : {}),
           value: a.kind === "message" && a.probe ? "(probe)" : a.kind === "message" && a.oprobe ? `(probe ${a.overrides})` : a.value,
           via: a.via ?? [],
         })),
@@ -1129,9 +1147,47 @@ export class TimeTravelEngine {
         rec.firstTrue = scan.hits.length ? scan.hits[0].pos : null
         examples.push(rec)
       }
+      // dynamic discovery: an alternate run may consult inputs the original
+      // recording never touched — a read sitting behind the very branch this
+      // candidate unlocked. Re-read the registries at this fork's end and
+      // let every new channel join the search, carrying the assignments
+      // that revealed it as required context for all its own candidates.
+      const fresh = []
+      if (wantJournal && inputs.length < MAXI) {
+        const seen = (fetch(`JSON.stringify(location.__paramReads.slice(0, 12))`) ?? []).map((k) => ({ kind: "param", key: k }))
+        for (const store of ["localStorage", "sessionStorage"])
+          for (const k of fetch(`JSON.stringify(${store}.__reads.slice(0, 8))`) ?? []) seen.push({ kind: "storage", key: k, store })
+        const ms = fetch(`JSON.stringify(typeof __messageStats === "function" ? __messageStats() : null)`)
+        if (ms && ms.handlers > 0) seen.push({ kind: "message", key: null, neverFired: ms.posted === 0 })
+        for (const cand of seen) {
+          if (inputs.length >= MAXI) break
+          if (cand.key != null && /ttc\d+z/i.test(cand.key)) continue // our own canary echoed back as a key
+          const ik = inputKeyOf(cand)
+          if (known.has(ik)) continue
+          known.add(ik)
+          cand.discovered = true
+          cand.under = edit
+          cand.ctx = assignments.map((a) => ({
+            kind: a.kind,
+            key: a.key ?? null,
+            store: a.store ?? null,
+            value: a.value,
+            probe: !!a.probe,
+            oprobe: !!a.oprobe,
+            overrides: a.overrides ?? null,
+            marker: a.marker ?? null,
+          }))
+          cand.asRun = cand.kind === "param" ? (basePairs.find((p) => p[0] === cand.key)?.[1] ?? null) : null
+          const idx = inputs.length
+          inputs.push(cand)
+          tried.push(new Set())
+          if (cand.asRun != null) tried[idx].add(String(cand.asRun))
+          fresh.push(idx)
+        }
+      }
       const journal = wantJournal && !g.ok ? this.comparisons() : []
       if (onProgress) onProgress({ explored, found: examples.length, round })
-      return { rec, journal }
+      return { rec, journal, fresh }
     }
 
     // ---- concolic derivation: a node is a candidate value for one input,
@@ -1158,10 +1214,10 @@ export class TimeTravelEngine {
         seenKid.add(value)
         const via = [...node.via, ...viaAdd].slice(-8)
         kids.push({ i: node.i, value, marker, via })
-        const lk = inp.kind + " " + (inp.key ?? "") + " " + value
+        const lk = inp.kind + "\0" + (inp.key ?? "") + "\0" + (inp.store ?? "") + "\0" + value
         if (!learnedSeen.has(lk)) {
           learnedSeen.add(lk)
-          learned.push({ input: { kind: inp.kind, key: inp.key ?? null }, value, via })
+          learned.push({ input: { kind: inp.kind, key: inp.key ?? null, ...(inp.store ? { store: inp.store } : {}) }, value, via })
         }
       }
       const emitGeneric = (raw, marker, viaEnt) => {
@@ -1178,38 +1234,58 @@ export class TimeTravelEngine {
           }
         }
       }
-      // rewrite the marker region of `inj` to satisfy `side op other`
-      const rewrite = (op, side, other) => {
-        const ci = side.indexOf(m)
+      // rewrite the marker region of `inj` to satisfy `side op other`. When
+      // the side carries the canary in a different case, the program
+      // normalized case before comparing — so the constant it compared
+      // against is normalized too, and the raw input that produces it is
+      // likely its lower-case spelling: emit both variants and let
+      // execution decide which one the goal actually needs.
+      const mLow = m.toLowerCase()
+      const rewrite = (op, side, other, folded) => {
+        const ci = side.toLowerCase().indexOf(mLow)
         const P = side.slice(0, ci)
         const S = side.slice(ci + m.length)
+        const out = []
+        const variants = (learned) => (folded && learned.toLowerCase() !== learned ? [learned, learned.toLowerCase()] : [learned])
         if (op === "eq") {
           const X =
             other.startsWith(P) && other.endsWith(S) && other.length >= P.length + S.length
               ? other.slice(P.length, other.length - S.length)
               : other
-          return [inj.replace(m, X), X.length ? X : null, { op: "eq", learned: X }]
+          for (const v of variants(X))
+            out.push([inj.replace(m, v), v.length ? v : null, v === X ? { op: "eq", learned: X } : { op: "eq", learned: X, folded: v }])
+          return out
         }
-        if (!other.length) return null
+        if (!other.length) return out
         if (op === "startsWith") {
           const need = other.startsWith(P) ? other.slice(P.length) : other
-          return need.length ? [inj.replace(m, need + m), m, { op: "startsWith", learned: other }] : null
+          for (const v of variants(need))
+            if (v.length)
+              out.push([inj.replace(m, v + m), m, v === need ? { op: "startsWith", learned: other } : { op: "startsWith", learned: other, folded: v }])
+          return out
         }
         if (op === "endsWith") {
           const need = other.endsWith(S) ? other.slice(0, other.length - S.length) : other
-          return need.length ? [inj.replace(m, m + need), m, { op: "endsWith", learned: other }] : null
+          for (const v of variants(need))
+            if (v.length)
+              out.push([inj.replace(m, m + v), m, v === need ? { op: "endsWith", learned: other } : { op: "endsWith", learned: other, folded: v }])
+          return out
         }
-        return [inj.replace(m, m + other), m, { op, learned: other }]
+        for (const v of variants(other)) out.push([inj.replace(m, m + v), m, v === other ? { op, learned: other } : { op, learned: other, folded: v }])
+        return out
       }
       const baseOver = node.oprobe ? JSON.parse(node.overrides) : {}
       const keyNeeds = new Map()
       const keyVia = []
       for (const e of journal) {
-        const aHas = e.a.includes(m)
-        const bHas = e.b.includes(m)
+        // case-insensitive: a program that upper/lower-cases its input
+        // before comparing still carries the canary, just re-cased
+        const aHas = e.a.toLowerCase().includes(mLow)
+        const bHas = e.b.toLowerCase().includes(mLow)
         if (aHas === bHas) continue // marker on both sides or neither: not attributable
         const side = aHas ? e.a : e.b
         const other = aHas ? e.b : e.a
+        const folded = !side.includes(m)
         if (mprobe && side.startsWith(m + ".")) {
           // object protocol: the probe proxy returned "<marker>.<key>" for
           // a property read — this key was consulted and tested here
@@ -1236,11 +1312,14 @@ export class TimeTravelEngine {
         if (!aHas && e.op !== "eq") {
           // our value is the ARGUMENT — constant.op(ourValue): matching the
           // whole receiver satisfies any of these tests
-          if (other.length) emitGeneric(inj.replace(m, other), other, { op: e.op, learned: other })
+          if (other.length) {
+            emitGeneric(inj.replace(m, other), other, { op: e.op, learned: other })
+            if (folded && other.toLowerCase() !== other)
+              emitGeneric(inj.replace(m, other.toLowerCase()), other.toLowerCase(), { op: e.op, learned: other, folded: other.toLowerCase() })
+          }
           continue
         }
-        const r = rewrite(e.op, side, other)
-        if (r) emitGeneric(r[0], r[1], r[2])
+        for (const r of rewrite(e.op, side, other, folded)) emitGeneric(r[0], r[1], r[2])
       }
       if (keyNeeds.size > 1) {
         // several keys tested in one run: combine every learned constraint
@@ -1281,7 +1360,7 @@ export class TimeTravelEngine {
         frontier.sort((a, b) => (b.parentNew ?? 0) - (a.parentNew ?? 0))
         const next = []
         for (const node of frontier) {
-          const key = node.probe ? " probe" : node.oprobe ? " oprobe:" + node.overrides : node.value
+          const key = node.probe ? "\0probe" : node.oprobe ? "\0oprobe:" + node.overrides : node.value
           if (key == null || key.length > CAP + 16 || tried[node.i].has(key)) continue
           tried[node.i].add(key)
           if (explored >= maxBranches) {
@@ -1289,8 +1368,20 @@ export class TimeTravelEngine {
             break bfs
           }
           const inp = inputs[node.i]
-          const { rec, journal } = await runCandidate([{ ...node, kind: inp.kind, key: inp.key }], true)
+          // a discovered input only exists inside the branch that revealed
+          // it: every candidate for it re-applies the unlocking assignments
+          const assigns = [...(inp.ctx ?? []), { ...node, kind: inp.kind, key: inp.key, store: inp.store }]
+          const { rec, journal, fresh } = await runCandidate(assigns, true)
           singles.push(rec)
+          for (const idx of fresh)
+            next.push({
+              i: idx,
+              probe: true,
+              value: canary(idx),
+              marker: canary(idx),
+              parentNew: rec.newLines.length + 1,
+              via: [{ op: "discovered", under: rec.edit }, { op: "probe", value: canary(idx) }],
+            })
           if (rec.satisfied) continue
           for (const kid of deriveFrom(journal, node)) {
             kid.parentNew = rec.newLines.length
@@ -1336,7 +1427,15 @@ export class TimeTravelEngine {
       pruned,
       budgetHit,
       baseline: base.detail,
-      inputs: inputs.map((x) => ({ kind: x.kind, key: x.key, asRun: x.asRun ?? null, neverFired: !!x.neverFired })),
+      inputs: inputs.map((x) => {
+        const o = { kind: x.kind, key: x.key, asRun: x.asRun ?? null, neverFired: !!x.neverFired }
+        if (x.store) o.store = x.store
+        if (x.discovered) {
+          o.discovered = true
+          o.under = x.under
+        }
+        return o
+      }),
       learned,
       unlocked: unlocked.slice(0, 6).map((u) => ({ ...u, branch: s.branches[u.branch] ? u.branch : null })),
     }

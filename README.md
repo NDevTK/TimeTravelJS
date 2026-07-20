@@ -90,11 +90,16 @@ npm run build      # rebuild dist/quickjs-tt.wasm (clang + wasi-libc + binaryen)
   alternate run and reading what that run *compared the canary against*.
   Each observation becomes the next candidate; required formats compose
   across rounds (probe → `pref:<canary>` → `pref:gold`), object message
-  protocols reveal their keys through a recording proxy payload, and the
-  search **learns from unused logic**: never-fired handlers are probed
-  first, runs that execute lines the recording never reached explore
-  first, and every answer carries its provenance chain and comes back
-  execution-verified.
+  protocols reveal their keys through a recording proxy payload, and
+  attribution survives case-normalizing programs (the canary is found
+  re-cased; learned constants are tried in both spellings). The input
+  set is **dynamic**: registries are re-read at every fork's end, so a
+  storage key or handler consulted only inside a branch some candidate
+  unlocked joins the search mid-flight with the unlocking assignments as
+  context. The search **learns from unused logic**: never-fired handlers
+  are probed first, runs that execute lines the recording never reached
+  explore first, and every answer carries its provenance chain and comes
+  back execution-verified.
 - **DOM + CSS time travel** — give the session an HTML document and it is
   parsed by an embedded [Lexbor](https://github.com/lexbor/lexbor) engine
   *into the same linear memory as the JS heap*. The DOM tree and CSSOM are
@@ -306,13 +311,22 @@ value; the journal of that run reports what the program tested the
 input against (`=== "solar"`, `startsWith("pref:")`), and each
 observation is rewritten into the next round's candidate, so formats
 compose: probe → `pref:<canary>` → `pref:gold`, with the whole chain
-kept as `via` provenance. Message probes deliver a recording proxy
-whose property reads return marked strings, so object protocols reveal
-their keys the same way (`{type:"sync"}`, then `{type:"sync",
-mode:"fast"}` behind an `&&`). The base run's own journal seeds round
-zero for free, and **unused logic guides the search**: inputs whose
-handlers never fired as-run are probed first, and children of runs that
-executed never-reached lines explore first. Goals compose as `{all,
+kept as `via` provenance. Attribution is case-insensitive — a program
+that runs `raw.toUpperCase() === "GRANDE"` still carries the canary,
+re-cased — and each learned constant is tried in both its literal and
+lower-case spellings, so the goal picks the raw form it needs. Message
+probes deliver a recording proxy whose property reads return marked
+strings, so object protocols reveal their keys the same way
+(`{type:"sync"}`, then `{type:"sync", mode:"fast"}` behind an `&&`).
+The input set grows as the search runs: registries are re-read at each
+fork's end, so when `?mode=x` unlocks a branch that reads
+`localStorage.getItem("secret")` — a key invisible to the original
+recording — `secret` joins the BFS as a discovered input whose every
+candidate re-applies `mode=x` as context, and each storage input
+targets the storage object it was actually read from. The base run's
+own journal seeds round zero for free, and **unused logic guides the
+search**: inputs whose handlers never fired as-run are probed first,
+and children of runs that executed never-reached lines explore first. Goals compose as `{all,
 any, none}` with every constraint reported separately; when no single
 input satisfies a compound goal, the most promising singles — ranked by
 how many constraints they did satisfy — are combined pairwise.
@@ -400,11 +414,13 @@ site nor the tests require a C toolchain.
 - The comparison journal sees **string-to-string** comparisons (plus
   `includes`/`startsWith`/`endsWith`/`indexOf`): numeric comparisons,
   regex tests and comparisons against `null`/`undefined` don't journal,
-  entries degrade to ASCII and cap at 64 chars / 384 entries, and a
-  transform that destroys the canary (hashing, `toUpperCase`) breaks
-  attribution for that branch. Values reachable only through such code
-  can be handed to `exploreParams` as `{extraValues}` — they enter the
-  same BFS and derive further from there.
+  entries degrade to ASCII and cap at 64 chars / 384 entries. Case
+  transforms are survived (attribution is case-insensitive), but a
+  transform that *destroys* the canary — hashing, slicing to a fixed
+  width, character remapping — breaks attribution for that branch.
+  Values reachable only through such code can be handed to
+  `exploreParams` as `{extraValues}` — they enter the same BFS and
+  derive further from there.
 
 ## Conformance: tc39/test262
 

@@ -668,8 +668,9 @@ export class DebuggerUI {
     for (const a of assignments ?? []) {
       for (const v of a.via ?? []) {
         if (v.op === "probe") parts.push("probe")
+        else if (v.op === "discovered") parts.push(`discovered under ${v.under}`)
         else if (v.op === "as-run" || v.op === "seed") parts.push(`${v.op} "${v.value}"`)
-        else parts.push(`${v.op}${v.key ? ` .${v.key}` : ""} → "${v.learned ?? ""}"`)
+        else parts.push(`${v.op}${v.key ? ` .${v.key}` : ""} → "${v.learned ?? ""}"${v.folded ? ` (as "${v.folded}")` : ""}`)
       }
     }
     return parts.join(" · ")

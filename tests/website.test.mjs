@@ -268,6 +268,96 @@ test("goal specs: any / none combinators evaluate with detail", async () => {
   ])
 })
 
+test("per-storage registries: sessionStorage keys are learned and targeted in their own store", async () => {
+  await engine.run(
+    `const token = sessionStorage.getItem("token");
+const theme = localStorage.getItem("theme");
+let live = false;
+if (token === "beta-pass") live = true;
+console.log(live);
+`,
+    { url: "https://app.example/" },
+  )
+  // each storage object keeps its own read registry — no cross-pollution
+  engine.positionTo(engine.trace.length - 1)
+  assert.deepEqual(JSON.parse(engine.consoleEval(`JSON.stringify(localStorage.__reads)`).value.v), ["theme"])
+  assert.deepEqual(JSON.parse(engine.consoleEval(`JSON.stringify(sessionStorage.__reads)`).value.v), ["token"])
+  const r = await engine.exploreParams({ goal: `live === true` })
+  assert.ok(r.examples.length >= 1)
+  // the learned write goes to the storage object the program actually read
+  assert.equal(r.examples[0].edit, `sessionStorage.setItem("token", "beta-pass")`)
+  assert.equal(r.inputs.find((x) => x.key === "token").store, "sessionStorage")
+  assert.equal(r.inputs.find((x) => x.key === "theme").store, "localStorage")
+})
+
+test("case-normalized comparisons still teach the raw value that the goal needs", async () => {
+  await engine.run(
+    `const raw = new URLSearchParams(location.search).get("size") || "";
+let cup = "none";
+if (raw.toUpperCase() === "GRANDE") cup = raw;
+console.log(cup);
+`,
+    { url: "https://cafe.example/" },
+  )
+  // the guard uppercases the input before comparing, but the goal needs the
+  // RAW spelling: the canary survives re-cased, attribution is
+  // case-insensitive, and the learned constant is tried in both spellings
+  const r = await engine.exploreParams({ goal: `cup === "grande"` })
+  assert.ok(r.examples.length >= 1)
+  const ex = r.examples[0]
+  assert.equal(ex.params.size, "grande")
+  const via = ex.assignments[0].via
+  assert.deepEqual(
+    via.map((v) => v.op),
+    ["probe", "eq"],
+  )
+  assert.equal(via.at(-1).learned, "GRANDE", "the journal reported the normalized constant")
+  assert.equal(via.at(-1).folded, "grande", "…and the candidate is its case-folded spelling")
+  assert.equal(r.explored, 3, "probe → GRANDE → grande — still zero guesses")
+})
+
+test("inputs consulted only inside unlocked branches join the search mid-flight", async () => {
+  await engine.run(
+    `const params = new URLSearchParams(location.search);
+let unlocked = false;
+if (params.get("mode") === "x") {
+  const secret = localStorage.getItem("secret");
+  if (secret === "42") unlocked = true;
+}
+console.log(unlocked);
+`,
+    { url: "https://vault.example/" },
+  )
+  // as recorded, localStorage.getItem("secret") NEVER ran — the key is
+  // invisible to any static read registry. The mode=x candidate's own run
+  // reveals it; the discovered input then probes with mode=x re-applied
+  // as context, and its value is learned from that combined run's journal
+  const r = await engine.exploreParams({ goal: `unlocked === true` })
+  assert.ok(r.examples.length >= 1, "the two-input combination was found")
+  const ex = r.examples[0]
+  assert.deepEqual(
+    ex.assignments.map((a) => [a.kind, a.key, a.value]),
+    [
+      ["param", "mode", "x"],
+      ["storage", "secret", "42"],
+    ],
+  )
+  const disc = r.inputs.find((x) => x.key === "secret")
+  assert.equal(disc.discovered, true, "the input joined mid-search")
+  assert.equal(disc.store, "localStorage")
+  assert.match(disc.under, /mode=x/, "provenance: which run revealed it")
+  // the chain on the discovered input: revealed → probed → learned
+  assert.deepEqual(
+    ex.assignments[1].via.map((v) => v.op),
+    ["discovered", "probe", "eq"],
+  )
+  assert.equal(ex.assignments[1].via.at(-1).learned, "42")
+  assert.ok(ex.firstTrue != null)
+  engine.switchTo(ex.branch, ex.firstTrue)
+  assert.equal(engine.consoleEval(`unlocked`).value.v, true)
+  engine.switchTo(0)
+})
+
 test("suggestEdits proposes storage writes with values learned from the run", async () => {
   await engine.run(
     `const pref = localStorage.getItem("accent") || "plain";
