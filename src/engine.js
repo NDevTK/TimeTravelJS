@@ -659,6 +659,167 @@ export class TimeTravelEngine {
     return out
   }
 
+  /**
+   * Candidate web-platform API calls for the CURRENT moment, read off the
+   * live document itself: events that actually have listeners registered
+   * right now, classes the stylesheets define, classes present in the
+   * tree, elements addressable by id. These are the raw material for
+   * explore() — each is a real call that COULD have been made here.
+   */
+  suggestEdits(pos = null, { limit = 12 } = {}) {
+    const s = this.session
+    if (!s.finished) throw new Error("no finished recording")
+    const savePos = s.pos
+    if (pos != null) this.positionTo(pos)
+    try {
+      const fetch = (expr) => {
+        const r = this.consoleEval(expr)
+        if (r.error || !r.value || r.value.t !== "str" || r.value.trunc) return null
+        try {
+          return JSON.parse(r.value.v)
+        } catch {
+          return null
+        }
+      }
+      const hasDoc = fetch(`JSON.stringify(typeof document !== "undefined")`)
+      if (hasDoc !== true) throw new Error("suggestEdits reads the live document — pass explicit candidates instead")
+      const ids = fetch(`JSON.stringify([...document.querySelectorAll("[id]")].slice(0, 8).map((e) => e.id))`) ?? []
+      const evTypes = fetch(`JSON.stringify(document.__eventTypes.slice(0, 6))`) ?? []
+      const cssClasses =
+        fetch(
+          `JSON.stringify((() => { const s = new Set(); for (const st of document.querySelectorAll("style")) for (const m of st.textContent.match(/\\.[A-Za-z_][A-Za-z0-9_-]*/g) || []) s.add(m.slice(1)); return [...s].slice(0, 6); })())`,
+        ) ?? []
+      const docClasses =
+        fetch(
+          `JSON.stringify((() => { const s = new Set(); for (const e of document.querySelectorAll("*")) for (const c of e.classList) s.add(c); return [...s].slice(0, 6); })())`,
+        ) ?? []
+      const out = []
+      const seen = new Set()
+      const push = (c) => {
+        if (!seen.has(c)) {
+          seen.add(c)
+          out.push(c)
+        }
+      }
+      const q = (id) => `document.getElementById(${JSON.stringify(id)})`
+      // behavioral first: events someone is actually listening for
+      for (const id of ids) for (const t of evTypes) push(`${q(id)}.dispatchEvent(new Event(${JSON.stringify(t)}, { bubbles: true }))`)
+      // styling: classes the CSS knows about, on and off
+      for (const id of ids) for (const c of cssClasses) push(`${q(id)}.classList.add(${JSON.stringify(c)})`)
+      for (const id of ids) for (const c of docClasses) push(`${q(id)}.classList.remove(${JSON.stringify(c)})`)
+      // structure last
+      for (const id of ids) push(`${q(id)}.remove()`)
+      return out.slice(0, limit)
+    } finally {
+      this.positionTo(savePos)
+    }
+  }
+
+  /**
+   * BFS constraint search over the multiverse: learn how the web platform
+   * API could have been used HERE to make `goal` true. Level 1 forks one
+   * timeline per candidate call; deeper levels compose calls — "call A,
+   * let the future play out, then call B" — by forking each surviving
+   * hypothesis at its last parked moment. Candidates come from
+   * suggestEdits() (the live document of the state being extended) unless
+   * given explicitly. Every returned example is execution-verified: a
+   * real recorded timeline whose future satisfies the goal, jumpable via
+   * switchTo(example.branch, example.firstTrue). Timelines that satisfied
+   * nothing are pruned (keep: "all" retains them).
+   */
+  async explore(pos, { goal, candidates = null, depth = 2, beam = 6, maxBranches = 48, keep = "examples", onProgress = null } = {}) {
+    const s = this.session
+    if (!s.finished) throw new Error("no finished recording")
+    if (!goal) throw new Error("explore needs a goal expression")
+    const saveView = s.view
+    const savePos = s.pos
+    pos = Math.max(0, Math.min(pos ?? savePos, this._compositeLen(saveView) - 1))
+    while (pos > 0 && !this._entryAt(pos)?.entry) pos-- // hypotheses need a parked machine
+    if (!this._entryAt(pos)?.entry) throw new Error("no parked step to explore from")
+
+    this.positionTo(pos)
+    const g0 = this.consoleEval(goal)
+    if (!g0.error && envTruthy(g0.value)) {
+      this.positionTo(savePos)
+      return { alreadyTrue: true, examples: [], explored: 0, pruned: 0, budgetHit: false }
+    }
+
+    const created = []
+    const examples = []
+    let explored = 0
+    let budgetHit = false
+    // a frontier node = where to fork (anchor) + edits to re-apply there
+    // (`prefix`) + the human-readable call sequence so far (`path`)
+    let frontier = [{ branch: saveView, pos, prefix: [], path: [] }]
+    try {
+      for (let level = 1; level <= depth && frontier.length && !budgetHit; level++) {
+        const next = []
+        for (const node of frontier) {
+          if (budgetHit) break
+          let cands = candidates
+          if (!cands) {
+            this.switchTo(node.branch, node.pos)
+            cands = this.suggestEdits(null, { limit: 12 })
+          }
+          for (const edit of cands) {
+            if (explored >= maxBranches) {
+              budgetHit = true
+              break
+            }
+            s.view = node.branch
+            const summary = await this.forkFrom(node.pos, [...node.prefix, edit].join("; "))
+            const b = s.view
+            created.push(b)
+            explored++
+            this.positionTo(summary.steps - 1)
+            const g = this.consoleEval(goal)
+            const satisfied = !g.error && envTruthy(g.value)
+            const path = [...node.path, edit]
+            if (satisfied) {
+              const scan = this.searchAll(goal, { branch: b, limit: 1 })
+              examples.push({
+                path,
+                branch: b,
+                steps: summary.steps,
+                error: summary.error,
+                firstTrue: scan.hits.length ? scan.hits[0].pos : null,
+                goal: g.value,
+              })
+            } else if (!summary.error && level < depth) {
+              // extend from this hypothesis' last parked moment — a state that
+              // CONTAINS the edit. If its whole remaining future ran without
+              // parking (nothing left to interleave), compose the next call
+              // back-to-back at the same anchor instead: "A; B".
+              let p = summary.steps - 1
+              while (p > summary.forkedAt && !this._entryAt(p)?.entry) p--
+              if (p > summary.forkedAt && this._entryAt(p)?.entry)
+                next.push({ branch: b, pos: p, prefix: [], path })
+              else next.push({ branch: node.branch, pos: node.pos, prefix: [...node.prefix, edit], path })
+            }
+            if (onProgress) onProgress({ level, explored, found: examples.length })
+          }
+        }
+        frontier = next.slice(0, beam)
+      }
+    } finally {
+      s.view = saveView
+      this.positionTo(savePos)
+    }
+    let pruned = 0
+    if (keep === "examples") {
+      const keepSet = new Set()
+      for (const ex of examples) {
+        let b = s.branches[ex.branch]
+        while (b) {
+          keepSet.add(b.id)
+          b = b.parentId != null ? s.branches[b.parentId] : null
+        }
+      }
+      for (const id of created) if (s.branches[id] && !keepSet.has(id)) pruned += this.pruneBranch(id).length
+    }
+    return { alreadyTrue: false, examples, explored, pruned, budgetHit }
+  }
+
   // ---- transactional inspection / evaluation ------------------------------
   /**
    * Inspect the current position: restores its state, rewinds the VM into

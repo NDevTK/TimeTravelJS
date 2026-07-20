@@ -179,6 +179,7 @@ export class DebuggerUI {
       branchStrip: $("#branch-strip"),
       whatifEdits: $("#whatif-edits"),
       whatifProbe: $("#whatif-probe"),
+      whatifSuggest: $("#whatif-suggest"),
       whatifRun: $("#whatif-run"),
       whatifResults: $("#whatif-results"),
     }
@@ -570,6 +571,16 @@ export class DebuggerUI {
 
   _wireWhatIf() {
     this.els.whatifRun?.addEventListener("click", () => this.runWhatIf())
+    this.els.whatifSuggest?.addEventListener("click", () => {
+      if (this.recording || !this.summary || !this.engine.suggestEdits) return
+      try {
+        const list = this.engine.suggestEdits(null, { limit: 8 })
+        this.els.whatifEdits.value = list.join("\n")
+        this.setStatus("ok", `✨ ${list.length} candidate API calls read off the live document`)
+      } catch (err) {
+        this.setStatus("err", String(err.message || err))
+      }
+    })
   }
 
   async runWhatIf() {

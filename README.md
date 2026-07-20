@@ -41,9 +41,26 @@ npm run build      # rebuild dist/quickjs-tt.wasm (clang + wasi-libc + binaryen)
   transaction. The timeline is immutable by construction.
 - **Timeline forking (edit and continue)** — Shift+Enter (or the ⑂ button)
   applies your expression to the *live paused frame* — real locals included,
-  via a C-level frame writer — discards the old future and lets the machine
-  keep executing from that exact state, recording a new one. Fork without an
-  edit and determinism gives you back the identical future, step for step.
+  via a C-level frame writer — and lets the machine keep executing from that
+  exact state, recording a new future. Fork without an edit and determinism
+  gives you back the identical future, step for step.
+- **The multiverse: forks keep both futures** — the abandoned future stays
+  reachable as a sibling timeline (a strip above the scrubber switches
+  between them), and because every timeline shares one content-deduplicated
+  page pool, a branch costs only the pages it diverges on. Navigation
+  between any two moments of any two timelines walks the tree through their
+  common ancestor — still pure memory, still no re-execution.
+- **"What would have happened if?"** — the what-if panel forks the current
+  step once per candidate edit, records every hypothetical future, and
+  shows the outcomes side by side with the first step where a probe turns
+  true. `searchAll(expr)` BFS-scans a predicate across every state of every
+  timeline (each state visited exactly once); `explore({goal, depth})` goes
+  further and *learns how the web platform API could have been used*: it
+  reads candidate calls off the live document (events with real listeners,
+  stylesheet classes, elements by id), forks each as a timeline, composes
+  deeper call sequences breadth-first, and returns only execution-verified
+  examples — every one a real, scrubbable recording whose future satisfies
+  the goal.
 - **Virtual time** — `Date.now()` ticks once per step, `setTimeout` runs on a
   virtual clock after the main script, `Math.random()` is seeded; recordings
   are reproducible run to run.
@@ -196,6 +213,50 @@ park mid-flight like any other code. Nodes detached during a session are
 unlinked, never destroyed, so a handle held across `innerHTML = …`
 remains valid on every timeline that ever saw it.
 
+### 7. The multiverse: BFS over what could have happened
+
+A recorded timeline answers "what happened". Because suspended machines
+are just bytes, the engine also answers "what *would* have happened":
+`forkFrom()` keeps the abandoned future as a sibling branch, so history is
+a **tree of delta chains** — all interning pages into one shared pool, so
+sibling timelines pay only for their divergence; their common prefix is
+literally the same chain. Moving between (timeline A, step i) and
+(timeline B, step j) walks the tree through the lowest common ancestor:
+undo up, move within, redo down — every transition a recorded delta
+applied in the direction it was captured. Still zero re-execution.
+
+On top of that tree sit three search primitives:
+
+```js
+// fork one timeline per hypothesis off the SAME moment, compare futures
+await engine.whatIf(pos, ["item.price = 1", "item.price = 99"],
+                    { probe: "total > 20", scan: true })
+
+// BFS a predicate across every state of every timeline —
+// shared prefixes are visited exactly once, at the branch that owns them
+engine.searchAll("balance < 0")   // → jumpable hits {branch, pos, value}
+
+// constraint search: learn how the web platform API could have been used
+await engine.explore(pos, {
+  goal: "document.querySelectorAll('.done').length >= 1",
+  depth: 2,        // compose up to two calls, breadth-first
+})
+```
+
+`explore()` generates its candidates from the live document of the moment
+being extended — `dispatchEvent` for event types that currently have
+listeners registered, `classList.add/remove` for classes the stylesheets
+define and the tree uses, `remove()` for elements addressable by id
+(`suggestEdits()` exposes the generator; explicit candidate lists work
+too, with or without a DOM). Each candidate is forked as a real timeline
+and its future actually executes; deeper levels chain from the
+hypothesis' last parked moment — "call A, let the program respond, then
+call B" — or compose back-to-back at the same anchor when the future ran
+to completion. Every returned example is **execution-verified**: a
+recorded timeline whose future satisfies the goal, jumpable to the exact
+step where it first became true. Timelines that satisfied nothing are
+pruned; their pages return to the pool.
+
 ## Repository layout
 
 ```
@@ -258,6 +319,15 @@ site nor the tests require a C toolchain.
   with simple `;`/`:` splitting. The preview panel re-renders serialized
   HTML in a sandboxed iframe — faithful structure and styles, browser
   layout.
+- `explore()` demonstrates usages; it does not prove absence. The search
+  is bounded (beam width, depth, `maxBranches` fork budget) and the
+  auto-candidate vocabulary is deliberately small — events with live
+  listeners, stylesheet/tree classes, elements with ids (bring explicit
+  candidates for anything else; required for DOM-less sessions). Once a
+  hypothesis' future has run to completion there is no "later" left
+  inside it, so deeper calls compose back-to-back at the fork moment
+  instead. The page-heat visualization aggregates writes across all
+  timelines.
 
 ## Conformance: tc39/test262
 
