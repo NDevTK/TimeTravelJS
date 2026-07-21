@@ -35,6 +35,20 @@ if ! cmp -s "$BUILD/a.base" "$BUILD/b.base"; then
 fi
 echo "PASS: cross-process resume is byte-identical ($(wc -l < "$BUILD/a.trace") trace lines)"
 
+echo "== process A: machine-park inside helper (TrampFrame chain) =="
+"$BUILD/flow-harness" emit2 "$BUILD/flow2.bin" | tee "$BUILD/a2.out"
+echo "== process B: transplant the parked machine + resume =="
+"$BUILD/flow-harness" resume2 "$BUILD/flow2.bin" | tee "$BUILD/b2.out"
+
+grep '^POST:' "$BUILD/a2.out" > "$BUILD/a2.trace"
+grep '^POST:' "$BUILD/b2.out" > "$BUILD/b2.trace"
+if ! cmp -s "$BUILD/a2.trace" "$BUILD/b2.trace"; then
+    echo "FAIL: machine-parked resume trace differs from reference"
+    diff "$BUILD/a2.trace" "$BUILD/b2.trace" || true
+    exit 1
+fi
+echo "PASS: machine-parked chain resumes byte-identically ($(wc -l < "$BUILD/a2.trace") trace lines)"
+
 echo "== selftest =="
 "$BUILD/flow-harness" selftest
 echo "PASS: flow serialization suite"

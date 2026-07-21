@@ -17,6 +17,18 @@
  *                               byte-equality, shared identity after
  *                               transplant, corrupt-input rejection,
  *                               wrong-baseline rejection, GC + leak checks.
+ *
+ *   flow-harness emit2/resume2  the machine-parked TrampFrame chain: a
+ *                               step-hook park INSIDE helper() (four frames
+ *                               deep under a for-of driver) serializes as
+ *                               [outer heap, inner yield* splice, helper
+ *                               arena]; process B transplants the parked
+ *                               machine and completes the interrupted
+ *                               next() with JS_TTFlowResumeParked. emit2's
+ *                               reference future comes from an in-process
+ *                               transplant into a second runtime, and the
+ *                               original machine is discarded through the
+ *                               abort-unwind path.
  */
 #include "quickjs.h"
 #include <stdio.h>
@@ -35,10 +47,17 @@ static const char *BASELINE_SRC =
 "var TABLE = [];\n"
 "for (var i = 0; i < 64; i++) TABLE.push(\"row-\" + i);\n"
 "function bump(x) { return x + CONFIG.limit; }\n"
+"function helper(k, a) {\n"
+"  var acc = k * 2;\n"
+"  acc = acc + CONFIG.limit;\n"
+"  acc = acc - a;\n"
+"  return acc + 1;\n"
+"}\n"
+"function drive(g) { var out = []; for (var v of g) out.push(v); return out.join(\"|\"); }\n"
 "function* inner(a) {\n"
 "  var t = 0.5;\n"
 "  for (var k = 0; k < a; k++) {\n"
-"    t += k;\n"
+"    t += helper(k, a);\n"
 "    try { yield \"inner:\" + k + \":\" + t + \":\" + TABLE[k % TABLE.length]; }\n"
 "    catch (e) { yield \"caught:\" + e; }\n"
 "  }\n"
@@ -176,6 +195,60 @@ static void expect_str(JSContext *ctx, const char *expr, const char *want,
     free(got);
 }
 
+/* park the machine at the Nth arrival on a target source line */
+typedef struct ParkPlan {
+    int line;
+    int countdown;
+    int parked_line;
+} ParkPlan;
+
+static int park_handler(JSContext *ctx, int line, int col, int depth,
+                        int parkable, void *opaque)
+{
+    ParkPlan *plan = opaque;
+    (void)ctx; (void)col; (void)depth;
+    if (getenv("FLOW_DEBUG_STEPS"))
+        fprintf(stderr, "[step] line=%d depth=%d parkable=%d\n",
+                line, depth, parkable);
+    if (parkable && line == plan->line && --plan->countdown == 0) {
+        plan->parked_line = line;
+        return 2;
+    }
+    return 0;
+}
+
+/* 1-based line of the first occurrence of 'needle' in the baseline */
+static int baseline_line_of(const char *needle)
+{
+    const char *p = strstr(BASELINE_SRC, needle);
+    int line = 1;
+    const char *q;
+    assert(p);
+    for (q = BASELINE_SRC; q < p; q++)
+        if (*q == '\n')
+            line++;
+    return line;
+}
+
+static void print_step(JSContext *ctx, JSValueConst val, int done,
+                       const char *pfx)
+{
+    if (done == 2) {
+        /* yield* delegation step: the value IS the iterator result */
+        JSValue v2 = JS_GetPropertyStr(ctx, val, "value");
+        JSValue d2 = JS_GetPropertyStr(ctx, val, "done");
+        print_step(ctx, v2, JS_ToBool(ctx, d2), pfx);
+        JS_FreeValue(ctx, v2);
+        JS_FreeValue(ctx, d2);
+        return;
+    }
+    {
+        const char *str = JS_ToCString(ctx, val);
+        printf("%s%s%s\n", pfx, done == 1 ? "return:" : "", str ? str : "?");
+        JS_FreeCString(ctx, str);
+    }
+}
+
 /* record the flow's COW delta: CONFIG.tag = "cfg-flow" through the flow */
 static void write_delta(JSContext *ctx, JSValueConst g)
 {
@@ -276,6 +349,199 @@ static int cmd_resume(const char *path)
         die(ctx, "checkin");
     expect_str(ctx, "CONFIG.tag", "cfg-flow", "flow view after checkin");
 
+    finish_flow(ctx, g, "POST:");
+    expect_str(ctx, "CONFIG.tag", "cfg-flow", "delta committed by resume");
+
+    JS_FreeValue(ctx, g);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    return 0;
+}
+
+/* ---- emit2/resume2: the machine-parked TrampFrame chain round trip ----
+   The flow parks INSIDE helper() called from inner() delegated from outer()
+   via yield* -- a three-frame chain [outer heap, inner heap, helper arena]
+   -- then crosses the process boundary and completes the interrupted
+   next() on the other side. */
+static int cmd_emit2(const char *path)
+{
+    JSRuntime *rt, *rt2;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    JSContext *ctx2;
+    JSValue g, g2, drive_fn;
+    ParkPlan plan;
+    uint8_t *bytes;
+    size_t blen;
+    FILE *f;
+    int parked = 0, done = 0;
+
+    printf("BASELINE:count=%u:fp=%016llx\n",
+           (unsigned)JS_TTBaselineCount(rt),
+           (unsigned long long)JS_TTBaselineFingerprint(rt));
+
+    g = start_flow(ctx, 2, "PRE:");   /* "start", "inner:0" */
+
+    /* a for-of driver resumes the generator through the engine's in-loop
+       splices, so the step hook can park anywhere inside; park at
+       helper()'s middle line, deep inside outer -> yield* inner -> helper */
+    plan.line = baseline_line_of("acc = acc + CONFIG.limit");
+    plan.countdown = 1;
+    plan.parked_line = 0;
+    JS_TTSetStepHandler(rt, park_handler, &plan);
+    JS_TTSetStepFilename(ctx, "baseline.js");
+    JS_TTEnableStep(rt, 1);
+    drive_fn = get_global(ctx, "drive");
+    {
+        JSValueConst args[1] = { g };
+        JSValue ret = JS_TTCallArgs(ctx, drive_fn, JS_UNDEFINED, 1, args,
+                                    &parked);
+        if (!parked) {
+            fprintf(stderr, "FATAL machine did not park (line %d)\n",
+                    plan.line);
+            return 1;
+        }
+        JS_FreeValue(ctx, ret);
+    }
+    JS_TTEnableStep(rt, 0);
+    printf("PARKED:line=%d\n", plan.parked_line);
+
+    write_delta(ctx, g);              /* delta on a machine-parked flow */
+    expect_str(ctx, "CONFIG.tag", "cfg-flow", "delta live view");
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout");
+    expect_str(ctx, "CONFIG.tag", "cfg", "pristine after checkout");
+
+    bytes = JS_TTFlowSerialize(ctx, g, &blen);
+    if (!bytes)
+        die(ctx, "serialize");
+    f = fopen(path, "wb");
+    if (!f || fwrite(bytes, 1, blen, f) != blen) {
+        fprintf(stderr, "FATAL cannot write %s\n", path);
+        return 1;
+    }
+    fclose(f);
+    printf("BYTES:%u\n", (unsigned)blen);
+
+    /* reference future: transplant into a SECOND runtime in this process
+       and drive it exactly like process B will -- the two futures must
+       agree byte for byte */
+    ctx2 = new_baseline_ctx(&rt2);
+    g2 = JS_TTFlowDeserialize(ctx2, bytes, blen);
+    if (JS_IsException(g2))
+        die(ctx2, "in-process deserialize");
+    expect_str(ctx2, "CONFIG.tag", "cfg", "pristine before checkin");
+    JS_RunGC(rt2);
+    if (JS_TTFlowCheckin(ctx2, g2))
+        die(ctx2, "checkin");
+    expect_str(ctx2, "CONFIG.tag", "cfg-flow", "flow view after checkin");
+    {
+        JSValue v = JS_TTFlowResumeParked(ctx2, g2, 0, &done, &parked);
+        if (parked || JS_IsException(v))
+            die(ctx2, "resume parked");
+        print_step(ctx2, v, done, "POST:");
+        JS_FreeValue(ctx2, v);
+    }
+    finish_flow(ctx2, g2, "POST:");
+    expect_str(ctx2, "CONFIG.tag", "cfg-flow", "delta committed by resume");
+    JS_FreeValue(ctx2, g2);
+    JS_FreeContext(ctx2);
+    JS_FreeRuntime(rt2);
+
+    /* discard the original parked machine: the documented abort path
+       (Interrupted unwinds helper -> inner -> outer -> driver) */
+    {
+        JSValue ret = JS_TTCallResume(ctx, 1, &parked);
+        if (parked)
+            die(ctx, "abort did not complete");
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    js_free(ctx, bytes);
+    JS_FreeValue(ctx, drive_fn);
+    JS_FreeValue(ctx, g);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    return 0;
+}
+
+static int cmd_resume2(const char *path)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    JSValue g;
+    uint8_t *bytes;
+    long blen;
+    FILE *f;
+    int done = 0, parked = 0;
+
+    printf("BASELINE:count=%u:fp=%016llx\n",
+           (unsigned)JS_TTBaselineCount(rt),
+           (unsigned long long)JS_TTBaselineFingerprint(rt));
+
+    f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "FATAL cannot read %s\n", path);
+        return 1;
+    }
+    fseek(f, 0, SEEK_END);
+    blen = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    bytes = malloc(blen);
+    if (fread(bytes, 1, blen, f) != (size_t)blen) {
+        fprintf(stderr, "FATAL short read\n");
+        return 1;
+    }
+    fclose(f);
+    printf("BYTES:%u\n", (unsigned)blen);
+
+    g = JS_TTFlowDeserialize(ctx, bytes, blen);
+    if (JS_IsException(g))
+        die(ctx, "deserialize");
+    if (!JS_TTParked(ctx)) {
+        fprintf(stderr, "FATAL machine not staged as parked\n");
+        return 1;
+    }
+    printf("PARKED:transplanted\n");
+
+    /* one parked machine per runtime: a second transplant must refuse */
+    {
+        JSValue dup = JS_TTFlowDeserialize(ctx, bytes, (size_t)blen);
+        if (!JS_IsException(dup)) {
+            fprintf(stderr, "FAIL busy-machine guard\n");
+            return 1;
+        }
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        printf("SELF:busy-guard ok\n");
+    }
+    /* re-serializing the transplanted parked chain reproduces the bytes:
+       arena offsets are relative, ids deterministic */
+    {
+        size_t l2;
+        uint8_t *again = JS_TTFlowSerialize(ctx, g, &l2);
+        if (!again)
+            die(ctx, "re-serialize parked");
+        if (l2 != (size_t)blen || memcmp(again, bytes, l2) != 0) {
+            fprintf(stderr, "FAIL parked re-serialization drifted\n");
+            return 1;
+        }
+        js_free(ctx, again);
+        printf("SELF:parked byte-stable ok\n");
+    }
+    free(bytes);
+
+    expect_str(ctx, "CONFIG.tag", "cfg", "pristine before checkin");
+    JS_RunGC(rt);
+    if (JS_TTFlowCheckin(ctx, g))
+        die(ctx, "checkin");
+    expect_str(ctx, "CONFIG.tag", "cfg-flow", "flow view after checkin");
+
+    {
+        JSValue v = JS_TTFlowResumeParked(ctx, g, 0, &done, &parked);
+        if (parked || JS_IsException(v))
+            die(ctx, "resume parked");
+        print_step(ctx, v, done, "POST:");
+        JS_FreeValue(ctx, v);
+    }
     finish_flow(ctx, g, "POST:");
     expect_str(ctx, "CONFIG.tag", "cfg-flow", "delta committed by resume");
 
@@ -449,6 +715,10 @@ int main(int argc, char **argv)
         return cmd_emit(argv[2]);
     if (argc >= 3 && !strcmp(argv[1], "resume"))
         return cmd_resume(argv[2]);
+    if (argc >= 3 && !strcmp(argv[1], "emit2"))
+        return cmd_emit2(argv[2]);
+    if (argc >= 3 && !strcmp(argv[1], "resume2"))
+        return cmd_resume2(argv[2]);
     if (argc >= 2 && !strcmp(argv[1], "selftest"))
         return cmd_selftest();
     fprintf(stderr, "usage: flow-harness emit|resume <file> | selftest\n");

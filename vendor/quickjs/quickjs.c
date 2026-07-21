@@ -41451,8 +41451,11 @@ typedef enum BCTagEnum {
 
 /* -- limits and wire constants -- */
 
-#define TT_FLOW_MAGIC     "TTFL01"
+#define TT_FLOW_MAGIC     "TTFL02"
 #define TT_FLOW_MAGIC_LEN 6
+
+/* header flag bits */
+#define TT_FLOWF_MACHINE  1   /* carries a machine-parked TrampFrame chain */
 
 enum {                        /* private record kinds */
     TT_REC_PLAIN = 1,         /* JS_CLASS_OBJECT / JS_CLASS_ERROR            */
@@ -42118,7 +42121,12 @@ static JSValue *tt_flow_delta_cell(TTFlowDeltaRec *rec)
     }
 }
 
-/* flow handle (generator object) -> its suspended base state */
+static BOOL tt_flow_base_is_parked(JSRuntime *rt, JSAsyncFunctionState *st);
+
+/* flow handle (generator object) -> its suspended base state. A flow is
+   serializable/delta-addressable while suspended at a yield OR while it is
+   the machine-parked chain (EXECUTING with the park running through its
+   frame). */
 static JSAsyncFunctionState *tt_flow_state_of(JSContext *ctx, JSValueConst flow)
 {
     JSGeneratorData *gd;
@@ -42129,8 +42137,9 @@ static JSAsyncFunctionState *tt_flow_state_of(JSContext *ctx, JSValueConst flow)
     }
     gd = JS_GetOpaque(flow, JS_CLASS_GENERATOR);
     if (!gd || !gd->func_state ||
-        gd->state == JS_GENERATOR_STATE_EXECUTING ||
-        gd->state == JS_GENERATOR_STATE_COMPLETED) {
+        gd->state == JS_GENERATOR_STATE_COMPLETED ||
+        (gd->state == JS_GENERATOR_STATE_EXECUTING &&
+         !tt_flow_base_is_parked(ctx->rt, gd->func_state))) {
         JS_ThrowTypeError(ctx, "flow is not suspended");
         return NULL;
     }
@@ -42338,21 +42347,51 @@ typedef struct TTFlowWrRec {
     void *ptr;                /* identity of the live entity */
 } TTFlowWrRec;
 
+/* one entry of the flow's TrampFrame chain (or of a detached suspended
+   nested state discovered through the value graph) */
+typedef struct TTFlowWrFrame {
+    JSStackFrame *sf;
+    uint8_t owner;            /* 0 = state-owned heap frame, 1 = arena frame */
+    uint8_t chained;          /* part of the machine-parked chain */
+} TTFlowWrFrame;
+
 typedef struct TTFlowWr {
     JSContext *ctx;
     TTFlowBaseline *bl;
     TTPtrMap map;             /* entity ptr -> record idx + 1 */
     TTFlowWrRec *recs;
     uint32_t rec_count, rec_size;
-    JSAsyncFunctionState **states;   /* frame owners, discovery order */
-    uint32_t state_count, state_size;
+    TTFlowWrFrame *frames;    /* the frame table: base first, chain order */
+    uint32_t frame_count, frame_size;
     TTPtrMap frame_map;       /* JSStackFrame* -> frame idx + 1 */
+    BOOL machine;             /* a parked chain travels in these bytes */
     JSAtom *atoms;            /* private atom table (borrowed from heap) */
     uint32_t atom_count, atom_size;
     TTPtrMap atom_map;        /* JSAtomStruct* -> atom-table idx + 1 */
     /* work queue of records whose children still need scanning */
     uint32_t scan_head;
 } TTFlowWr;
+
+/* a frame's owned value range: [start, cur_sp). Heap (state) frames own
+   everything from arg_buf; arena frames own their allocation block only --
+   an aliased argument window belongs to the parent frame. */
+static JSValue *wr_frame_owned_start(TTFlowWrFrame *f)
+{
+    return f->owner ? f->sf->tt_frame_base : f->sf->arg_buf;
+}
+
+/* TRUE if the machine's parked chain runs through this state's frame:
+   the flow is suspended mid-call (EXECUTING), parked by the step hook */
+static BOOL tt_flow_base_is_parked(JSRuntime *rt, JSAsyncFunctionState *st)
+{
+    JSStackFrame *sf = rt->tt_parked_frame;
+    while (sf) {
+        if (sf == &st->frame)
+            return TRUE;
+        sf = sf->prev_frame;
+    }
+    return FALSE;
+}
 
 static int wr_enum_value(TTFlowWr *w, JSValueConst v);
 static int wr_enum_varref(TTFlowWr *w, JSVarRef *vr);
@@ -42425,6 +42464,28 @@ static int wr_fn_id(TTFlowWr *w, JSFunctionBytecode *b)
     return (int)(v - 1);
 }
 
+static int wr_add_frame(TTFlowWr *w, JSStackFrame *sf, int owner, int chained)
+{
+    if (tt_ptrmap_get(&w->frame_map, sf))
+        return 0;
+    if (w->frame_count >= w->frame_size) {
+        uint32_t nsize = w->frame_size ? w->frame_size * 2 : 8;
+        TTFlowWrFrame *ntab =
+            js_realloc(w->ctx, w->frames, sizeof(*ntab) * nsize);
+        if (!ntab)
+            return -1;
+        w->frames = ntab;
+        w->frame_size = nsize;
+    }
+    if (tt_ptrmap_put(w->ctx, &w->frame_map, sf, w->frame_count))
+        return -1;
+    w->frames[w->frame_count].sf = sf;
+    w->frames[w->frame_count].owner = (uint8_t)owner;
+    w->frames[w->frame_count].chained = (uint8_t)chained;
+    w->frame_count++;
+    return 0;
+}
+
 static int wr_enum_state(TTFlowWr *w, JSAsyncFunctionState *st)
 {
     uint32_t idx;
@@ -42448,18 +42509,140 @@ static int wr_enum_state(TTFlowWr *w, JSAsyncFunctionState *st)
     }
     if (wr_add_rec(w, TT_REC_STATE, st, &idx))
         return -1;
-    if (w->state_count >= w->state_size) {
-        uint32_t nsize = w->state_size ? w->state_size * 2 : 8;
-        JSAsyncFunctionState **ntab =
-            js_realloc(w->ctx, w->states, sizeof(*ntab) * nsize);
-        if (!ntab)
+    /* chained frames were pre-registered by the chain walk; a state found
+       only through the value graph is a detached suspended nested flow */
+    return wr_add_frame(w, &st->frame, 0, 0);
+}
+
+/* Walk the machine's parked chain from rt->tt_parked_frame down to the flow
+   base and register it as the flow's TrampFrame chain (base first). Every
+   frame is validated against the transplantable subset: plain inlined calls
+   and in-loop generator splices, whose pops touch no side arena blocks. The
+   arena extent must be exactly the chain's frames, contiguously -- foreign
+   blocks (pump descriptors, iterator blocks, ...) refuse loudly. */
+static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
+{
+    JSRuntime *rt = w->ctx->rt;
+    JSStackFrame *chain[256];
+    int n = 0, i;
+    JSStackFrame *sf = rt->tt_parked_frame;
+
+    while (sf && sf != &base->frame) {
+        if (n >= (int)countof(chain)) {
+            JS_ThrowTypeError(w->ctx, "flow serialization: parked chain too "
+                              "deep");
             return -1;
-        w->states = ntab;
-        w->state_size = nsize;
+        }
+        chain[n++] = sf;
+        sf = sf->prev_frame;
     }
-    if (tt_ptrmap_put(w->ctx, &w->frame_map, &st->frame, w->state_count))
+    if (sf != &base->frame) {
+        JS_ThrowTypeError(w->ctx, "flow serialization: flow is running but "
+                          "is not the parked machine");
         return -1;
-    w->states[w->state_count++] = st;
+    }
+    chain[n++] = sf;
+    /* base first */
+    for (i = n - 1; i >= 0; i--) {
+        JSStackFrame *f = chain[i];
+        if (f->js_mode & JS_MODE_ASYNC) {
+            JSAsyncFunctionState *st =
+                container_of(f, JSAsyncFunctionState, frame);
+            int kind = f->tt_frame_kind;
+            if (i != n - 1) {
+                /* a nested in-loop generator splice: its pop protocol
+                   travels; APPEND smuggles an arena block, refuse it */
+                int gshape;
+                if (kind != TT_FRAME_GEN) {
+                    JS_ThrowTypeError(w->ctx, "flow serialization: "
+                                      "unsupported chained state frame kind "
+                                      "%d", kind);
+                    return -1;
+                }
+                gshape = (f->tt_aux_i >> 8) & 0xff;
+                if (gshape != TT_GENSHAPE_METHOD &&
+                    gshape != TT_GENSHAPE_FOROF &&
+                    gshape != TT_GENSHAPE_ITERNEXT &&
+                    gshape != TT_GENSHAPE_ITERCALL) {
+                    JS_ThrowTypeError(w->ctx, "flow serialization: "
+                                      "unsupported generator splice shape %d",
+                                      gshape);
+                    return -1;
+                }
+                if (!JS_IsUndefined(f->tt_ctor_this)) {
+                    JS_ThrowTypeError(w->ctx, "flow serialization: chained "
+                                      "frame carries a side block");
+                    return -1;
+                }
+            } else if (kind != TT_FRAME_GEN && kind != TT_FRAME_ENTRY) {
+                JS_ThrowTypeError(w->ctx, "flow serialization: base frame "
+                                  "kind %d is not transplantable", kind);
+                return -1;
+            }
+            if (wr_add_frame(w, f, 0, 1))
+                return -1;
+            if (wr_enum_state(w, st))
+                return -1;
+        } else {
+            int kind = f->tt_frame_kind;
+            if (kind != TT_FRAME_CALL && kind != TT_FRAME_CALL_METHOD &&
+                kind != TT_FRAME_TAIL && kind != TT_FRAME_TAIL_METHOD) {
+                JS_ThrowTypeError(w->ctx, "flow serialization: arena frame "
+                                  "kind %d is not transplantable (reflective "
+                                  "machinery in the chain)", kind);
+                return -1;
+            }
+            if (f->tt_aux != NULL || !JS_IsUndefined(f->tt_ctor_this) ||
+                !JS_IsUndefined(f->tt_new_target)) {
+                JS_ThrowTypeError(w->ctx, "flow serialization: arena frame "
+                                  "carries continuation state");
+                return -1;
+            }
+            if (f->cur_sp == NULL) {
+                JS_ThrowInternalError(w->ctx, "flow serialization: parked "
+                                      "frame without a saved sp");
+                return -1;
+            }
+            if (wr_add_frame(w, f, 1, 1))
+                return -1;
+            if (wr_enum_value(w, f->cur_func))
+                return -1;
+        }
+    }
+    /* contiguity: the arena extent must hold exactly the chain's arena
+       frames -- each next frame starts where the previous allocation ends,
+       and the innermost one ends at the arena top */
+    {
+        uint8_t *expect = NULL;
+        for (i = 0; i < n; i++) {
+            JSStackFrame *f = chain[n - 1 - i]; /* base first */
+            JSObject *fo;
+            JSFunctionBytecode *fb;
+            size_t val_count, size;
+            if (f->js_mode & JS_MODE_ASYNC)
+                continue;
+            if (expect && (uint8_t *)f != expect) {
+                JS_ThrowTypeError(w->ctx, "flow serialization: foreign arena "
+                                  "blocks inside the parked chain");
+                return -1;
+            }
+            fo = JS_VALUE_GET_OBJ(f->cur_func);
+            fb = fo->u.func.function_bytecode;
+            val_count = (f->arg_buf == f->tt_frame_base ? (size_t)fb->arg_count
+                                                        : 0) +
+                        fb->var_count + fb->stack_size;
+            size = sizeof(JSStackFrame) + sizeof(JSValue) * val_count +
+                   sizeof(JSVarRef *) * fb->var_ref_count;
+            size = (size + 15) & ~(size_t)15;
+            expect = (uint8_t *)f + size;
+        }
+        if (expect && expect != rt->tt_arena_top) {
+            JS_ThrowTypeError(w->ctx, "flow serialization: arena extent does "
+                              "not end at the parked top");
+            return -1;
+        }
+    }
+    w->machine = TRUE;
     return 0;
 }
 
@@ -42650,9 +42833,16 @@ static int wr_scan_children(TTFlowWr *w, TTFlowWrRec *rec)
         if (gd && gd->func_state &&
             gd->state != JS_GENERATOR_STATE_COMPLETED) {
             if (gd->state == JS_GENERATOR_STATE_EXECUTING) {
-                JS_ThrowTypeError(w->ctx, "flow serialization: nested "
-                                  "generator is running");
-                return -1;
+                /* legal only when the generator's frame is part of the
+                   flow's machine-parked chain (registered before the BFS) */
+                uint32_t fi = tt_ptrmap_get(&w->frame_map,
+                                            &gd->func_state->frame);
+                if (!fi || !w->frames[fi - 1].chained) {
+                    JS_ThrowTypeError(w->ctx, "flow serialization: nested "
+                                      "generator is running outside the "
+                                      "flow's parked chain");
+                    return -1;
+                }
             }
             if (wr_enum_state(w, gd->func_state))
                 return -1;
@@ -42927,9 +43117,14 @@ static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
         goto fail;
     }
 
-    /* pass A (assign ids): queued BFS from the base state and the root
-       handle; wr_scan_children() of each record enumerates every reachable
-       JSValue exactly once */
+    /* pass A (assign ids): a machine-parked base registers its TrampFrame
+       chain first (base frame = frame 0); then a queued BFS from the base
+       state and the root handle; wr_scan_children() of each record
+       enumerates every reachable JSValue exactly once */
+    if (tt_flow_base_is_parked(ctx->rt, base)) {
+        if (wr_register_chain(w, base))
+            goto fail;
+    }
     if (wr_enum_state(w, base))
         goto fail;
     if (root_kind == 1 && wr_enum_value(w, root))
@@ -42960,8 +43155,8 @@ static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
             }
         }
     }
-    if (w->state_count == 0 || w->states[0] != base) {
-        JS_ThrowInternalError(ctx, "flow serialization: base state not first");
+    if (w->frame_count == 0 || w->frames[0].sf != &base->frame) {
+        JS_ThrowInternalError(ctx, "flow serialization: base frame not first");
         goto fail;
     }
 
@@ -42973,7 +43168,7 @@ static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
             dbuf_putc(&db, (uint8_t)(fp >> (i * 8)));
     }
     dbuf_put_leb128(&db, w->bl->count);
-    dbuf_put_leb128(&db, 0);  /* flags, reserved */
+    dbuf_put_leb128(&db, w->machine ? TT_FLOWF_MACHINE : 0);
 
     /* private atom table */
     dbuf_put_leb128(&db, w->atom_count);
@@ -43028,28 +43223,33 @@ static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
             JSVarRef *vr = rec->ptr;
             JSStackFrame *sf = vr->stack_frame;
             uint32_t fidx = tt_ptrmap_get(&w->frame_map, sf);
-            uint32_t slot;
-            JSFunctionBytecode *ob;
+            uint32_t k, mem_frame = 0;
+            JSValue *mem_start = NULL;
             if (!fidx) {
                 JS_ThrowTypeError(ctx, "flow serialization: open cell "
                                   "belongs to a frame outside the flow");
                 goto fail;
             }
-            ob = JS_VALUE_GET_OBJ(sf->cur_func)->u.func.function_bytecode;
-            if (vr->pvalue >= sf->arg_buf &&
-                vr->pvalue < sf->arg_buf + sf->arg_count) {
-                slot = (uint32_t)(vr->pvalue - sf->arg_buf) << 1 | 1;
-            } else if (vr->pvalue >= sf->var_buf &&
-                       vr->pvalue < sf->var_buf + ob->var_count) {
-                slot = (uint32_t)(vr->pvalue - sf->var_buf) << 1;
-            } else {
+            /* the cell's storage may live in a DIFFERENT frame than the one
+               it is registered on: an aliased argument window puts a
+               captured arg's slot in the parent's block */
+            for (k = 0; k < w->frame_count; k++) {
+                JSValue *s0 = wr_frame_owned_start(&w->frames[k]);
+                if (vr->pvalue >= s0 && vr->pvalue < w->frames[k].sf->cur_sp) {
+                    mem_frame = k + 1;
+                    mem_start = s0;
+                    break;
+                }
+            }
+            if (!mem_frame) {
                 JS_ThrowInternalError(ctx, "flow serialization: open cell "
-                                      "points outside its frame");
+                                      "points outside the flow's frames");
                 goto fail;
             }
             dbuf_put_leb128(&db, fidx - 1);
             dbuf_put_leb128(&db, vr->var_ref_idx);
-            dbuf_put_leb128(&db, slot);
+            dbuf_put_leb128(&db, mem_frame - 1);
+            dbuf_put_leb128(&db, (uint32_t)(vr->pvalue - mem_start));
             dbuf_putc(&db, (vr->is_lexical ? 1 : 0) | (vr->is_const ? 2 : 0));
             break;
         }
@@ -43072,27 +43272,110 @@ static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
         }
     }
 
-    /* frame table: the parked TrampFrame chain, base first. Every frame is
-       owned by a STATE record in v1; the owner byte reserves the arena
-       (machine-parked) extension. cur_pc travels as (fn_id, offset). */
-    dbuf_put_leb128(&db, w->state_count);
-    for (i = 0; i < w->state_count; i++) {
-        JSAsyncFunctionState *st = w->states[i];
-        JSStackFrame *sf = &st->frame;
+    /* frame table: the parked TrampFrame chain, base first (detached
+       suspended nested states follow). cur_pc travels as a byte offset
+       against the frame's function; every frame carries its live extent
+       and step-cache so a stepping host resumes byte-identically. */
+    dbuf_put_leb128(&db, w->frame_count);
+    for (i = 0; i < w->frame_count; i++) {
+        TTFlowWrFrame *fe = &w->frames[i];
+        JSStackFrame *sf = fe->sf;
         JSObject *fp = JS_VALUE_GET_OBJ(sf->cur_func);
         JSFunctionBytecode *b = fp->u.func.function_bytecode;
-        uint32_t rec_idx = tt_ptrmap_get(&w->map, st);
         uint32_t pc_off = (uint32_t)(sf->cur_pc - b->byte_code_buf);
-        uint32_t stack_len = (uint32_t)(sf->cur_sp - sf->arg_buf);
+        uint32_t stack_len =
+            (uint32_t)(sf->cur_sp - wr_frame_owned_start(fe));
         if (pc_off > (uint32_t)b->byte_code_len) {
             JS_ThrowInternalError(ctx, "flow serialization: pc outside its "
                                   "function");
             goto fail;
         }
-        dbuf_putc(&db, 0);    /* owner: state record */
-        dbuf_put_leb128(&db, rec_idx - 1);
-        dbuf_put_leb128(&db, pc_off);
-        dbuf_put_leb128(&db, stack_len);
+        dbuf_putc(&db, fe->owner);
+        if (fe->owner == 0) {
+            JSAsyncFunctionState *st =
+                container_of(sf, JSAsyncFunctionState, frame);
+            uint32_t rec_idx = tt_ptrmap_get(&w->map, st);
+            dbuf_put_leb128(&db, rec_idx - 1);
+            dbuf_put_leb128(&db, pc_off);
+            dbuf_put_leb128(&db, stack_len);
+            dbuf_putc(&db, fe->chained);
+            if (fe->chained) {
+                /* the in-loop splice linkage; normalized to zero for the
+                   base frame, which is rebuilt as a C-entry (its result
+                   returns to the host in the fresh process) */
+                if (i == 0) {
+                    dbuf_put_leb128(&db, 0);
+                    dbuf_put_leb128(&db, 0);
+                    dbuf_put_leb128(&db, 0);
+                } else {
+                    JSGeneratorData *gs = sf->tt_aux;
+                    uint32_t gobj_rec = 0;
+                    uint32_t k;
+                    /* the generator object owning this splice: find the
+                       GENOBJ record whose data is sf->tt_aux */
+                    for (k = 0; k < w->rec_count; k++) {
+                        if (w->recs[k].kind == TT_REC_GENOBJ &&
+                            ((JSObject *)w->recs[k].ptr)->u.generator_data == gs) {
+                            gobj_rec = k + 1;
+                            break;
+                        }
+                    }
+                    if (!gobj_rec) {
+                        JS_ThrowTypeError(ctx, "flow serialization: chained "
+                                          "generator object escaped the "
+                                          "flow graph");
+                        goto fail;
+                    }
+                    dbuf_put_leb128(&db, (uint32_t)sf->tt_aux_i);
+                    dbuf_put_leb128(&db, sf->tt_call_argc);
+                    dbuf_put_leb128(&db, gobj_rec);
+                }
+            }
+        } else {
+            /* arena TrampFrame: geometry re-derives from cur_func's
+               bytecode; the argument window and `this` are parent-relative
+               so aliasing rebuilds exactly */
+            TTFlowWrFrame *pe = &w->frames[i - 1];
+            JSValue *pstart = wr_frame_owned_start(pe);
+            uint32_t plive = (uint32_t)(pe->sf->cur_sp - pstart);
+            uint32_t argv_off;
+            if (sf->tt_orig_argv < pstart ||
+                sf->tt_orig_argv + sf->tt_orig_argc > pe->sf->cur_sp) {
+                JS_ThrowInternalError(ctx, "flow serialization: argument "
+                                      "window outside the parent frame");
+                goto fail;
+            }
+            argv_off = (uint32_t)(sf->tt_orig_argv - pstart);
+            if (wr_put_vref(w, &db, sf->cur_func))
+                goto fail;
+            dbuf_put_leb128(&db, pc_off);
+            dbuf_putc(&db, sf->tt_frame_kind);
+            dbuf_put_leb128(&db, (uint32_t)sf->tt_orig_argc);
+            dbuf_put_leb128(&db, sf->tt_call_argc);
+            dbuf_put_leb128(&db, stack_len);
+            dbuf_put_leb128(&db, argv_off);
+            if (JS_IsUndefined(sf->tt_this)) {
+                dbuf_putc(&db, 0);
+            } else {
+                /* a method receiver: the value below the callee on the
+                   parent's stack (bit-identical by construction) */
+                uint32_t toff = argv_off - 2;
+                if (argv_off < 2 || toff >= plive ||
+                    memcmp(&pstart[toff], &sf->tt_this,
+                           sizeof(JSValue)) != 0) {
+                    JS_ThrowInternalError(ctx, "flow serialization: `this` "
+                                          "is not the parent receiver slot");
+                    goto fail;
+                }
+                dbuf_putc(&db, 1);
+                dbuf_put_leb128(&db, toff);
+            }
+        }
+        /* step-hook line cache: byte-identical resume under stepping */
+        dbuf_put_leb128(&db, (uint32_t)sf->tt_last_line);
+        dbuf_put_leb128(&db, sf->tt_pc_lo);
+        dbuf_put_leb128(&db, sf->tt_pc_hi);
+        dbuf_put_leb128(&db, sf->tt_prev_off);
     }
 
     /* record payloads (the reader's pass-2 stream) */
@@ -43187,11 +43470,13 @@ static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
         }
     }
 
-    /* frame payloads: each parked frame's live JSValue stack */
-    for (i = 0; i < w->state_count; i++) {
-        JSStackFrame *sf = &w->states[i]->frame;
+    /* frame payloads: each parked frame's owned live JSValue range
+       (aliased argument windows belong to -- and travel with -- the
+       parent frame) */
+    for (i = 0; i < w->frame_count; i++) {
+        JSStackFrame *sf = w->frames[i].sf;
         JSValue *sp;
-        for (sp = sf->arg_buf; sp < sf->cur_sp; sp++)
+        for (sp = wr_frame_owned_start(&w->frames[i]); sp < sf->cur_sp; sp++)
             if (wr_put_vref(w, &db, *sp))
                 goto fail;
     }
@@ -43239,7 +43524,7 @@ fail:
     tt_ptrmap_free(ctx, &w->frame_map);
     tt_ptrmap_free(ctx, &w->atom_map);
     js_free(ctx, w->recs);
-    js_free(ctx, w->states);
+    js_free(ctx, w->frames);
     js_free(ctx, w->atoms);
     return out;
 }
@@ -43251,9 +43536,22 @@ typedef struct TTFlowRdRec {
     JSValue v;                /* OBJ/STRING/SYMBOL construction reference */
     JSVarRef *vr;             /* VARREF construction reference */
     JSAsyncFunctionState *st; /* STATE construction reference */
-    uint32_t fn_id, argc, aux_a, aux_b, aux_c;
+    uint32_t fn_id, argc, aux_a, aux_b, aux_c, aux_d;
     uint8_t u8a;
 } TTFlowRdRec;
+
+/* one rebuilt frame of the TrampFrame chain */
+typedef struct TTFlowRdFrame {
+    JSStackFrame *sf;
+    JSFunctionBytecode *b;
+    JSValue *start;           /* owned value range start */
+    uint32_t live;            /* owned live count ([start, cur_sp)) */
+    uint32_t aux_i, cargc;    /* chained splice linkage (heap frames) */
+    uint32_t genobj_rec;      /* +1; 0 = none */
+    int32_t this_off;         /* arena: parent slot of tt_this, -1 = none */
+    uint8_t owner;            /* 0 = state-owned heap frame, 1 = arena */
+    uint8_t chained;
+} TTFlowRdFrame;
 
 typedef struct TTFlowRd {
     JSContext *ctx;
@@ -43264,8 +43562,11 @@ typedef struct TTFlowRd {
     uint32_t atom_count;
     TTFlowRdRec *recs;
     uint32_t rec_count;
-    JSStackFrame **frames;    /* rebuilt TrampFrame chain, base first */
+    TTFlowRdFrame *frames;    /* rebuilt TrampFrame chain, base first */
     uint32_t frame_count;
+    uint32_t chain_count;     /* leading chained frames (machine extent) */
+    uint8_t machine;
+    uint8_t *arena_saved_top; /* error unwind: pre-rebuild arena top */
 } TTFlowRd;
 
 static JSFunctionBytecode *rd_fn(TTFlowRd *r, uint32_t fn_id)
@@ -43659,6 +43960,31 @@ static int rd_set_proto(TTFlowRd *r, JSValueConst obj)
     return ret < 0 ? -1 : 0;
 }
 
+/* error path: dismantle the arena frames built so far -- their owned live
+   slots plus any cur_func not yet converted to the engine's borrow -- and
+   restore the arena top (memory stays mapped; late free_var_ref calls that
+   clear frame slots remain safe) */
+static void rd_unwind_arena(TTFlowRd *r)
+{
+    uint32_t i;
+    if (r->frames) {
+        for (i = 0; i < r->frame_count; i++) {
+            TTFlowRdFrame *fe = &r->frames[i];
+            uint32_t k;
+            if (fe->owner != 1 || !fe->sf)
+                continue;
+            for (k = 0; k < fe->live; k++)
+                JS_FreeValue(r->ctx, fe->start[k]);
+            if (!fe->aux_i)   /* aux_i = 1 once cur_func became a borrow */
+                JS_FreeValue(r->ctx, fe->sf->cur_func);
+        }
+    }
+    if (r->rt->tt_arena_base) {
+        r->rt->tt_arena_top = r->arena_saved_top ? r->arena_saved_top
+                                                 : r->rt->tt_arena_base;
+    }
+}
+
 /* deserialize_flow(): rebuild a suspended flow in the (fresh) runtime that
    owns the identically rebuilt baseline. Returns the base state with one
    reference for the caller; *proot (optional) receives the root handle. */
@@ -43686,6 +44012,7 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
     r->bl = bl;
     r->rd.ptr = buf;
     r->rd.end = buf + len;
+    r->arena_saved_top = rt->tt_arena_top;
 
     /* ---- header ---- */
     {
@@ -43702,7 +44029,12 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
                           "drift?)");
         goto fail;
     }
-    tt_rd_leb(&r->rd);        /* flags, reserved */
+    r->machine = (tt_rd_leb(&r->rd) & TT_FLOWF_MACHINE) != 0;
+    if (r->machine && rt->tt_parked_frame) {
+        JS_ThrowTypeError(ctx, "flow bytes: a machine is already parked in "
+                          "this runtime");
+        goto fail;
+    }
 
     /* ---- private atoms ---- */
     r->atom_count = tt_rd_leb(&r->rd);
@@ -43795,6 +44127,12 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
             case JS_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
             case JS_GENERATOR_STATE_COMPLETED:
                 break;
+            case JS_GENERATOR_STATE_EXECUTING:
+                /* legal only for states whose frame is in the machine-parked
+                   chain; cross-checked once the frame table is read */
+                if (r->machine)
+                    break;
+                /* fall through */
             default:
                 JS_ThrowTypeError(ctx, "flow bytes: bad generator state");
                 goto fail;
@@ -43830,9 +44168,10 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
         case TT_REC_VARREF_CLOSED: {
             JSVarRef *vr;
             if (kind == TT_REC_VARREF_OPEN) {
-                rec->aux_a = tt_rd_leb(&r->rd);     /* frame idx */
+                rec->aux_a = tt_rd_leb(&r->rd);     /* registration frame */
                 rec->aux_b = tt_rd_leb(&r->rd);     /* var_ref_idx */
-                rec->aux_c = tt_rd_leb(&r->rd);     /* slot<<1|is_arg */
+                rec->aux_c = tt_rd_leb(&r->rd);     /* storage frame */
+                rec->aux_d = tt_rd_leb(&r->rd);     /* slot in owned range */
             }
             rec->u8a = (uint8_t)tt_rd_u8(&r->rd);   /* lexical/const bits */
             if (r->rd.err)
@@ -43897,131 +44236,255 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
 
     /* ---- frame table: rebuild the TrampFrame chain ---- */
     r->frame_count = tt_rd_leb(&r->rd);
-    if (r->rd.err || r->frame_count > r->rec_count)
+    if (r->rd.err || r->frame_count > (uint32_t)len + 16)
         goto trunc;
     if (r->frame_count) {
-        r->frames = js_mallocz(ctx, sizeof(JSStackFrame *) * r->frame_count);
+        r->frames = js_mallocz(ctx, sizeof(TTFlowRdFrame) * r->frame_count);
         if (!r->frames)
             goto fail;
     }
     for (i = 0; i < r->frame_count; i++) {
+        TTFlowRdFrame *fe = &r->frames[i];
         uint32_t owner = tt_rd_u8(&r->rd);
-        uint32_t rec_idx, pc_off, stack_len;
-        TTFlowRdRec *rec;
-        JSAsyncFunctionState *st;
-        JSFunctionBytecode *b;
-        uint32_t min_len, max_len;
-        if (owner != 0) {
-            /* owner 1 (machine-parked arena frames) is reserved: transplanting
-               them re-parks the whole machine, which is the COW page
-               snapshot's domain */
-            JS_ThrowTypeError(ctx, "flow bytes: arena-parked frames are not "
-                              "transplantable");
-            goto fail;
-        }
-        rec_idx = tt_rd_leb(&r->rd);
-        pc_off = tt_rd_leb(&r->rd);
-        stack_len = tt_rd_leb(&r->rd);
-        if (r->rd.err || rec_idx >= r->rec_count ||
-            r->recs[rec_idx].kind != TT_REC_STATE)
+        if (r->rd.err || owner > 1)
             goto trunc;
-        rec = &r->recs[rec_idx];
-        st = rec->st;
-        if (rec->aux_b) {
-            JS_ThrowTypeError(ctx, "flow bytes: duplicate frame owner");
-            goto fail;
+        fe->owner = (uint8_t)owner;
+        fe->this_off = -1;
+        if (owner == 0) {
+            uint32_t rec_idx = tt_rd_leb(&r->rd);
+            uint32_t pc_off = tt_rd_leb(&r->rd);
+            uint32_t stack_len = tt_rd_leb(&r->rd);
+            TTFlowRdRec *rec;
+            JSAsyncFunctionState *st;
+            JSFunctionBytecode *b;
+            uint32_t min_len, max_len;
+            fe->chained = (uint8_t)tt_rd_u8(&r->rd);
+            if (r->rd.err || rec_idx >= r->rec_count ||
+                r->recs[rec_idx].kind != TT_REC_STATE || fe->chained > 1)
+                goto trunc;
+            if (fe->chained) {
+                if (!r->machine)
+                    goto trunc;
+                fe->aux_i = tt_rd_leb(&r->rd);
+                fe->cargc = tt_rd_leb(&r->rd);
+                fe->genobj_rec = tt_rd_leb(&r->rd);
+                if (r->rd.err || fe->cargc > 65535)
+                    goto trunc;
+            }
+            rec = &r->recs[rec_idx];
+            st = rec->st;
+            if (rec->aux_b) {
+                JS_ThrowTypeError(ctx, "flow bytes: duplicate frame owner");
+                goto fail;
+            }
+            rec->aux_b = 1;          /* this state's frame is claimed */
+            rec->aux_c = i + 1;      /* frame index, for cross-validation */
+            b = rd_fn(r, rec->fn_id);
+            /* cur_pc relocation: function id + byte offset into the fresh
+               process's identical bytecode */
+            if (pc_off > (uint32_t)b->byte_code_len) {
+                JS_ThrowTypeError(ctx, "flow bytes: pc offset outside "
+                                  "function");
+                goto fail;
+            }
+            min_len = (uint32_t)st->frame.arg_count + b->var_count;
+            max_len = min_len + b->stack_size;
+            if (stack_len < min_len || stack_len > max_len) {
+                JS_ThrowTypeError(ctx, "flow bytes: bad stack extent");
+                goto fail;
+            }
+            st->frame.cur_pc = b->byte_code_buf + pc_off;
+            st->frame.cur_sp = st->frame.arg_buf + stack_len;
+            fe->sf = &st->frame;
+            fe->b = b;
+            fe->start = st->frame.arg_buf;
+            fe->live = stack_len;
+        } else {
+            /* an arena TrampFrame: geometry re-derives from its function's
+               bytecode; the argument window (and a method receiver) alias
+               the PARENT frame's owned slots, exactly as the push made
+               them. cur_func is validated now and converted to the
+               engine's borrow once the parent's slots are decoded. */
+            JSValue f = rd_get_vref(r);
+            JSObject *fo;
+            JSFunctionBytecode *b;
+            uint32_t pc_off, kindb, orig_argc, cargc, stack_len, argv_off;
+            uint32_t this_mode, this_off = 0;
+            uint32_t aas, val_count, min_len, k;
+            TTFlowRdFrame *pe;
+            JSValue *vals;
+            JSStackFrame *sf;
+            if (JS_IsException(f))
+                goto fail;
+            if (JS_VALUE_GET_TAG(f) != JS_TAG_OBJECT ||
+                JS_VALUE_GET_OBJ(f)->class_id != JS_CLASS_BYTECODE_FUNCTION) {
+                JS_FreeValue(ctx, f);
+                JS_ThrowTypeError(ctx, "flow bytes: bad arena frame "
+                                  "function");
+                goto fail;
+            }
+            fo = JS_VALUE_GET_OBJ(f);
+            b = fo->u.func.function_bytecode;
+            pc_off = tt_rd_leb(&r->rd);
+            kindb = tt_rd_u8(&r->rd);
+            orig_argc = tt_rd_leb(&r->rd);
+            cargc = tt_rd_leb(&r->rd);
+            stack_len = tt_rd_leb(&r->rd);
+            argv_off = tt_rd_leb(&r->rd);
+            this_mode = tt_rd_u8(&r->rd);
+            if (!r->rd.err && this_mode == 1)
+                this_off = tt_rd_leb(&r->rd);
+            if (r->rd.err || i == 0 || !r->machine || this_mode > 1 ||
+                orig_argc > 65535 || cargc > 65535) {
+                JS_FreeValue(ctx, f);
+                goto trunc;
+            }
+            if (kindb != TT_FRAME_CALL && kindb != TT_FRAME_CALL_METHOD &&
+                kindb != TT_FRAME_TAIL && kindb != TT_FRAME_TAIL_METHOD) {
+                JS_FreeValue(ctx, f);
+                JS_ThrowTypeError(ctx, "flow bytes: bad arena frame kind");
+                goto fail;
+            }
+            pe = &r->frames[i - 1];
+            if (!pe->chained ||
+                pc_off > (uint32_t)b->byte_code_len ||
+                argv_off < 1 || argv_off + orig_argc > pe->live ||
+                (this_mode == 1 &&
+                 (argv_off < 2 || this_off != argv_off - 2))) {
+                JS_FreeValue(ctx, f);
+                JS_ThrowTypeError(ctx, "flow bytes: bad arena frame extent");
+                goto fail;
+            }
+            aas = (orig_argc < (uint32_t)b->arg_count) ? (uint32_t)b->arg_count
+                                                       : 0;
+            val_count = aas + b->var_count + b->stack_size;
+            min_len = aas + b->var_count;
+            if (stack_len < min_len || stack_len > val_count) {
+                JS_FreeValue(ctx, f);
+                JS_ThrowTypeError(ctx, "flow bytes: bad stack extent");
+                goto fail;
+            }
+            sf = tt_arena_push(rt, val_count, b->var_ref_count, &vals);
+            if (!sf) {
+                JS_FreeValue(ctx, f);
+                JS_ThrowStackOverflow(ctx);
+                goto fail;
+            }
+            sf->js_mode = b->js_mode;
+            sf->cur_func = f;         /* owned until the borrow fixup */
+            sf->cur_pc = b->byte_code_buf + pc_off;
+            sf->cur_sp = vals + stack_len;
+            sf->tt_frame_kind = (uint8_t)kindb;
+            sf->tt_call_argc = (uint16_t)cargc;
+            sf->tt_this = JS_UNDEFINED;   /* receiver bound post-payload */
+            sf->tt_new_target = JS_UNDEFINED;
+            sf->tt_orig_argv = pe->start + argv_off;
+            sf->tt_orig_argc = (int)orig_argc;
+            sf->tt_frame_base = vals;
+            sf->tt_ctor_this = JS_UNDEFINED;
+            sf->tt_aux = NULL;
+            sf->tt_aux_i = 0;
+            sf->arg_buf = aas ? vals : pe->start + argv_off;
+            sf->arg_count = aas ? b->arg_count : (int)orig_argc;
+            sf->var_buf = vals + aas;
+            sf->var_refs = (JSVarRef **)(vals + val_count);
+            for (k = 0; k < (uint32_t)b->var_ref_count; k++)
+                sf->var_refs[k] = NULL;
+            for (k = 0; k < val_count; k++)
+                vals[k] = JS_UNDEFINED;
+            sf->prev_frame = pe->sf;
+            fe->sf = sf;
+            fe->b = b;
+            fe->start = vals;
+            fe->live = stack_len;
+            fe->chained = 1;
+            fe->this_off = (this_mode == 1) ? (int32_t)this_off : -1;
         }
-        rec->aux_b = 1;       /* this state's frame is claimed */
-        b = rd_fn(r, rec->fn_id);
-        /* cur_pc relocation: function id + byte offset into the fresh
-           process's identical bytecode */
-        if (pc_off > (uint32_t)b->byte_code_len) {
-            JS_ThrowTypeError(ctx, "flow bytes: pc offset outside function");
-            goto fail;
+        {   /* step-hook line cache, for byte-identical stepping */
+            uint32_t l0 = tt_rd_leb(&r->rd), l1 = tt_rd_leb(&r->rd);
+            uint32_t l2 = tt_rd_leb(&r->rd), l3 = tt_rd_leb(&r->rd);
+            if (r->rd.err)
+                goto trunc;
+            fe->sf->tt_last_line = (int)l0;
+            fe->sf->tt_pc_lo = l1;
+            fe->sf->tt_pc_hi = l2;
+            fe->sf->tt_prev_off = l3;
         }
-        min_len = (uint32_t)st->frame.arg_count + b->var_count;
-        max_len = min_len + b->stack_size;
-        if (stack_len < min_len || stack_len > max_len) {
-            JS_ThrowTypeError(ctx, "flow bytes: bad stack extent");
-            goto fail;
-        }
-        st->frame.cur_pc = b->byte_code_buf + pc_off;
-        st->frame.cur_sp = st->frame.arg_buf + stack_len;
-        r->frames[i] = &st->frame;
     }
-    /* every STATE record must own exactly one frame */
+    /* chain shape: chained frames form a non-empty prefix iff a machine
+       travels; every STATE record owns exactly one frame */
     {
-        uint32_t nstates = 0;
+        uint32_t nstates = 0, nchained = 0;
+        BOOL in_prefix = TRUE;
+        for (i = 0; i < r->frame_count; i++) {
+            if (r->frames[i].chained) {
+                if (!in_prefix)
+                    goto badchain;
+                nchained++;
+            } else {
+                in_prefix = FALSE;
+            }
+        }
+        if (r->machine != (nchained != 0) ||
+            (r->machine && !r->frames[0].chained)) {
+        badchain:
+            JS_ThrowTypeError(ctx, "flow bytes: malformed frame chain");
+            goto fail;
+        }
+        r->chain_count = nchained;
         for (i = 0; i < r->rec_count; i++)
             if (r->recs[i].kind == TT_REC_STATE)
                 nstates++;
-        if (nstates != r->frame_count) {
-            JS_ThrowTypeError(ctx, "flow bytes: state/frame count mismatch");
-            goto fail;
+        {
+            uint32_t nheap = 0;
+            for (i = 0; i < r->frame_count; i++)
+                if (r->frames[i].owner == 0)
+                    nheap++;
+            if (nstates != nheap) {
+                JS_ThrowTypeError(ctx, "flow bytes: state/frame count "
+                                  "mismatch");
+                goto fail;
+            }
         }
     }
 
     /* ---- var_ref fixups: reattach open cells over the rebuilt stacks ---- */
     for (i = 0; i < r->rec_count; i++) {
         TTFlowRdRec *rec = &r->recs[i];
-        JSStackFrame *sf;
+        TTFlowRdFrame *rf, *mf;
         JSVarRef *vr;
-        JSValue *pv;
-        uint32_t slot, is_arg;
-        JSFunctionBytecode *b;
         if (rec->kind != TT_REC_VARREF_OPEN)
             continue;
         vr = rec->vr;
-        if (rec->aux_a >= r->frame_count)
+        if (rec->aux_a >= r->frame_count || rec->aux_c >= r->frame_count)
             goto trunc;
-        sf = r->frames[rec->aux_a];
-        {
+        rf = &r->frames[rec->aux_a];      /* frame the cell registers on */
+        mf = &r->frames[rec->aux_c];      /* frame owning the cell's slot */
+        if (rec->aux_b >= (uint32_t)rf->b->var_ref_count) {
+            JS_ThrowTypeError(ctx, "flow bytes: bad var_ref index");
+            goto fail;
+        }
+        if (rec->aux_d >= mf->live) {
+            JS_ThrowTypeError(ctx, "flow bytes: open cell slot out of "
+                              "range");
+            goto fail;
+        }
+        if (rf->sf->var_refs[rec->aux_b]) {
+            JS_ThrowTypeError(ctx, "flow bytes: duplicate open cell");
+            goto fail;
+        }
+        /* mirror get_var_ref(): the frame slot stays weak; a cell on a
+           heap (async-state) frame pins its owner */
+        vr->is_detached = FALSE;
+        vr->var_ref_idx = (uint16_t)rec->aux_b;
+        vr->stack_frame = rf->sf;
+        vr->pvalue = mf->start + rec->aux_d;
+        rf->sf->var_refs[rec->aux_b] = vr;
+        if (rf->sf->js_mode & JS_MODE_ASYNC) {
             JSAsyncFunctionState *owner =
-                container_of(sf, JSAsyncFunctionState, frame);
-            uint32_t k;
-            /* recover the owner's bytecode for slot validation */
-            b = NULL;
-            for (k = 0; k < r->rec_count; k++) {
-                if (r->recs[k].kind == TT_REC_STATE &&
-                    r->recs[k].st == owner) {
-                    b = rd_fn(r, r->recs[k].fn_id);
-                    break;
-                }
-            }
-            if (!b)
-                goto trunc;
-            slot = rec->aux_c >> 1;
-            is_arg = rec->aux_c & 1;
-            if (rec->aux_b >= b->var_ref_count) {
-                JS_ThrowTypeError(ctx, "flow bytes: bad var_ref index");
-                goto fail;
-            }
-            if (is_arg) {
-                if (slot >= (uint32_t)sf->arg_count)
-                    goto badslot;
-                pv = &sf->arg_buf[slot];
-            } else {
-                if (slot >= (uint32_t)b->var_count)
-                    goto badslot;
-                pv = &sf->var_buf[slot];
-            }
-            if (sf->var_refs[rec->aux_b]) {
-                JS_ThrowTypeError(ctx, "flow bytes: duplicate open cell");
-                goto fail;
-            }
-            /* mirror get_var_ref(): the frame slot stays weak, the ref pins
-               the owning async state */
-            vr->is_detached = FALSE;
-            vr->var_ref_idx = (uint16_t)rec->aux_b;
-            vr->stack_frame = sf;
-            vr->pvalue = pv;
-            sf->var_refs[rec->aux_b] = vr;
+                container_of(rf->sf, JSAsyncFunctionState, frame);
             js_rc(owner)->ref_count++;
         }
-        continue;
-    badslot:
-        JS_ThrowTypeError(ctx, "flow bytes: open cell slot out of range");
-        goto fail;
     }
 
     /* ---- pass 2: relink every payload against the complete map ---- */
@@ -44182,15 +44645,124 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
         }
     }
 
-    /* ---- frame payloads: the JSValue stacks ---- */
+    /* ---- frame payloads: each frame's owned JSValue range ---- */
     for (i = 0; i < r->frame_count; i++) {
-        JSStackFrame *sf = r->frames[i];
+        TTFlowRdFrame *fe = &r->frames[i];
         JSValue *sp;
-        for (sp = sf->arg_buf; sp < sf->cur_sp; sp++) {
+        for (sp = fe->start; sp < fe->start + fe->live; sp++) {
             JSValue v = rd_get_vref(r);
             if (JS_IsException(v))
                 goto fail;
             *sp = v;          /* overwrites the UNDEFINED placeholder */
+        }
+    }
+
+    /* ---- machine fixups: now that parent slots hold real values, bind
+       the borrows and the in-loop splice linkage, and cross-validate the
+       chain against the generator records ---- */
+    for (i = 0; i < r->frame_count; i++) {
+        TTFlowRdFrame *fe = &r->frames[i];
+        TTFlowRdFrame *pe = i ? &r->frames[i - 1] : NULL;
+        if (fe->owner == 1) {
+            JSStackFrame *sf = fe->sf;
+            uint32_t argv_off = (uint32_t)(sf->tt_orig_argv - pe->start);
+            /* the function below the argument window must be the same
+               closure the frame was built from; then the frame keeps the
+               engine's borrow and the parent slot keeps the reference */
+            if (memcmp(&pe->start[argv_off - 1], &sf->cur_func,
+                       sizeof(JSValue)) != 0) {
+                JS_ThrowTypeError(ctx, "flow bytes: arena frame function "
+                                  "does not match its call site");
+                goto fail;
+            }
+            JS_FreeValue(ctx, sf->cur_func);   /* convert to borrow */
+            fe->aux_i = 1;
+            if (fe->this_off >= 0)
+                sf->tt_this = pe->start[fe->this_off];
+        } else if (fe->chained && i > 0) {
+            /* a nested in-loop generator splice */
+            JSStackFrame *sf = fe->sf;
+            JSGeneratorData *gd;
+            JSAsyncFunctionState *st =
+                container_of(sf, JSAsyncFunctionState, frame);
+            uint32_t gshape = (fe->aux_i >> 8) & 0xff;
+            if (!fe->genobj_rec || fe->genobj_rec - 1 >= r->rec_count ||
+                r->recs[fe->genobj_rec - 1].kind != TT_REC_GENOBJ)
+                goto trunc;
+            gd = JS_GetOpaque(r->recs[fe->genobj_rec - 1].v,
+                              JS_CLASS_GENERATOR);
+            if (!gd || gd->func_state != st ||
+                gd->state != JS_GENERATOR_STATE_EXECUTING ||
+                !pe->chained) {
+                JS_ThrowTypeError(ctx, "flow bytes: chained generator "
+                                  "record mismatch");
+                goto fail;
+            }
+            if (gshape != TT_GENSHAPE_METHOD && gshape != TT_GENSHAPE_FOROF &&
+                gshape != TT_GENSHAPE_ITERNEXT &&
+                gshape != TT_GENSHAPE_ITERCALL) {
+                JS_ThrowTypeError(ctx, "flow bytes: bad generator splice "
+                                  "shape");
+                goto fail;
+            }
+            sf->tt_frame_kind = TT_FRAME_GEN;
+            sf->tt_aux = gd;
+            sf->tt_aux_i = (int)fe->aux_i;
+            sf->tt_call_argc = (uint16_t)fe->cargc;
+            sf->prev_frame = pe->sf;
+        } else if (fe->chained) {
+            /* the base frame of a machine-parked flow: rebuilt as a C
+               entry so its yields/returns come back to the host */
+            JSAsyncFunctionState *st =
+                container_of(fe->sf, JSAsyncFunctionState, frame);
+            JSGeneratorData *gd = NULL;
+            uint32_t k;
+            for (k = 0; k < r->rec_count; k++) {
+                if (r->recs[k].kind == TT_REC_GENOBJ) {
+                    JSGeneratorData *g2 =
+                        JS_GetOpaque(r->recs[k].v, JS_CLASS_GENERATOR);
+                    if (g2 && g2->func_state == st) {
+                        gd = g2;
+                        break;
+                    }
+                }
+            }
+            if (!gd || gd->state != JS_GENERATOR_STATE_EXECUTING) {
+                JS_ThrowTypeError(ctx, "flow bytes: machine-parked base "
+                                  "without an executing generator record");
+                goto fail;
+            }
+        }
+    }
+    /* every EXECUTING generator record must sit on the parked chain */
+    for (i = 0; i < r->rec_count; i++) {
+        TTFlowRdRec *rec = &r->recs[i];
+        JSGeneratorData *gd;
+        uint32_t fidx;
+        if (rec->kind != TT_REC_GENOBJ ||
+            rec->u8a != JS_GENERATOR_STATE_EXECUTING)
+            continue;
+        gd = JS_GetOpaque(rec->v, JS_CLASS_GENERATOR);
+        if (!gd || !gd->func_state)
+            goto trunc;
+        /* its state's frame index was stamped at claim time */
+        {
+            uint32_t k, srec = 0;
+            for (k = 0; k < r->rec_count; k++) {
+                if (r->recs[k].kind == TT_REC_STATE &&
+                    r->recs[k].st == gd->func_state) {
+                    srec = k + 1;
+                    break;
+                }
+            }
+            if (!srec)
+                goto trunc;
+            fidx = r->recs[srec - 1].aux_c;
+            if (!fidx || !r->frames[fidx - 1].chained) {
+                JS_ThrowTypeError(ctx, "flow bytes: executing generator "
+                                  "outside the parked chain");
+                goto fail;
+            }
         }
     }
 
@@ -44200,8 +44772,8 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
         TTFlowDelta *d = NULL;
         if (r->rd.err || n > (uint32_t)len + 16)
             goto trunc;
-        base = r->frame_count ?
-            container_of(r->frames[0], JSAsyncFunctionState, frame) : NULL;
+        base = (r->frame_count && r->frames[0].owner == 0) ?
+            container_of(r->frames[0].sf, JSAsyncFunctionState, frame) : NULL;
         if (!base) {
             JS_ThrowTypeError(ctx, "flow bytes: no base frame");
             goto fail;
@@ -44280,6 +44852,13 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
         }
     }
 
+    /* ---- stage the transplanted machine: the rebuilt chain becomes the
+       runtime's parked chain, resumable with JS_TTFlowResumeParked ---- */
+    if (r->machine) {
+        rt->tt_parked_frame = r->frames[r->chain_count - 1].sf;
+        rt->current_stack_frame = rt->tt_parked_frame;
+    }
+
     /* ---- reconciliation: keep the graph, drop construction refs ---- */
     js_rc(base)->ref_count++;             /* the caller's reference */
     rd_release(r);
@@ -44293,6 +44872,7 @@ trunc:
     JS_ThrowTypeError(ctx, "flow bytes: truncated or corrupt");
 fail:
     JS_FreeValue(ctx, root_val);
+    rd_unwind_arena(r);
     rd_release(r);
     return NULL;
 }
@@ -44331,6 +44911,56 @@ JSValue JS_TTFlowDeserialize(JSContext *ctx, const uint8_t *buf, size_t len)
         return JS_ThrowTypeError(ctx, "flow bytes: no host handle (bare "
                                  "state root)");
     return root;
+}
+
+/* Resume a transplanted machine-parked flow: completes the next() that the
+   park interrupted in the source process. cmd 0 continues, cmd 1 aborts
+   (an Interrupted error unwinds the whole chain, completing the flow --
+   the way to discard a transplanted parked flow without leaking it).
+   *pdone follows the generator protocol (0 yielded, 1 done, 2 yield*
+   delegation); *pparked = 1 means a step handler re-parked the machine --
+   call again to continue. Afterwards the flow is an ordinary suspended
+   generator: drive it with next(). */
+JSValue JS_TTFlowResumeParked(JSContext *ctx, JSValueConst flow, int cmd,
+                              int *pdone, int *pparked)
+{
+    JSRuntime *rt = ctx->rt;
+    JSGeneratorData *gd;
+    JSAsyncFunctionState *s;
+    JSValue func_ret, ret;
+    BOOL gdone = TRUE;
+
+    *pdone = 1;
+    *pparked = 0;
+    if (JS_VALUE_GET_TAG(flow) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_OBJ(flow)->class_id != JS_CLASS_GENERATOR)
+        return JS_ThrowTypeError(ctx, "flow handle must be a generator "
+                                 "object");
+    gd = JS_GetOpaque(flow, JS_CLASS_GENERATOR);
+    if (!gd || !gd->func_state || gd->state != JS_GENERATOR_STATE_EXECUTING)
+        return JS_ThrowTypeError(ctx, "flow is not machine-parked");
+    s = gd->func_state;
+    if (!rt->tt_parked_frame || !tt_flow_base_is_parked(rt, s))
+        return JS_ThrowTypeError(ctx, "flow is not the parked machine");
+    if (s->frame.tt_frame_kind != TT_FRAME_ENTRY ||
+        s->frame.prev_frame != NULL)
+        return JS_ThrowTypeError(ctx, "flow is parked inside a live machine; "
+                                 "resume it with JS_TTCallResume instead");
+    if (js_check_stack_overflow(rt, 0))
+        return JS_ThrowStackOverflow(ctx);
+    rt->tt_park_ok = TRUE;
+    rt->tt_park_abort = (cmd == 1);
+    func_ret = JS_CallInternal(ctx, JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED,
+                               0, NULL, JS_CALL_FLAG_TT_RESUME);
+    if (rt->tt_parked_frame) {
+        *pparked = 1;
+        return JS_UNDEFINED;
+    }
+    rt->tt_park_ok = FALSE;
+    func_ret = async_func_finish(ctx, s, func_ret);
+    ret = js_generator_resume_post(ctx, gd, func_ret, &gdone);
+    *pdone = (int)gdone;
+    return ret;
 }
 /*---------------------------------------------------------------------------*/
 /* end TimeTravelJS flow serialization                                        */

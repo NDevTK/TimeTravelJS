@@ -11,16 +11,21 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
                                               JSValue *proot);
 ```
 
-with the public wrappers `JS_TTFlowSerialize` / `JS_TTFlowDeserialize` and the
-baseline registry `JS_TTBaselineCapture*` (declared in `quickjs.h`). A *flow*
-is a suspended computation rooted at a `JSAsyncFunctionState` — the struct
-QuickJS uses for both generator and async-function activations — plus the
-chain of parked interpreter frames reachable from it and a per-flow COW delta
-of first-writes against shared baseline objects. The proof harness is
-`tests/flow/` (`sh tests/flow/run.sh`, or `npm run test:flow`): process A
-parks a flow two frames deep inside a `yield*` chain, records a delta, and
-serializes; process B rebuilds the baseline from the same source, restores
-the bytes, and resumes — the two futures are compared **byte for byte**.
+with the public wrappers `JS_TTFlowSerialize` / `JS_TTFlowDeserialize` /
+`JS_TTFlowResumeParked` and the baseline registry `JS_TTBaselineCapture*`
+(declared in `quickjs.h`). A *flow* is a suspended computation rooted at a
+`JSAsyncFunctionState` — the struct QuickJS uses for both generator and
+async-function activations — plus its parked TrampFrame chain and a
+per-flow COW delta of first-writes against shared baseline objects. The
+chain covers both suspension styles: a flow parked at a yield (each
+`yield*` level contributes its state's heap frame) and a flow parked
+*mid-call* by the step hook's park-by-return, where the chain additionally
+carries the arena frames of the helpers it was inside. The proof harness
+is `tests/flow/` (`sh tests/flow/run.sh`, or `npm run test:flow`): process
+A parks one flow at a yield inside a `yield*` chain and another four
+frames deep inside a helper call, records deltas, and serializes; process
+B rebuilds the baseline from the same source, restores the bytes, and
+resumes both — futures compared **byte for byte**.
 
 ## The contract
 
@@ -115,16 +120,44 @@ refused at serialization with a precise error.
 
 ## 4. The TrampFrame chain and var_ref reconstruction
 
-The frame table lists the flow's parked frames outermost-first (frame 0 =
-the base state's own frame; a `yield*` chain contributes one frame per
-nested suspended state). Each entry carries its owner state record, the
-relocated pc, and the live stack extent `cur_sp - arg_buf`; each frame's
-`[arg_buf, cur_sp)` — arguments, locals, and operand stack — is replayed
-value-by-value in the payload. Frame geometry (`max(arg_count, argc) +
-var_count + stack_size` slots plus `var_ref_count` cell slots) is
-*re-derived from the function bytecode*, never trusted from the wire; the
-stack extent is validated against it. The owner byte reserves a second kind
-for arena-parked machine frames (see limits).
+The frame table lists the flow's parked frames outermost-first, frame 0 =
+the base state's own frame. Two owner kinds coexist in one chain:
+
+- **state-owned heap frames** — the base, suspended `yield*` states, and
+  (when the machine is parked mid-run) nested generators spliced in-loop.
+  A `chained` entry carries its splice linkage (`tt_aux_i` shape,
+  call-site argc, and the owning generator record) so its pop delivers
+  results to the caller frame exactly as the original splice would.
+- **arena TrampFrames** — plain inlined calls (`TT_FRAME_CALL`,
+  `CALL_METHOD`, `TAIL`, `TAIL_METHOD`) left parked by the step hook's
+  park-by-return. Serialization validates the chain against this subset
+  (kinds whose pops touch no side arena blocks) and checks the arena
+  extent is exactly the chain's frames, contiguously — pump descriptors or
+  other foreign blocks refuse loudly. The frame record carries the
+  relocated pc, call-site argc, live extent, and the **parent-relative
+  offsets** of its argument window and method receiver: QuickJS aliases
+  `arg_buf` into the caller's operand stack when `argc >= arg_count`, and
+  the rebuild reproduces that aliasing (and the copied-argument layout
+  otherwise) exactly, so ownership on pop is byte-for-byte the engine's.
+  `cur_func` is decoded for geometry, validated bit-identical against the
+  parent's callee slot, then converted to the engine's borrow.
+
+Every frame's owned range `[owned_start, cur_sp)` — where `owned_start` is
+`arg_buf` for heap frames and the allocation block for arena frames — is
+replayed value-by-value in the payload; aliased windows travel exactly
+once, with their owner. Geometry (`arg_alloc + var_count + stack_size`
+slots plus `var_ref_count` cells) re-derives from the function bytecode,
+never trusted from the wire; extents, offsets, and the step-hook line
+cache (carried so a stepping host resumes byte-identically) are all
+bounds-checked. On success the rebuilt chain is staged as the fresh
+runtime's parked machine (`rt->tt_parked_frame`), refusing to transplant
+into a runtime whose machine is already parked.
+
+Closure cells rebuild over those stacks with a two-frame address: the
+frame the cell *registers on* (its `var_refs[]` slot) and the frame that
+*owns its storage* — distinct exactly when a captured argument lives in an
+aliased window. Cells on heap frames pin their owning state, mirroring
+`get_var_ref`; cells on arena frames do not, mirroring the engine.
 
 Closure cells rebuild over those stacks:
 
@@ -195,17 +228,40 @@ Check-in/out are pure swaps: refcount-neutral by construction, in either
 process. The delta rides on the base `JSAsyncFunctionState` (`tt_delta`)
 and is freed with it.
 
-## Wire format (`TTFL01`)
+## Resuming a transplanted machine
+
+A flow serialized while machine-parked arrives EXECUTING: its base frame is
+rebuilt as a C entry (`TT_FRAME_ENTRY`), so when the chain finishes or the
+generator yields, the dispatch loop returns to the host instead of to a
+caller frame that stayed behind in the source process — the fresh process's
+host *becomes* the driver. `JS_TTFlowResumeParked(ctx, flow, cmd, &done,
+&parked)` re-enters the loop at the innermost frame (`JS_CALL_FLAG_TT_RESUME`)
+and completes the interrupted `next()`: `done` follows the generator
+protocol (0 yield, 1 return, 2 `yield*` delegation result), `parked`
+reports a re-park if the fresh host steps too. `cmd 1` aborts instead: an
+Interrupted error unwinds helper → nested generators → base through the
+engine's own exception path, completing the flow — the leak-free way to
+discard a transplanted parked flow. Afterwards the flow is an ordinary
+suspended generator, driven with `next()`. A flow still parked inside a
+*live* machine (its base frame not yet transplant-rewritten) is refused
+with a pointer to `JS_TTCallResume`.
+
+## Wire format (`TTFL02`)
 
 ```
 header    magic, baseline fingerprint (u64), baseline count, flags
+          (bit 0: a machine-parked chain travels in these bytes)
 atoms     private name strings (interned on read)
 records   shell table: kind + allocation parameters (class, fn_id, argc,
           element count, open-cell coordinates, string/symbol bytes)
-frames    the TrampFrame chain: owner state record, pc offset, stack extent
+frames    the TrampFrame chain, base first: owner byte (state | arena);
+          state: record idx, pc offset, live extent, splice linkage;
+          arena: cur_func vref, pc offset, frame kind, call-site argc,
+          live extent, parent-relative argument window + receiver slot;
+          both: the step-hook line cache
 payloads  per record: prototype, properties (atomref, 6-bit shape flags,
           kind-specific payload), fast elements, closure cells, state
-          fields; then per frame: the live JSValue stack
+          fields; then per frame: the owned live JSValue range
 delta     (target, value) records: PROP obj+atom / CELL ref, then the view
 root      handle kind + vref (generator object) or base state index
 ```
@@ -224,11 +280,15 @@ at any byte (fuzzed in the selftest) with a `TypeError` — never a crash.
   queue; transplanting severs external awaiters, so restoring them is a
   job-queue feature, not a value-graph one. The state serializer is
   class-general (`resolving_funcs` travel in the format) for that follow-up.
-- **Machine-parked arena frames** (a flow suspended mid-helper-call by the
-  park-by-return machinery, `rt->tt_parked_frame`) are refused for now: the
-  frame-table owner byte reserves their encoding, but resuming them means
-  re-parking the whole machine, which today is the COW page snapshot's
-  domain.
+- **Machine-parked chains** transplant when every parked frame is a plain
+  inlined call or an in-loop generator splice (`METHOD`/`FOROF`/
+  `ITERNEXT`/`ITERCALL` shapes) — which is what stepping through ordinary
+  generator code produces. Chains running through the reflective residue
+  (pumped builtins, proxy traps, deferred accessors, `OP_append` spreads:
+  frame kinds whose pops consume side arena blocks) are refused with the
+  kind named. Note that a *direct* `g.next()` call from script goes
+  through C and is unparkable by the engine's own design; parks form under
+  language-level iteration (`for-of`, `yield*`), as in the harness.
 - Flow-private values of exotic classes (Map/Set/Proxy/TypedArray/promises,
   heap bigints, `Symbol.for`) are refused with the class named in the
   error; *baseline* objects of any class pass by id.
