@@ -3,3 +3,4 @@ dist/quickjs-tt.raw.wasm
 *.tmp.mjs
 *.wat
 .DS_Store
+tests/flow/build/

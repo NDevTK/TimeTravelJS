@@ -1,0 +1,241 @@
+# Flow serialization: transplanting a suspended flow into a fresh process
+
+`vendor/quickjs/quickjs.c` (section "TimeTravelJS: cross-process flow
+serialization") implements
+
+```c
+static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
+                               JSValueConst root, int root_kind, size_t *plen);
+static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
+                                              const uint8_t *buf, size_t len,
+                                              JSValue *proot);
+```
+
+with the public wrappers `JS_TTFlowSerialize` / `JS_TTFlowDeserialize` and the
+baseline registry `JS_TTBaselineCapture*` (declared in `quickjs.h`). A *flow*
+is a suspended computation rooted at a `JSAsyncFunctionState` — the struct
+QuickJS uses for both generator and async-function activations — plus the
+chain of parked interpreter frames reachable from it and a per-flow COW delta
+of first-writes against shared baseline objects. The proof harness is
+`tests/flow/` (`sh tests/flow/run.sh`, or `npm run test:flow`): process A
+parks a flow two frames deep inside a `yield*` chain, records a delta, and
+serializes; process B rebuilds the baseline from the same source, restores
+the bytes, and resumes — the two futures are compared **byte for byte**.
+
+## The contract
+
+Both processes must build the same *baseline* before flows move:
+
+1. evaluate byte-identical baseline code (same script, same order), then
+2. call `JS_TTBaselineCapture(ctx)`.
+
+Capture walks the heap breadth-first from the global object in a fixed
+structural order and assigns every reachable entity a **stable id**: its
+ordinal in that walk. Because the walk order is a pure function of the heap
+shape and the heaps are built identically, id *N* in process A and id *N* in
+process B name "the same" object. Two guards keep this honest:
+
+- **Forced materialization.** QuickJS installs intrinsic methods and
+  `fn.prototype` lazily (`JS_PROP_AUTOINIT`). First *read* materializes a
+  fresh object — so a flow that touched `%GeneratorPrototype%.next` before
+  capture-time in one process and after it in the other would disagree about
+  what exists. Capture therefore forces every autoinit property it walks
+  (`JS_AutoInitProperty`, in shape order) so both processes materialize the
+  same objects at the same ids *before* any flow runs.
+- **A fingerprint** (order/kind/class hash over the registration sequence,
+  embedded in every flow's bytes) rejects transplants into a drifted
+  baseline with a clear error instead of undefined behavior.
+
+The registry holds one reference per entry (objects, function bytecodes,
+detached closure cells, symbols), pinning the baseline for the runtime's
+lifetime; `JS_FreeRuntime` releases it automatically.
+
+## 1. The stable-id scheme: by-reference vs by-value
+
+Every `JSValue` reachable from the frames and the delta is classified at
+serialization time by one pointer lookup:
+
+- **baseline (by reference)** — the pointer is in the registry. The wire
+  carries `(id << 2) | 1`, a few bytes, regardless of the object's size.
+- **flow-private (by value)** — everything else. The value joins the flow's
+  private record table and is copied structurally: plain objects and arrays
+  (prototype, property flags, accessors), closures (function-id + captured
+  cells + own props), generator wrappers, nested suspended
+  `JSAsyncFunctionState`s, strings, symbols (identity deduplicated within
+  the flow), `JSVarRef` cells, primitive wrappers.
+- **immediates** — ints, doubles, booleans, `undefined`/`null`,
+  TDZ `uninitialized`, catch offsets, short bigints — travel inline.
+
+A value reference (`vref`) is one uleb128 whose low two bits select the
+space: `0` inline, `1` baseline id, `2` private record index. Property keys
+use the same split: atoms below `JS_ATOM_END` (the predefined table compiled
+into both processes) and array indices pass as numbers; anything else is
+interned via a private atom table; symbol keys reference the symbol value.
+
+**The dedup guarantee:** a baseline object shared across N serialized flows
+is serialized **zero** times — each flow carries only its uleb id, and all N
+flows relink to the *same* rebuilt object in the fresh process. The selftest
+asserts this three ways: the flow bytes of two flows closing over a 64-row
+baseline table are ~190 bytes each and contain no row data; a delta written
+through flow 1 is visible to transplanted flow 2 (same object identity); and
+re-serializing a transplanted flow reproduces the original bytes exactly.
+
+## 2. The two-pass swizzle
+
+Serialization and deserialization are both structured as *assign ids → 
+relink*, which is what makes cycles free and re-serialization byte-stable:
+
+- **Write, pass A (assign):** a queued BFS from the base state discovers
+  every private entity exactly once and appends it to the record table
+  (`wr_enum_value` / `wr_scan_children`); the pointer→index map is the id
+  assignment. No bytes are produced.
+- **Write, pass B (relink):** shells, frames, payloads, delta and root are
+  emitted against the now-complete maps; every pointer becomes an id.
+- **Read, pass 1 (assign):** every record shell is allocated *empty* —
+  objects with null prototypes, closures with zeroed cell tables, states
+  with `JS_UNDEFINED`-filled frames — and indexed (`recs[i]`). Baseline ids
+  resolve through the registry immediately.
+- **Read, pass 2 (relink):** every field, property, stack slot, cell, delta
+  record and the root are decoded against the complete table; forward
+  references and cycles (a frame slot holding the flow's own generator
+  object, mutually referencing private objects) need no special casing.
+
+## 3. `cur_pc` relocation: function-id + offset
+
+Bytecode addresses are meaningless across processes. Function bytecodes are
+part of the baseline registry (`TT_BASE_FUNC_BC`), registered depth-first
+through each function's constant pool so the numbering is purely structural.
+A parked frame's pc serializes as `(fn_id, cur_pc - b->byte_code_buf)`; the
+reader rebases it onto the fresh process's identical bytecode
+(`b->byte_code_buf + pc_off` after bounds-checking `pc_off ≤ byte_code_len`)
+and cross-checks that the frame's restored function object actually carries
+that same `JSFunctionBytecode` — a pc can never be relocated against the
+wrong function. Code outside the baseline (`eval`'d at flow-time) is
+refused at serialization with a precise error.
+
+## 4. The TrampFrame chain and var_ref reconstruction
+
+The frame table lists the flow's parked frames outermost-first (frame 0 =
+the base state's own frame; a `yield*` chain contributes one frame per
+nested suspended state). Each entry carries its owner state record, the
+relocated pc, and the live stack extent `cur_sp - arg_buf`; each frame's
+`[arg_buf, cur_sp)` — arguments, locals, and operand stack — is replayed
+value-by-value in the payload. Frame geometry (`max(arg_count, argc) +
+var_count + stack_size` slots plus `var_ref_count` cell slots) is
+*re-derived from the function bytecode*, never trusted from the wire; the
+stack extent is validated against it. The owner byte reserves a second kind
+for arena-parked machine frames (see limits).
+
+Closure cells rebuild over those stacks:
+
+- **closed cells** (`is_detached`, the variable's frame is gone) rebuild as
+  self-contained `JSVarRef`s owning their value.
+- **open cells** — a closure created inside the flow captured a still-live
+  local — serialize as `(frame_idx, var_ref_idx, slot)` where `slot` is the
+  arg/var index recovered from `pvalue`'s offset in the owning frame. The
+  reader recreates the cell exactly as `get_var_ref()` would have:
+  `pvalue = &frame->arg_buf[slot]` (or `var_buf`), registered in the
+  frame's `var_refs[var_ref_idx]` slot — which stays **weak**, mirroring
+  the engine — while the cell takes one pinning reference on its owning
+  async state. Assignments through the transplanted closure hit the
+  transplanted frame slot, and vice versa, exactly as before the move.
+- **baseline cells** (module/global lexicals captured from baseline
+  closures) pass by registry id like any shared entity; a flow's write to
+  one is a delta record, not a copy.
+
+## 5. Refcount/GC reconciliation
+
+The restored graph must be neither leaked nor double-freed, including when
+the host drops it unresumed. The rules:
+
+- Every record is built holding exactly **one construction reference**,
+  owned by the swizzle table. Every link made during pass 2 — a property, a
+  stack slot, a closure cell entry, `gd->func_state` — takes its own
+  reference. When the graph is complete, `rd_release()` drops all
+  construction references: what the graph (and the returned root handle)
+  reaches survives at the correct count; anything unreachable frees on the
+  spot. On a mid-parse error the same release runs over the partial table,
+  so corrupt bytes cannot leak.
+- States and cells are registered with the cycle collector at creation
+  (`add_gc_object`), and open cells pin their owning state exactly like
+  `get_var_ref` does — so the engine's existing collector semantics (the
+  closure ⇄ frame ⇄ state cycle is collectable; `free_var_ref` clears the
+  weak slot and unpins) hold for transplanted flows unchanged. The
+  selftest ends every scenario with `JS_FreeRuntime`, whose
+  `assert(list_empty(&rt->gc_obj_list))` is the leak/double-free oracle,
+  and runs a full `JS_RunGC` over the freshly rebuilt graph before it ever
+  executes.
+- **Every owned reference must be a visible GC edge.** The per-flow delta
+  taught this the hard way: its records own references (target object,
+  displaced value, cell), and leaving them out of the async state's
+  `mark_children` made delta targets look externally rooted during
+  `JS_FreeRuntime`'s final collection, reviving intrinsic clusters that
+  then outlived the GC (caught by the teardown assertion). The delta is
+  marked via `tt_flow_delta_mark()` from the `JS_GC_OBJ_TYPE_ASYNC_FUNCTION`
+  mark path; any future extension hanging values off a flow must follow the
+  same rule.
+
+## The per-flow COW delta
+
+A flow's first-writes against shared baseline state are records of
+`(target, saved)` where target is a property slot `(obj, atom)` or a closure
+cell (`JSVarRef`), and `saved` always owns *the value not currently
+installed*:
+
+- `JS_TTFlowDeltaWriteProp/Cell` records the pre-image once (moving it into
+  the record), then writes through — the flow's view lives in the heap.
+- `JS_TTFlowCheckout` swaps every record newest-first: the baseline shows
+  pristine values, the records hold the flow's view. This is the state
+  flows serialize in (enforced), so the wire's delta *is* the flow's view.
+- `JS_TTFlowCheckin` swaps oldest-first. In the fresh process this installs
+  the flow's view over the pristine rebuilt baseline while capturing the
+  fresh pre-images — so a later checkout heals the baseline exactly.
+
+Check-in/out are pure swaps: refcount-neutral by construction, in either
+process. The delta rides on the base `JSAsyncFunctionState` (`tt_delta`)
+and is freed with it.
+
+## Wire format (`TTFL01`)
+
+```
+header    magic, baseline fingerprint (u64), baseline count, flags
+atoms     private name strings (interned on read)
+records   shell table: kind + allocation parameters (class, fn_id, argc,
+          element count, open-cell coordinates, string/symbol bytes)
+frames    the TrampFrame chain: owner state record, pc offset, stack extent
+payloads  per record: prototype, properties (atomref, 6-bit shape flags,
+          kind-specific payload), fast elements, closure cells, state
+          fields; then per frame: the live JSValue stack
+delta     (target, value) records: PROP obj+atom / CELL ref, then the view
+root      handle kind + vref (generator object) or base state index
+```
+
+Everything is bounds-checked against the tables and the baseline registry;
+readers reject bad magic, drifted baselines, out-of-range ids, pc offsets,
+stack extents, cell slots, class ids, duplicate frame owners, and truncation
+at any byte (fuzzed in the selftest) with a `TypeError` — never a crash.
+
+## Scope and limits (v1)
+
+- **Generator flows** (including nested `yield*` chains, flow-private
+  closures over live locals, deltas) transplant fully. `async function` /
+  async-generator states are *refused at serialization*: an await-suspended
+  flow's identity is entangled with its promise's reaction lists and job
+  queue; transplanting severs external awaiters, so restoring them is a
+  job-queue feature, not a value-graph one. The state serializer is
+  class-general (`resolving_funcs` travel in the format) for that follow-up.
+- **Machine-parked arena frames** (a flow suspended mid-helper-call by the
+  park-by-return machinery, `rt->tt_parked_frame`) are refused for now: the
+  frame-table owner byte reserves their encoding, but resuming them means
+  re-parking the whole machine, which today is the COW page snapshot's
+  domain.
+- Flow-private values of exotic classes (Map/Set/Proxy/TypedArray/promises,
+  heap bigints, `Symbol.for`) are refused with the class named in the
+  error; *baseline* objects of any class pass by id.
+- Delta targets must be plain own data properties or detached cells.
+- `JS_TTBaselineCapture` should run before flows start (it forces autoinit
+  materialization; a flow started earlier may have materialized private
+  copies).
+
+All refusals are loud, specific `TypeError`s at serialization time — never
+silent corruption at resume time.

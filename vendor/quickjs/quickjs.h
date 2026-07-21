@@ -985,6 +985,35 @@ JSValue JS_TTGlobalLexicals(JSContext *ctx);
 void JS_TTResetExecState(JSContext *ctx);
 /* Rebind a live frame local/argument/closure capture. TRUE if found. */
 JS_BOOL JS_TTSetLocal(JSContext *ctx, int level, JSAtom name, JSValueConst value);
+
+/* TimeTravelJS flow serialization: transplant a suspended flow (generator
+   flow: base JSAsyncFunctionState + parked frame chain + per-flow COW delta)
+   into a fresh process that rebuilt the same baseline.
+   Contract: both processes evaluate identical baseline code, then call
+   JS_TTBaselineCapture() (deterministic BFS registration, so ids agree);
+   flows serialize against those ids. Baseline objects travel by id (a
+   baseline object shared by N flows is never copied); everything else
+   reachable from the flow travels by value. */
+int JS_TTBaselineCapture(JSContext *ctx);
+int JS_TTBaselineCaptureRoots(JSContext *ctx, JSValueConst *roots, int count);
+void JS_TTBaselineFree(JSRuntime *rt);
+uint32_t JS_TTBaselineCount(JSRuntime *rt);
+uint64_t JS_TTBaselineFingerprint(JSRuntime *rt);
+/* serialize a suspended flow (generator object handle); js_malloc'd bytes */
+uint8_t *JS_TTFlowSerialize(JSContext *ctx, JSValueConst flow, size_t *plen);
+/* rebuild a flow from bytes in the runtime owning the captured baseline */
+JSValue JS_TTFlowDeserialize(JSContext *ctx, const uint8_t *buf, size_t len);
+/* per-flow COW delta: record-once first-write against a baseline property
+   or closure cell, then write through; checkout parks the flow's view
+   (baseline shows pristine values), checkin installs it. Pure swaps. */
+int JS_TTFlowDeltaWriteProp(JSContext *ctx, JSValueConst flow,
+                            JSValueConst obj, JSAtom prop, JSValueConst val);
+int JS_TTFlowDeltaWriteCell(JSContext *ctx, JSValueConst flow,
+                            JSValueConst func_obj, int cv_idx,
+                            JSValueConst val);
+int JS_TTFlowCheckout(JSContext *ctx, JSValueConst flow);
+int JS_TTFlowCheckin(JSContext *ctx, JSValueConst flow);
+int JS_TTFlowDeltaCount(JSContext *ctx, JSValueConst flow);
 /* select which debug info is stripped from the compiled code */
 #define JS_STRIP_SOURCE (1 << 0) /* strip source code */
 #define JS_STRIP_DEBUG  (1 << 1) /* strip all debug info including source code */

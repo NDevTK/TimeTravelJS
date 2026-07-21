@@ -1,0 +1,40 @@
+#!/bin/sh
+# Build the native flow-serialization harness and prove the cross-process
+# round trip: a flow parked in process A resumes byte-identically in a
+# fresh process B (traces diffed), plus the in-process selftest suite.
+set -e
+cd "$(dirname "$0")"
+Q=../../vendor/quickjs
+CC="${CC:-cc}"
+BUILD=build
+mkdir -p "$BUILD"
+
+$CC -O1 -g -Wall -I"$Q" -D_GNU_SOURCE -DCONFIG_VERSION='"tt-flow"' \
+    -o "$BUILD/flow-harness" flow-harness.c \
+    "$Q/quickjs.c" "$Q/cutils.c" "$Q/libregexp.c" "$Q/libunicode.c" "$Q/dtoa.c" \
+    -lm -lpthread
+
+echo "== process A: park + serialize + reference future =="
+"$BUILD/flow-harness" emit "$BUILD/flow.bin" | tee "$BUILD/a.out"
+echo "== process B: fresh runtime + deserialize + resume =="
+"$BUILD/flow-harness" resume "$BUILD/flow.bin" | tee "$BUILD/b.out"
+
+grep '^POST:' "$BUILD/a.out" > "$BUILD/a.trace"
+grep '^POST:' "$BUILD/b.out" > "$BUILD/b.trace"
+if ! cmp -s "$BUILD/a.trace" "$BUILD/b.trace"; then
+    echo "FAIL: resumed trace differs from reference"
+    diff "$BUILD/a.trace" "$BUILD/b.trace" || true
+    exit 1
+fi
+# the two processes must also agree on the baseline they rebuilt
+grep '^BASELINE:' "$BUILD/a.out" > "$BUILD/a.base"
+grep '^BASELINE:' "$BUILD/b.out" > "$BUILD/b.base"
+if ! cmp -s "$BUILD/a.base" "$BUILD/b.base"; then
+    echo "FAIL: baseline fingerprint drifted between processes"
+    exit 1
+fi
+echo "PASS: cross-process resume is byte-identical ($(wc -l < "$BUILD/a.trace") trace lines)"
+
+echo "== selftest =="
+"$BUILD/flow-harness" selftest
+echo "PASS: flow serialization suite"

@@ -367,6 +367,9 @@ src/deltastore.js            per-step COW page store (content-deduplicated)
 src/engine.js                recorder, delta navigation, inspection, forking
 src/ui.js, main.js, samples.js   debugger UI
 tests/                       node --test suites + Playwright e2e
+tests/flow/                  native harness: cross-process flow transplant
+                             (npm run test:flow, needs a C compiler)
+docs/flow-serialization.md   suspended-flow serialization design
 tools/serve.mjs              zero-dependency static server
 tools/html5lib-run.mjs       html5lib tree-construction suite through the engine
 ```
