@@ -72,6 +72,23 @@
  *                               the parent or siblings; the live legacy
  *                               machine refuses; yield-suspended flows
  *                               evict too.
+ *
+ *   flow-harness asynctest      per-flow async machinery: an async
+ *                               function suspended at `await p` forks
+ *                               through its RESULT-PROMISE handle; each
+ *                               arm settles its own cloned resolver
+ *                               (read via JS_TTFlowGetLocal) and
+ *                               continues past the await with diverging
+ *                               values, isolated deltas, and a .then
+ *                               observer running as its own parked
+ *                               sub-flow. A for-await loop over a
+ *                               flow-private async iterator forks
+ *                               mid-loop into independently-fed arms.
+ *                               An await-suspended flow with a captured
+ *                               pending microtask evicts to bytes, frees,
+ *                               hydrates, and pumps to a byte-identical
+ *                               continuation -- the microtask firing
+ *                               exactly once per living copy.
  */
 #include "quickjs.h"
 #include <stdio.h>
@@ -132,6 +149,36 @@ static const char *BASELINE_SRC =
 "  yield \"deep:\" + t;\n"
 "  yield \"deep2:\" + (t + rec(3, 1));\n"
 "  return \"deep-done:\" + t;\n"
+"}\n"
+"var SINK = [];\n"
+"function sink(tag) { return function (v) { SINK.push(tag + \":\" + v); return v; }; }\n"
+"async function af(n) {\n"
+"  var r = null;\n"
+"  var p = new Promise(function (res) { r = res; });\n"
+"  var got = await p;\n"
+"  return \"af\" + n + \":got=\" + got + \":\" + CONFIG.tag;\n"
+"}\n"
+"async function loopy(ait) {\n"
+"  var acc = [];\n"
+"  for await (var v of ait) {\n"
+"    acc.push(v);\n"
+"    if (acc.length >= 2) break;\n"
+"  }\n"
+"  return acc.join(\"+\");\n"
+"}\n"
+"function mk_ait() {\n"
+"  var o = {};\n"
+"  o.feed = null;\n"
+"  o.next = function () { return new Promise(function (res) { o.feed = res; }); };\n"
+"  o[Symbol.asyncIterator] = function () { return o; };\n"
+"  return o;\n"
+"}\n"
+"var MLOG = [];\n"
+"async function mf() {\n"
+"  var r = null;\n"
+"  Promise.resolve(\"m\").then(function (v) { MLOG.push(\"micro:\" + v); return v; });\n"
+"  var got = await new Promise(function (res) { r = res; });\n"
+"  return \"mf:got=\" + got;\n"
 "}\n";
 
 static void die(JSContext *ctx, const char *what)
@@ -1574,6 +1621,306 @@ static int cmd_evict(void)
     return 0;
 }
 
+/* drain the (checked-in) flow's live queue; parked job callbacks finish as
+   their own sub-machines. Returns jobs run; *psub counts the parked ones. */
+static int pump_all(JSContext *ctx, JSRuntime *rt, int *psub)
+{
+    int fired = 0;
+    for (;;) {
+        int pk = 0;
+        int r = JS_TTPumpJob(rt, NULL, &pk);
+        if (pk) {
+            int pk2 = 1;
+            while (pk2) {
+                JSValue v = JS_TTCallResume(ctx, 0, &pk2);
+                JS_FreeValue(ctx, v);
+            }
+            if (psub)
+                (*psub)++;
+            fired++;
+            continue;
+        }
+        if (r < 0)
+            die(ctx, "job raised");
+        if (r == 0)
+            break;
+        fired++;
+    }
+    return fired;
+}
+
+static JSValue eval_val(JSContext *ctx, const char *expr)
+{
+    JSValue v = JS_Eval(ctx, expr, strlen(expr), "probe.js",
+                        JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(v))
+        die(ctx, expr);
+    return v;
+}
+
+/* settle an await-suspended arm through ITS OWN cloned resolver (read out
+   of the suspended frame) and pump its queue dry */
+static void settle_arm(JSContext *ctx, JSRuntime *rt, JSValueConst arm,
+                       const char *rname, JSValueConst v, int *psub)
+{
+    JSAtom a = JS_NewAtom(ctx, rname);
+    JSValue r = JS_TTFlowGetLocal(ctx, arm, 0, a);
+    JSValue ret;
+    JS_FreeAtom(ctx, a);
+    if (!JS_IsFunction(ctx, r))
+        die(ctx, "arm resolver not found");
+    ret = JS_Call(ctx, r, JS_UNDEFINED, 1, &v);
+    if (JS_IsException(ret))
+        die(ctx, "settle");
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, r);
+    pump_all(ctx, rt, psub);
+}
+
+/* async flows: per-flow job queues, promise-graph fork, await fork with
+   diverging settles, for-await fork, evict/hydrate with a pending
+   microtask */
+static int cmd_asynctest(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    ParkPlan plan;
+    JSAtom atom_r;
+    int subparks = 0;
+
+    atom_r = JS_NewAtom(ctx, "r");
+    plan.line = baseline_line_of("SINK.push(tag");
+    plan.countdown = 1;
+    plan.parked_line = 0;
+    plan.fork_here = 0;
+    plan.forked = JS_UNDEFINED;
+    JS_TTSetStepHandler(rt, park_handler, &plan);
+    JS_TTSetStepFilename(ctx, "baseline.js");
+
+    /* ---- (a) an async function suspended at `await p` forks; the arms
+       settle p independently and diverge; a .then chained after the await
+       runs as its own parked sub-flow in each arm ---- */
+    {
+        JSValue af_fn = get_global(ctx, "af");
+        JSValue arg = JS_NewInt32(ctx, 7);
+        JSValue g, armA, armB, thenret, sinkfn, sv;
+        g = JS_Call(ctx, af_fn, JS_UNDEFINED, 1, (JSValueConst *)&arg);
+        if (JS_IsException(g))
+            die(ctx, "af()");
+        JS_FreeValue(ctx, af_fn);
+        assert(JS_PromiseState(ctx, g) == JS_PROMISE_PENDING);
+        write_delta(ctx, g);            /* delta through the promise handle */
+        if (JS_TTFlowCheckout(ctx, g))
+            die(ctx, "checkout af");
+        armA = JS_TTFlowFork(ctx, g);
+        if (JS_IsException(armA))
+            die(ctx, "fork armA");
+        armB = JS_TTFlowFork(ctx, g);
+        if (JS_IsException(armB))
+            die(ctx, "fork armB");
+        printf("ASYNC:await-suspended flow forked twice\n");
+
+        /* arm A: its own delta mark, its own observer, its own settle */
+        if (JS_TTFlowCheckin(ctx, armA))
+            die(ctx, "checkin armA");
+        delta_mark(ctx, armA, "cfg-A");
+        sinkfn = eval_val(ctx, "sink('A')");
+        thenret = JS_Invoke(ctx, armA, JS_NewAtom(ctx, "then"), 1,
+                            (JSValueConst *)&sinkfn);
+        if (JS_IsException(thenret))
+            die(ctx, "then armA");
+        JS_FreeValue(ctx, thenret);
+        JS_FreeValue(ctx, sinkfn);
+        plan.countdown = 1;
+        JS_TTEnableStep(rt, 1);         /* the sink handler parks mid-run */
+        sv = JS_NewString(ctx, "ax");
+        settle_arm(ctx, rt, armA, "r", sv, &subparks);
+        JS_FreeValue(ctx, sv);
+        JS_TTEnableStep(rt, 0);
+        assert(JS_PromiseState(ctx, armA) == JS_PROMISE_FULFILLED);
+
+        /* arm B sees the fork-time delta view, not arm A's mark */
+        if (JS_TTFlowCheckin(ctx, armB))
+            die(ctx, "checkin armB");
+        expect_str(ctx, "CONFIG.tag", "cfg-flow",
+                   "armB inherits the fork-time view");
+        delta_mark(ctx, armB, "cfg-B");
+        sinkfn = eval_val(ctx, "sink('B')");
+        thenret = JS_Invoke(ctx, armB, JS_NewAtom(ctx, "then"), 1,
+                            (JSValueConst *)&sinkfn);
+        if (JS_IsException(thenret))
+            die(ctx, "then armB");
+        JS_FreeValue(ctx, thenret);
+        JS_FreeValue(ctx, sinkfn);
+        plan.countdown = 1;
+        JS_TTEnableStep(rt, 1);
+        sv = JS_NewString(ctx, "bx");
+        settle_arm(ctx, rt, armB, "r", sv, &subparks);
+        JS_FreeValue(ctx, sv);
+        JS_TTEnableStep(rt, 0);
+        assert(JS_PromiseState(ctx, armB) == JS_PROMISE_FULFILLED);
+
+        assert(subparks >= 2);          /* one parked sub-flow per arm */
+        expect_str(ctx, "SINK.join('|')",
+                   "A:af7:got=ax:cfg-A|B:af7:got=bx:cfg-B",
+                   "diverging await continuations, isolated deltas, "
+                   "per-arm sub-flows");
+        printf("ASYNC:await fork diverges, deltas isolated, "
+               "%d parked sub-flows\n", subparks);
+
+        JS_FreeValue(ctx, g);           /* parent: still suspended, dropped */
+        JS_FreeValue(ctx, armA);
+        JS_FreeValue(ctx, armB);
+    }
+
+    /* ---- (b) for-await over an async iterator, parked mid-loop, forks;
+       both arms iterate independently ---- */
+    {
+        JSValue ait = eval_val(ctx, "mk_ait()");
+        JSValue loopy_fn = get_global(ctx, "loopy");
+        JSValue lp, bA, bB;
+        JSAtom atom_ait = JS_NewAtom(ctx, "ait");
+        JSAtom atom_feed = JS_NewAtom(ctx, "feed");
+        int k;
+        lp = JS_Call(ctx, loopy_fn, JS_UNDEFINED, 1, (JSValueConst *)&ait);
+        if (JS_IsException(lp))
+            die(ctx, "loopy()");
+        JS_FreeValue(ctx, loopy_fn);
+        assert(JS_PromiseState(ctx, lp) == JS_PROMISE_PENDING);
+        if (JS_TTFlowCheckout(ctx, lp))
+            die(ctx, "checkout loopy");
+        bA = JS_TTFlowFork(ctx, lp);
+        if (JS_IsException(bA))
+            die(ctx, "fork bA");
+        bB = JS_TTFlowFork(ctx, lp);
+        if (JS_IsException(bB))
+            die(ctx, "fork bB");
+        for (k = 0; k < 2; k++) {
+            JSValue arm = k == 0 ? bA : bB;
+            const char *v1 = k == 0 ? "a1" : "b1";
+            const char *v2 = k == 0 ? "a2" : "b2";
+            const char *want = k == 0 ? "a1+a2" : "b1+b2";
+            int step;
+            if (JS_TTFlowCheckin(ctx, arm))
+                die(ctx, "checkin b-arm");
+            for (step = 0; step < 2; step++) {
+                JSValue it = JS_TTFlowGetLocal(ctx, arm, 0, atom_ait);
+                JSValue feed = JS_GetProperty(ctx, it, atom_feed);
+                JSValue res = JS_NewObject(ctx);
+                JSValue ret;
+                if (!JS_IsFunction(ctx, feed))
+                    die(ctx, "arm feed not found");
+                JS_SetPropertyStr(ctx, res, "value",
+                                  JS_NewString(ctx, step ? v2 : v1));
+                JS_SetPropertyStr(ctx, res, "done", JS_NewBool(ctx, 0));
+                ret = JS_Call(ctx, feed, JS_UNDEFINED, 1,
+                              (JSValueConst *)&res);
+                if (JS_IsException(ret))
+                    die(ctx, "feed");
+                JS_FreeValue(ctx, ret);
+                JS_FreeValue(ctx, res);
+                JS_FreeValue(ctx, feed);
+                JS_FreeValue(ctx, it);
+                pump_all(ctx, rt, NULL);
+            }
+            assert(JS_PromiseState(ctx, arm) == JS_PROMISE_FULFILLED);
+            {
+                JSValue rv = JS_PromiseResult(ctx, arm);
+                const char *s = JS_ToCString(ctx, rv);
+                if (strcmp(s, want)) {
+                    fprintf(stderr, "FAIL for-await arm: %s != %s\n", s,
+                            want);
+                    return 1;
+                }
+                JS_FreeCString(ctx, s);
+                JS_FreeValue(ctx, rv);
+            }
+            if (k == 0)
+                assert(JS_PromiseState(ctx, bB) == JS_PROMISE_PENDING);
+        }
+        printf("ASYNC:for-await arms iterate independently\n");
+        JS_FreeAtom(ctx, atom_ait);
+        JS_FreeAtom(ctx, atom_feed);
+        JS_FreeValue(ctx, ait);
+        JS_FreeValue(ctx, lp);
+        JS_FreeValue(ctx, bA);
+        JS_FreeValue(ctx, bB);
+    }
+
+    /* ---- (c) evict an await-suspended flow with a queued microtask to
+       bytes, free, hydrate, pump: byte-identical continuation, the
+       microtask fires exactly once per living copy ---- */
+    {
+        JSValue mf_fn = get_global(ctx, "mf");
+        JSValue mh, tw, h2, sv;
+        uint8_t *eb;
+        size_t el;
+        char res_tw[256], res_h2[256];
+        mh = JS_Call(ctx, mf_fn, JS_UNDEFINED, 0, NULL);
+        if (JS_IsException(mh))
+            die(ctx, "mf()");
+        JS_FreeValue(ctx, mf_fn);
+        if (JS_TTFlowCheckout(ctx, mh))   /* captures the pending micro job */
+            die(ctx, "checkout mf");
+        tw = JS_TTFlowFork(ctx, mh);      /* control twin, queue copied */
+        if (JS_IsException(tw))
+            die(ctx, "fork twin");
+        eb = JS_TTMachineEvict(ctx, mh, &el);
+        if (!eb)
+            die(ctx, "evict mf");
+        printf("ASYNC:await+microtask evicted to %u bytes\n", (unsigned)el);
+        h2 = JS_TTMachineHydrate(ctx, eb, el);
+        if (JS_IsException(h2))
+            die(ctx, "hydrate mf");
+        js_free(ctx, eb);
+
+        if (JS_TTFlowCheckin(ctx, tw))
+            die(ctx, "checkin twin");
+        pump_all(ctx, rt, NULL);          /* the twin's micro fires once */
+        sv = JS_NewString(ctx, "tv");
+        settle_arm(ctx, rt, tw, "r", sv, NULL);
+        JS_FreeValue(ctx, sv);
+        {
+            JSValue rv = JS_PromiseResult(ctx, tw);
+            const char *s = JS_ToCString(ctx, rv);
+            snprintf(res_tw, sizeof(res_tw), "%s", s ? s : "?");
+            JS_FreeCString(ctx, s);
+            JS_FreeValue(ctx, rv);
+        }
+        if (JS_TTFlowCheckin(ctx, h2))
+            die(ctx, "checkin hydrated");
+        pump_all(ctx, rt, NULL);          /* the hydrated micro fires once */
+        sv = JS_NewString(ctx, "tv");
+        settle_arm(ctx, rt, h2, "r", sv, NULL);
+        JS_FreeValue(ctx, sv);
+        {
+            JSValue rv = JS_PromiseResult(ctx, h2);
+            const char *s = JS_ToCString(ctx, rv);
+            snprintf(res_h2, sizeof(res_h2), "%s", s ? s : "?");
+            JS_FreeCString(ctx, s);
+            JS_FreeValue(ctx, rv);
+        }
+        printf("ASYNC:twin=%s hydrated=%s\n", res_tw, res_h2);
+        assert(strcmp(res_tw, res_h2) == 0);
+        assert(strcmp(res_tw, "mf:got=tv") == 0);
+        /* two living copies ran, one micro each; the evicted original's
+           captured job was serialized then freed unfired */
+        expect_str(ctx, "MLOG.join(',')", "micro:m,micro:m",
+                   "the microtask fired exactly once per copy");
+        printf("ASYNC:evict/hydrate continuation byte-identical, "
+               "microtask fired once\n");
+        JS_FreeValue(ctx, mh);
+        JS_FreeValue(ctx, tw);
+        JS_FreeValue(ctx, h2);
+    }
+
+    JS_FreeAtom(ctx, atom_r);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);       /* the leak oracle */
+    printf("ASYNC:teardown ok\n");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 3 && !strcmp(argv[1], "emit"))
@@ -1596,6 +1943,8 @@ int main(int argc, char **argv)
         return cmd_deep();
     if (argc >= 2 && !strcmp(argv[1], "evict"))
         return cmd_evict();
+    if (argc >= 2 && !strcmp(argv[1], "asynctest"))
+        return cmd_asynctest();
     fprintf(stderr, "usage: flow-harness emit|resume <file> | selftest\n");
     return 2;
 }

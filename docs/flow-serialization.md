@@ -440,15 +440,62 @@ readers reject bad magic, drifted baselines, out-of-range ids, pc offsets,
 stack extents, cell slots, class ids, duplicate frame owners, and truncation
 at any byte (fuzzed in the selftest) with a `TypeError` — never a crash.
 
+## Per-flow async machinery: the promise graph and the job queue
+
+The async/promise machinery is per-flow, so await-suspended flows fork,
+serialize and evict like everything else.
+
+**The flow's job queue.** A pending `.then`/`.catch`/`.finally` reaction,
+a microtask, an async resume is a `JSJobEntry`. While a flow is **checked
+in**, the runtime's live job list is by convention *that flow's queue*:
+jobs its promises spawn land there and `JS_TTPumpJob` drains them —
+reaction handlers still run under park-by-return, so a `.then` chained
+after an await runs as its own parked sub-flow. **Checkout captures the
+live list's entries into the flow** (`TTFlowJobs`, hung off the base
+state, GC-marked, freed with it); **checkin splices them back**. The
+queue rides the same single-writer discipline as the delta swaps — one
+flow's jobs in flight at a time — and travels in the wire's jobs section
+(job kind + argument vrefs; reaction and thenable jobs; anything else
+refuses loudly), forks by deep copy, and hydrates back runnable.
+
+**The promise graph classifies like any heap value.** Four record kinds
+cover it: `PROMISE` (state, handled flag, result, both reaction lists),
+`PROMISE_FUNC` (a resolve/reject capability, pointing at its promise),
+`PRESOLVED` (the capability pair's *shared* already-resolved flag — the
+pair keeps sharing it across clone and wire), and `ASYNC_RESOLVE` (an
+await continuation handler, pinning its state exactly as
+`js_async_function_resolve_create` does). A state's `resolving_funcs`
+travel in its payload. Baseline promises pass by id; flow-private ones by
+value; the two-pass assign→relink swizzle is untouched.
+
+**The result promise is the async flow's handle.** `js_async_function_call`
+links the result promise to its state (an owned, GC-marked edge, cleared
+on completion, on eviction, and by the finalizer), so every flow API —
+fork, serialize, evict, delta writes, checkout/checkin,
+`JS_TTFlowGetLocal`/`SetLocal` — accepts it exactly as it accepts a
+generator object. Deserialization and fork re-establish the link on the
+fresh result promise. `JS_TTFlowGetLocal` (the read dual of `SetLocal`,
+walking a suspended flow's frames) is how a host reaches an *arm's own*
+cloned resolver or iterator to settle that arm's awaits independently:
+fork an `await p` flow, read each arm's `r`, settle A with X and B with
+Y, pump — the arms continue past the same await with diverging values,
+isolated deltas, and their own reaction sub-flows. Evicting an
+await-suspended flow serializes the suspended frame, the pending promise
+graph *and* the captured queue, then severs the handle link — the
+orphaned await cycle collects on the spot — and hydration brings it back
+with the pending microtask firing exactly once. The asynctest harness
+drives all three, including a `for await` loop over a flow-private async
+iterator forked mid-loop into independently-fed arms.
+
 ## Scope and limits (v1)
 
 - **Generator flows** (including nested `yield*` chains, flow-private
-  closures over live locals, deltas) transplant fully. `async function` /
-  async-generator states are *refused at serialization*: an await-suspended
-  flow's identity is entangled with its promise's reaction lists and job
-  queue; transplanting severs external awaiters, so restoring them is a
-  job-queue feature, not a value-graph one. The state serializer is
-  class-general (`resolving_funcs` travel in the format) for that follow-up.
+  closures over live locals, deltas) transplant fully. **Async-function
+  flows** (suspended at `await`, with their private promise graph and
+  captured job queue) fork, serialize, evict and hydrate; their handle is
+  the result promise. **Async generators** remain refused (their request
+  queue is a follow-up); a `for await` over a plain flow-private async
+  iterator works today, as the harness shows.
 - **Machine-parked chains** transplant when every parked frame is a plain
   inlined call or an in-loop generator splice (`METHOD`/`FOROF`/
   `ITERNEXT`/`ITERCALL` shapes) — which is what stepping through ordinary
@@ -458,10 +505,13 @@ at any byte (fuzzed in the selftest) with a `TypeError` — never a crash.
   kind named. Note that a *direct* `g.next()` call from script goes
   through C and is unparkable by the engine's own design; parks form under
   language-level iteration (`for-of`, `yield*`), as in the harness.
-- Flow-private values of exotic classes (Map/Set/Proxy/TypedArray/promises,
+- Flow-private values of exotic classes (Map/Set/Proxy/TypedArray,
   heap bigints, `Symbol.for`) are refused with the class named in the
-  error; *baseline* objects of any class pass by id.
+  error; *baseline* objects of any class pass by id. Promises and their
+  capability/continuation functions are fully supported (above).
 - Delta targets must be plain own data properties or detached cells.
+- A flow checks out only between jobs: a job parked mid-run
+  (`tt_job_kind` set) must finish through `JS_TTCallResume` first.
 - `JS_TTBaselineCapture` should run before flows start (it forces autoinit
   materialization; a flow started earlier may have materialized private
   copies).

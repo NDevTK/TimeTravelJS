@@ -973,6 +973,9 @@ typedef struct JSAsyncFunctionState {
     /* per-flow suspended machine: the parked TrampFrame chain rooted at
        this state, with its own arena (NULL if not machine-parked) */
     struct TTMachine *tt_machine;
+    /* per-flow pending job queue: reactions/microtasks captured out of the
+       live queue at checkout, spliced back at checkin (NULL if empty) */
+    struct TTFlowJobs *tt_jobs;
     JSStackFrame frame;
     /* arg_buf, var_buf, stack_buf and var_refs follow */
 } JSAsyncFunctionState;
@@ -1524,6 +1527,20 @@ static void tt_machine_mark(JSRuntime *rt, struct TTMachine *m,
 struct TTArenaSeg;
 static void tt_arena_segs_free(JSRuntime *rt, struct TTArenaSeg *seg);
 static void tt_arena_flush_graveyard(JSRuntime *rt);
+struct TTFlowJobs;
+static void tt_flow_jobs_free(JSRuntime *rt, struct TTFlowJobs *q);
+static void tt_flow_jobs_mark(JSRuntime *rt, struct TTFlowJobs *q,
+                              JS_MarkFunc *mark_func);
+static void tt_async_flow_link(JSContext *ctx, JSValueConst promise,
+                               JSAsyncFunctionState *s);
+static void tt_async_flow_unlink(JSContext *ctx, JSAsyncFunctionState *s);
+static JSValue promise_reaction_job(JSContext *ctx, int argc,
+                                    JSValueConst *argv);
+static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
+                                               int argc, JSValueConst *argv);
+struct JSPromiseFunctionDataResolved;
+static void js_promise_resolve_function_free_resolved(JSRuntime *rt,
+                              struct JSPromiseFunctionDataResolved *sr);
 static void tt_flow_delta_mark(JSRuntime *rt, struct TTFlowDelta *d,
                                JS_MarkFunc *mark_func);
 static JSValue js_new_promise_capability(JSContext *ctx,
@@ -6878,6 +6895,10 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                mark through their own states above) */
             if (s->tt_machine)
                 tt_machine_mark(rt, s->tt_machine, &s->frame, mark_func);
+            /* TimeTravelJS: the flow's captured pending jobs own their
+               argument values (and a realm reference) -- GC edges too */
+            if (s->tt_jobs)
+                tt_flow_jobs_mark(rt, s->tt_jobs, mark_func);
         }
         break;
     case JS_GC_OBJ_TYPE_SHAPE:
@@ -24958,6 +24979,10 @@ static void __async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
         tt_flow_delta_free(rt, s->tt_delta);
         s->tt_delta = NULL;
     }
+    if (s->tt_jobs) {
+        tt_flow_jobs_free(rt, s->tt_jobs);
+        s->tt_jobs = NULL;
+    }
     JS_FreeValueRT(rt, s->resolving_funcs[0]);
     JS_FreeValueRT(rt, s->resolving_funcs[1]);
 
@@ -25283,6 +25308,9 @@ static void js_async_function_post(JSContext *ctx, JSAsyncFunctionState *s,
             JS_FreeValue(ctx, func_ret);
             JS_FreeValue(ctx, ret2); /* XXX: what to do if exception ? */
         }
+        /* TimeTravelJS: completed -- the result promise drops its flow
+           handle link */
+        tt_async_flow_unlink(ctx, s);
     } else {
         JSValue value, promise, resolving_funcs[2], resolving_funcs1[2];
         int i, res;
@@ -25364,6 +25392,11 @@ static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
         async_func_free(ctx->rt, s);
         return JS_EXCEPTION;
     }
+
+    /* TimeTravelJS: the result promise is the flow's host handle -- give it
+       an owned, GC-visible link to the state so an await-suspended flow can
+       be forked/serialized/evicted through it */
+    tt_async_flow_link(ctx, promise, s);
 
     js_async_function_resume(ctx, s);
 
@@ -41613,6 +41646,39 @@ typedef enum BCTagEnum {
 
 #define BC_VERSION 5
 
+/* Promise internals -- defined here so the TimeTravelJS flow serializer
+   below can classify, clone and serialize a flow-private promise graph
+   (pending promises, their reaction lists, resolve/reject capabilities,
+   async-function await continuations). */
+typedef struct JSPromiseData {
+    JSPromiseStateEnum promise_state;
+    /* 0=fulfill, 1=reject, list of JSPromiseReactionData.link */
+    struct list_head promise_reactions[2];
+    BOOL is_handled; /* Note: only useful to debug */
+    JSValue promise_result;
+    /* TimeTravelJS: when this promise is the RESULT of an async function,
+       an owned, GC-marked link to the flow's suspended state -- the
+       promise IS the flow's host handle. Cleared on completion, on
+       eviction, and by the finalizer. */
+    JSAsyncFunctionState *tt_flow_state;
+} JSPromiseData;
+
+typedef struct JSPromiseFunctionDataResolved {
+    int ref_count;
+    BOOL already_resolved;
+} JSPromiseFunctionDataResolved;
+
+typedef struct JSPromiseFunctionData {
+    JSValue promise;
+    JSPromiseFunctionDataResolved *presolved;
+} JSPromiseFunctionData;
+
+typedef struct JSPromiseReactionData {
+    struct list_head link; /* not used in promise_reaction_job */
+    JSValue resolving_funcs[2];
+    JSValue handler;
+} JSPromiseReactionData;
+
 /*---------------------------------------------------------------------------*/
 /* TimeTravelJS: cross-process flow serialization                            */
 /*                                                                           */
@@ -41670,7 +41736,7 @@ typedef enum BCTagEnum {
 
 /* -- limits and wire constants -- */
 
-#define TT_FLOW_MAGIC     "TTFL02"
+#define TT_FLOW_MAGIC     "TTFL03"
 #define TT_FLOW_MAGIC_LEN 6
 
 /* header flag bits */
@@ -41687,7 +41753,11 @@ enum {                        /* private record kinds */
     TT_REC_STRING,            /* immutable string, copied                    */
     TT_REC_SYMBOL,            /* unique symbol, identity kept inside flow    */
     TT_REC_DATAOBJ,           /* Number/String/Boolean/Symbol/Date wrapper   */
-    TT_REC_LAST = TT_REC_DATAOBJ
+    TT_REC_PROMISE,           /* JS_CLASS_PROMISE: state/result/reactions    */
+    TT_REC_PROMISE_FUNC,      /* resolve/reject capability function          */
+    TT_REC_PRESOLVED,         /* the capability pair's shared resolved flag  */
+    TT_REC_ASYNC_RESOLVE,     /* async-function await continuation handler   */
+    TT_REC_LAST = TT_REC_ASYNC_RESOLVE
 };
 
 enum {                        /* vref inline subtags */
@@ -42342,6 +42412,106 @@ static JSValue *tt_flow_delta_cell(TTFlowDeltaRec *rec)
 
 static BOOL tt_flow_base_is_parked(JSRuntime *rt, JSAsyncFunctionState *st);
 
+/* -- the per-flow pending job queue ---------------------------------------
+   A reaction, a microtask, an async resume is a JSJobEntry. While a flow is
+   CHECKED IN, the runtime's live job list is by convention that flow's
+   queue: new jobs its promises spawn land there and the pump drains them.
+   CHECKOUT captures the live list's entries into the flow (they ride its
+   delta discipline, serialize, fork); CHECKIN splices them back. Exactly
+   one flow's jobs are in flight at a time -- the same single-writer rule
+   the delta swaps already impose. */
+typedef struct TTFlowJobs {
+    struct list_head jobs;    /* JSJobEntry.link, oldest first */
+    int count;
+} TTFlowJobs;
+
+static void tt_flow_jobs_free(JSRuntime *rt, struct TTFlowJobs *q)
+{
+    struct list_head *el, *el1;
+    list_for_each_safe(el, el1, &q->jobs) {
+        JSJobEntry *e = list_entry(el, JSJobEntry, link);
+        int i;
+        list_del(&e->link);
+        for (i = 0; i < e->argc; i++)
+            JS_FreeValueRT(rt, e->argv[i]);
+        JS_FreeContext(e->realm);
+        js_free_rt(rt, e);
+    }
+    js_free_rt(rt, q);
+}
+
+static void tt_flow_jobs_mark(JSRuntime *rt, struct TTFlowJobs *q,
+                              JS_MarkFunc *mark_func)
+{
+    struct list_head *el;
+    list_for_each(el, &q->jobs) {
+        JSJobEntry *e = list_entry(el, JSJobEntry, link);
+        int i;
+        for (i = 0; i < e->argc; i++)
+            JS_MarkValue(rt, e->argv[i], mark_func);
+        mark_func(rt, &e->realm->header);
+    }
+}
+
+/* -- async flows: the result promise as the flow handle ------------------- */
+
+static JSAsyncFunctionState *tt_promise_flow_state(JSValueConst promise)
+{
+    JSPromiseData *pd = JS_GetOpaque(promise, JS_CLASS_PROMISE);
+    return pd ? pd->tt_flow_state : NULL;
+}
+
+static void tt_async_flow_link(JSContext *ctx, JSValueConst promise,
+                               JSAsyncFunctionState *s)
+{
+    JSPromiseData *pd = JS_GetOpaque(promise, JS_CLASS_PROMISE);
+    if (pd && !pd->tt_flow_state) {
+        pd->tt_flow_state = s;
+        js_rc(s)->ref_count++;
+    }
+}
+
+/* resolve a state's own result promise through its resolve capability
+   (undefined / a foreign capability class simply means no link) */
+static JSPromiseData *tt_async_flow_result_pd(JSAsyncFunctionState *s)
+{
+    JSObject *fp;
+    JSPromiseFunctionData *fd;
+    if (JS_VALUE_GET_TAG(s->resolving_funcs[0]) != JS_TAG_OBJECT)
+        return NULL;
+    fp = JS_VALUE_GET_OBJ(s->resolving_funcs[0]);
+    if (fp->class_id != JS_CLASS_PROMISE_RESOLVE_FUNCTION)
+        return NULL;
+    fd = fp->u.promise_function_data;
+    if (!fd)
+        return NULL;
+    return JS_GetOpaque(fd->promise, JS_CLASS_PROMISE);
+}
+
+static void tt_async_flow_unlink(JSContext *ctx, JSAsyncFunctionState *s)
+{
+    JSPromiseData *pd = tt_async_flow_result_pd(s);
+    if (pd && pd->tt_flow_state == s) {
+        pd->tt_flow_state = NULL;
+        async_func_free(ctx->rt, s);
+    }
+}
+
+/* rebuilt/cloned async states re-establish the handle link on their fresh
+   result promise (the deserializer's and the fork's post-pass) */
+static void tt_async_flow_link_from_state(JSContext *ctx,
+                                          JSAsyncFunctionState *s)
+{
+    JSPromiseData *pd;
+    if (s->is_completed)
+        return;
+    pd = tt_async_flow_result_pd(s);
+    if (pd && !pd->tt_flow_state) {
+        pd->tt_flow_state = s;
+        js_rc(s)->ref_count++;
+    }
+}
+
 /* flow handle (generator object) -> its suspended base state. A flow is
    serializable/delta-addressable while suspended at a yield OR while it is
    the machine-parked chain (EXECUTING with the park running through its
@@ -42349,6 +42519,18 @@ static BOOL tt_flow_base_is_parked(JSRuntime *rt, JSAsyncFunctionState *st);
 static JSAsyncFunctionState *tt_flow_state_of(JSContext *ctx, JSValueConst flow)
 {
     JSGeneratorData *gd;
+    if (JS_VALUE_GET_TAG(flow) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(flow)->class_id == JS_CLASS_PROMISE) {
+        /* an async-function flow, addressed by its result promise */
+        JSAsyncFunctionState *st = tt_promise_flow_state(flow);
+        if (!st || st->is_completed ||
+            (st->frame.cur_sp == NULL &&
+             !tt_flow_base_is_parked(ctx->rt, st))) {
+            JS_ThrowTypeError(ctx, "promise is not an await-suspended flow");
+            return NULL;
+        }
+        return st;
+    }
     if (JS_VALUE_GET_TAG(flow) != JS_TAG_OBJECT ||
         JS_VALUE_GET_OBJ(flow)->class_id != JS_CLASS_GENERATOR) {
         JS_ThrowTypeError(ctx, "flow handle must be a generator object");
@@ -42495,6 +42677,26 @@ int JS_TTFlowCheckout(JSContext *ctx, JSValueConst flow)
     uint32_t i;
     if (!st)
         return -1;
+    /* the flow's pending jobs: capture the live queue. While checked in,
+       the runtime list IS this flow's queue, so everything on it belongs
+       to the flow being parked. */
+    if (ctx->rt->tt_job_kind) {
+        JS_ThrowTypeError(ctx, "a job is parked mid-run; finish it "
+                          "(JS_TTCallResume) before checking out");
+        return -1;
+    }
+    while (!list_empty(&ctx->rt->job_list)) {
+        JSJobEntry *e = list_entry(ctx->rt->job_list.next, JSJobEntry, link);
+        if (!st->tt_jobs) {
+            st->tt_jobs = js_mallocz(ctx, sizeof(*st->tt_jobs));
+            if (!st->tt_jobs)
+                return -1;
+            init_list_head(&st->tt_jobs->jobs);
+        }
+        list_del(&e->link);
+        list_add_tail(&e->link, &st->tt_jobs->jobs);
+        st->tt_jobs->count++;
+    }
     d = st->tt_delta;
     if (!d)
         return 0;             /* no first-writes recorded: nothing to park */
@@ -42528,6 +42730,17 @@ int JS_TTFlowCheckin(JSContext *ctx, JSValueConst flow)
     uint32_t i;
     if (!st)
         return -1;
+    /* the flow's captured jobs go live again: the pump drains them */
+    if (st->tt_jobs) {
+        while (!list_empty(&st->tt_jobs->jobs)) {
+            JSJobEntry *e = list_entry(st->tt_jobs->jobs.next, JSJobEntry,
+                                       link);
+            list_del(&e->link);
+            list_add_tail(&e->link, &ctx->rt->job_list);
+        }
+        js_free_rt(ctx->rt, st->tt_jobs);
+        st->tt_jobs = NULL;
+    }
     d = st->tt_delta;
     if (!d)
         return 0;             /* no first-writes recorded: nothing to install */
@@ -42929,14 +43142,12 @@ static int wr_enum_state(TTFlowWr *w, JSAsyncFunctionState *st)
         JS_ThrowTypeError(w->ctx, "flow serialization: flow is running");
         return -1;
     }
-    if (!JS_IsUndefined(st->resolving_funcs[0]) ||
-        !JS_IsUndefined(st->resolving_funcs[1])) {
-        JS_ThrowTypeError(w->ctx, "flow serialization: async-function flows "
-                          "have live promise subscribers; only generator "
-                          "flows transplant in v1");
-        return -1;
-    }
     if (wr_add_rec(w, TT_REC_STATE, st, &idx))
+        return -1;
+    /* an async-function state's result-promise capability travels with it:
+       the whole promise graph classifies baseline/private like any value */
+    if (wr_enum_value(w, st->resolving_funcs[0]) ||
+        wr_enum_value(w, st->resolving_funcs[1]))
         return -1;
     /* chained frames were pre-registered by the chain walk; a state found
        only through the value graph is a detached suspended nested flow */
@@ -43145,6 +43356,14 @@ static int wr_enum_object(TTFlowWr *w, JSObject *p)
     case JS_CLASS_SYMBOL:
     case JS_CLASS_DATE:
         return wr_add_rec(w, TT_REC_DATAOBJ, p, NULL);
+    case JS_CLASS_PROMISE:
+        return wr_add_rec(w, TT_REC_PROMISE, p, NULL);
+    case JS_CLASS_PROMISE_RESOLVE_FUNCTION:
+    case JS_CLASS_PROMISE_REJECT_FUNCTION:
+        return wr_add_rec(w, TT_REC_PROMISE_FUNC, p, NULL);
+    case JS_CLASS_ASYNC_FUNCTION_RESOLVE:
+    case JS_CLASS_ASYNC_FUNCTION_REJECT:
+        return wr_add_rec(w, TT_REC_ASYNC_RESOLVE, p, NULL);
     default:
         return wr_unsupported(w, p);
     }
@@ -43250,6 +43469,66 @@ static int wr_scan_children(TTFlowWr *w, TTFlowWrRec *rec)
         JSObject *p = rec->ptr;
         if (p->shape->proto &&
             wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_PROMISE: {
+        JSObject *p = rec->ptr;
+        JSPromiseData *pd = JS_GetOpaque(JS_MKPTR(JS_TAG_OBJECT, p),
+                                         JS_CLASS_PROMISE);
+        struct list_head *el;
+        int i;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        if (!pd) {
+            JS_ThrowTypeError(w->ctx, "flow serialization: promise without "
+                              "data");
+            return -1;
+        }
+        if (wr_enum_value(w, pd->promise_result))
+            return -1;
+        for (i = 0; i < 2; i++) {
+            list_for_each(el, &pd->promise_reactions[i]) {
+                JSPromiseReactionData *rd =
+                    list_entry(el, JSPromiseReactionData, link);
+                if (wr_enum_value(w, rd->resolving_funcs[0]) ||
+                    wr_enum_value(w, rd->resolving_funcs[1]) ||
+                    wr_enum_value(w, rd->handler))
+                    return -1;
+            }
+        }
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_PROMISE_FUNC: {
+        JSObject *p = rec->ptr;
+        JSPromiseFunctionData *fd = p->u.promise_function_data;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        if (!fd) {
+            JS_ThrowTypeError(w->ctx, "flow serialization: capability "
+                              "without data");
+            return -1;
+        }
+        if (wr_enum_value(w, fd->promise))
+            return -1;
+        if (!tt_ptrmap_get(&w->map, fd->presolved) &&
+            wr_add_rec(w, TT_REC_PRESOLVED, fd->presolved, NULL))
+            return -1;
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_ASYNC_RESOLVE: {
+        JSObject *p = rec->ptr;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        if (!p->u.async_function_data) {
+            JS_ThrowTypeError(w->ctx, "flow serialization: await "
+                              "continuation without a state");
+            return -1;
+        }
+        if (wr_enum_state(w, p->u.async_function_data))
             return -1;
         return wr_scan_props(w, p, FALSE);
     }
@@ -43608,6 +43887,28 @@ static int wr_enumerate(TTFlowWr *w, JSAsyncFunctionState *base,
             }
         }
     }
+    /* the flow's captured pending jobs are part of the reachable set */
+    if (base->tt_jobs) {
+        struct list_head *el;
+        list_for_each(el, &base->tt_jobs->jobs) {
+            JSJobEntry *e = list_entry(el, JSJobEntry, link);
+            int j;
+            if (e->job_func != promise_reaction_job &&
+                e->job_func != js_promise_resolve_thenable_job) {
+                JS_ThrowTypeError(ctx, "flow serialization: unsupported "
+                                  "pending job kind in the flow queue");
+                return -1;
+            }
+            for (j = 0; j < e->argc; j++)
+                if (wr_enum_value(w, e->argv[j]))
+                    return -1;
+            while (w->scan_head < w->rec_count) {
+                if (wr_scan_children(w, &w->recs[w->scan_head]))
+                    return -1;
+                w->scan_head++;
+            }
+        }
+    }
     if (w->frame_count == 0 || w->frames[0].sf != &base->frame) {
         JS_ThrowInternalError(ctx, "flow serialization: base frame not "
                               "first");
@@ -43701,6 +44002,18 @@ static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
             dbuf_putc(&db, st->throw_flag ? 1 : 0);
             break;
         }
+        case TT_REC_PROMISE_FUNC:
+            dbuf_putc(&db, (uint8_t)(((JSObject *)rec->ptr)->class_id -
+                                     JS_CLASS_PROMISE_RESOLVE_FUNCTION));
+            break;
+        case TT_REC_PRESOLVED:
+            dbuf_putc(&db, ((JSPromiseFunctionDataResolved *)rec->ptr)
+                      ->already_resolved ? 1 : 0);
+            break;
+        case TT_REC_ASYNC_RESOLVE:
+            dbuf_putc(&db, (uint8_t)(((JSObject *)rec->ptr)->class_id -
+                                     JS_CLASS_ASYNC_FUNCTION_RESOLVE));
+            break;
         case TT_REC_VARREF_OPEN: {
             JSVarRef *vr = rec->ptr;
             JSStackFrame *sf = vr->stack_frame;
@@ -43927,6 +44240,68 @@ static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
                 goto fail;
             if (wr_put_vref(w, &db, st->this_val))
                 goto fail;
+            if (wr_put_vref(w, &db, st->resolving_funcs[0]) ||
+                wr_put_vref(w, &db, st->resolving_funcs[1]))
+                goto fail;
+            break;
+        }
+        case TT_REC_PROMISE: {
+            JSObject *p = rec->ptr;
+            JSPromiseData *pd = JS_GetOpaque(JS_MKPTR(JS_TAG_OBJECT, p),
+                                             JS_CLASS_PROMISE);
+            struct list_head *el;
+            int k;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            dbuf_putc(&db, (uint8_t)pd->promise_state);
+            dbuf_putc(&db, pd->is_handled ? 1 : 0);
+            if (wr_put_vref(w, &db, pd->promise_result))
+                goto fail;
+            for (k = 0; k < 2; k++) {
+                uint32_t n = 0;
+                list_for_each(el, &pd->promise_reactions[k])
+                    n++;
+                dbuf_put_leb128(&db, n);
+                list_for_each(el, &pd->promise_reactions[k]) {
+                    JSPromiseReactionData *rd =
+                        list_entry(el, JSPromiseReactionData, link);
+                    if (wr_put_vref(w, &db, rd->resolving_funcs[0]) ||
+                        wr_put_vref(w, &db, rd->resolving_funcs[1]) ||
+                        wr_put_vref(w, &db, rd->handler))
+                        goto fail;
+                }
+            }
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_PROMISE_FUNC: {
+            JSObject *p = rec->ptr;
+            JSPromiseFunctionData *fd = p->u.promise_function_data;
+            uint32_t pidx = tt_ptrmap_get(&w->map, fd->presolved);
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            if (wr_put_vref(w, &db, fd->promise))
+                goto fail;
+            dbuf_put_leb128(&db, pidx - 1);
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_ASYNC_RESOLVE: {
+            JSObject *p = rec->ptr;
+            uint32_t sidx = tt_ptrmap_get(&w->map, p->u.async_function_data);
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            dbuf_put_leb128(&db, sidx - 1);
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
             break;
         }
         case TT_REC_VARREF_CLOSED: {
@@ -43983,6 +44358,24 @@ static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
         }
     }
 
+    /* the flow's pending job queue (captured at checkout) */
+    {
+        uint32_t nj = base->tt_jobs ? (uint32_t)base->tt_jobs->count : 0;
+        struct list_head *el;
+        dbuf_put_leb128(&db, nj);
+        if (base->tt_jobs) {
+            list_for_each(el, &base->tt_jobs->jobs) {
+                JSJobEntry *e = list_entry(el, JSJobEntry, link);
+                int j;
+                dbuf_putc(&db, e->job_func == promise_reaction_job ? 0 : 1);
+                dbuf_put_leb128(&db, (uint32_t)e->argc);
+                for (j = 0; j < e->argc; j++)
+                    if (wr_put_vref(w, &db, e->argv[j]))
+                        goto fail;
+            }
+        }
+    }
+
     /* root */
     dbuf_putc(&db, (uint8_t)root_kind);
     if (root_kind == 1) {
@@ -44017,6 +44410,8 @@ typedef struct TTFlowRdRec {
     uint8_t kind;
     JSValue v;                /* OBJ/STRING/SYMBOL construction reference */
     JSVarRef *vr;             /* VARREF construction reference */
+    void *raw;                /* PRESOLVED flag struct; PROMISE_FUNC's data
+                                 until its object adopts it in pass 2 */
     JSAsyncFunctionState *st; /* STATE construction reference */
     uint32_t fn_id, argc, aux_a, aux_b, aux_c, aux_d;
     uint8_t u8a;
@@ -44303,6 +44698,19 @@ static void rd_release(TTFlowRd *r)
         case TT_REC_VARREF_CLOSED:
             if (rec->vr)
                 free_var_ref(r->rt, rec->vr);
+            break;
+        case TT_REC_PRESOLVED:
+            if (rec->raw)
+                js_promise_resolve_function_free_resolved(r->rt, rec->raw);
+            break;
+        case TT_REC_PROMISE_FUNC:
+            if (rec->raw) {
+                /* the object never adopted its data (early failure) */
+                JSPromiseFunctionData *fd = rec->raw;
+                JS_FreeValue(r->ctx, fd->promise);
+                js_free(r->ctx, fd);
+            }
+            JS_FreeValue(r->ctx, rec->v);
             break;
         default:
             JS_FreeValue(r->ctx, rec->v);
@@ -44706,6 +45114,63 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
             JS_VALUE_GET_OBJ(rec->v)->u.object_data = JS_UNDEFINED;
             break;
         }
+        case TT_REC_PROMISE: {
+            JSPromiseData *pd;
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_PROMISE);
+            if (JS_IsException(rec->v))
+                goto fail;
+            pd = js_mallocz(ctx, sizeof(*pd));
+            if (!pd)
+                goto fail;
+            pd->promise_state = JS_PROMISE_PENDING;
+            init_list_head(&pd->promise_reactions[0]);
+            init_list_head(&pd->promise_reactions[1]);
+            pd->promise_result = JS_UNDEFINED;
+            JS_SetOpaque(rec->v, pd);
+            break;
+        }
+        case TT_REC_PROMISE_FUNC: {
+            uint32_t which = tt_rd_u8(&r->rd);
+            JSPromiseFunctionData *fd;
+            if (r->rd.err || which > 1)
+                goto trunc;
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                            JS_CLASS_PROMISE_RESOLVE_FUNCTION
+                                            + which);
+            if (JS_IsException(rec->v))
+                goto fail;
+            fd = js_mallocz(ctx, sizeof(*fd));
+            if (!fd)
+                goto fail;
+            fd->promise = JS_UNDEFINED;
+            rec->raw = fd;    /* the object adopts it once linked */
+            break;
+        }
+        case TT_REC_PRESOLVED: {
+            uint32_t ar = tt_rd_u8(&r->rd);
+            JSPromiseFunctionDataResolved *sr;
+            if (r->rd.err || ar > 1)
+                goto trunc;
+            sr = js_malloc(ctx, sizeof(*sr));
+            if (!sr)
+                goto fail;
+            sr->ref_count = 1;
+            sr->already_resolved = ar;
+            rec->raw = sr;
+            break;
+        }
+        case TT_REC_ASYNC_RESOLVE: {
+            uint32_t which = tt_rd_u8(&r->rd);
+            if (r->rd.err || which > 1)
+                goto trunc;
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                            JS_CLASS_ASYNC_FUNCTION_RESOLVE
+                                            + which);
+            if (JS_IsException(rec->v))
+                goto fail;
+            JS_VALUE_GET_OBJ(rec->v)->u.async_function_data = NULL;
+            break;
+        }
         }
     }
 
@@ -45089,6 +45554,14 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
                 goto fail;
             st->this_val = t;
             st->frame.tt_this = st->this_val;
+            t = rd_get_vref(r);
+            if (JS_IsException(t))
+                goto fail;
+            st->resolving_funcs[0] = t;
+            t = rd_get_vref(r);
+            if (JS_IsException(t))
+                goto fail;
+            st->resolving_funcs[1] = t;
             break;
         }
         case TT_REC_VARREF_CLOSED: {
@@ -45096,6 +45569,97 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
             if (JS_IsException(v))
                 goto fail;
             rec->vr->value = v;
+            break;
+        }
+        case TT_REC_PROMISE: {
+            JSPromiseData *pd = JS_GetOpaque(rec->v, JS_CLASS_PROMISE);
+            uint32_t st8, hd8, k;
+            JSValue v;
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            st8 = tt_rd_u8(&r->rd);
+            hd8 = tt_rd_u8(&r->rd);
+            if (r->rd.err || st8 > JS_PROMISE_REJECTED || hd8 > 1)
+                goto trunc;
+            pd->promise_state = st8;
+            pd->is_handled = hd8;
+            v = rd_get_vref(r);
+            if (JS_IsException(v))
+                goto fail;
+            pd->promise_result = v;
+            for (k = 0; k < 2; k++) {
+                uint32_t n = tt_rd_leb(&r->rd), j;
+                if (r->rd.err || n > (uint32_t)len)
+                    goto trunc;
+                for (j = 0; j < n; j++) {
+                    JSPromiseReactionData *rdd =
+                        js_mallocz(ctx, sizeof(*rdd));
+                    int m;
+                    if (!rdd)
+                        goto fail;
+                    for (m = 0; m < 2; m++)
+                        rdd->resolving_funcs[m] = JS_UNDEFINED;
+                    rdd->handler = JS_UNDEFINED;
+                    list_add_tail(&rdd->link, &pd->promise_reactions[k]);
+                    for (m = 0; m < 2; m++) {
+                        v = rd_get_vref(r);
+                        if (JS_IsException(v))
+                            goto fail;
+                        rdd->resolving_funcs[m] = v;
+                    }
+                    v = rd_get_vref(r);
+                    if (JS_IsException(v))
+                        goto fail;
+                    rdd->handler = v;
+                }
+            }
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        }
+        case TT_REC_PROMISE_FUNC: {
+            JSPromiseFunctionData *fd = rec->raw;
+            JSValue pv;
+            uint32_t pidx;
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            pv = rd_get_vref(r);
+            if (JS_IsException(pv))
+                goto fail;
+            fd->promise = pv;
+            if (JS_VALUE_GET_TAG(pv) != JS_TAG_OBJECT ||
+                JS_VALUE_GET_OBJ(pv)->class_id != JS_CLASS_PROMISE) {
+                JS_ThrowTypeError(ctx, "flow bytes: capability without a "
+                                  "promise");
+                goto fail;
+            }
+            pidx = tt_rd_leb(&r->rd);
+            if (r->rd.err || pidx >= r->rec_count ||
+                r->recs[pidx].kind != TT_REC_PRESOLVED)
+                goto trunc;
+            fd->presolved = r->recs[pidx].raw;
+            fd->presolved->ref_count++;
+            JS_VALUE_GET_OBJ(rec->v)->u.promise_function_data = fd;
+            rec->raw = NULL;  /* owned by the object now */
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        }
+        case TT_REC_ASYNC_RESOLVE: {
+            uint32_t sidx;
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            sidx = tt_rd_leb(&r->rd);
+            if (r->rd.err || sidx >= r->rec_count ||
+                r->recs[sidx].kind != TT_REC_STATE)
+                goto trunc;
+            /* the continuation handler pins its state, as the engine's
+               js_async_function_resolve_create does */
+            JS_VALUE_GET_OBJ(rec->v)->u.async_function_data =
+                r->recs[sidx].st;
+            js_rc(r->recs[sidx].st)->ref_count++;
+            if (rd_read_props(r, rec->v))
+                goto fail;
             break;
         }
         case TT_REC_DATAOBJ: {
@@ -45314,6 +45878,49 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
         }
     }
 
+    /* ---- the flow's pending job queue ---- */
+    {
+        uint32_t nj = tt_rd_leb(&r->rd), i2;
+        if (r->rd.err || nj > (uint32_t)len)
+            goto trunc;
+        for (i2 = 0; i2 < nj; i2++) {
+            uint32_t kind = tt_rd_u8(&r->rd);
+            uint32_t argc2 = tt_rd_leb(&r->rd), j;
+            JSJobEntry *e;
+            if (r->rd.err || kind > 1 || argc2 > 16)
+                goto trunc;
+            if (!base->tt_jobs) {
+                base->tt_jobs = js_mallocz(ctx, sizeof(*base->tt_jobs));
+                if (!base->tt_jobs)
+                    goto fail;
+                init_list_head(&base->tt_jobs->jobs);
+            }
+            e = js_mallocz(ctx, sizeof(*e) + argc2 * sizeof(JSValue));
+            if (!e)
+                goto fail;
+            e->realm = JS_DupContext(ctx);
+            e->job_func = (kind == 0) ? promise_reaction_job
+                                      : js_promise_resolve_thenable_job;
+            e->argc = (int)argc2;
+            for (j = 0; j < argc2; j++)
+                e->argv[j] = JS_UNDEFINED;
+            list_add_tail(&e->link, &base->tt_jobs->jobs);
+            base->tt_jobs->count++;
+            for (j = 0; j < argc2; j++) {
+                JSValue v = rd_get_vref(r);
+                if (JS_IsException(v))
+                    goto fail;
+                e->argv[j] = v;
+            }
+        }
+    }
+
+    /* ---- async flows: fresh result promises regain their handle link ---- */
+    for (i = 0; i < r->rec_count; i++) {
+        if (r->recs[i].kind == TT_REC_STATE && r->recs[i].st)
+            tt_async_flow_link_from_state(ctx, r->recs[i].st);
+    }
+
     /* ---- root ---- */
     root_kind = (uint8_t)tt_rd_u8(&r->rd);
     if (r->rd.err)
@@ -45392,6 +45999,8 @@ typedef struct TTForkCtx {
     JSValue *clone_v;
     JSVarRef **clone_vr;
     JSAsyncFunctionState **clone_st;
+    void **clone_raw;         /* PRESOLVED clones; PROMISE_FUNC data until
+                                 its object adopts it in pass 2 */
     /* per frame-table entry: the sibling frame */
     JSStackFrame **clone_frame;
     /* machine-parked parent: the sibling chain's own machine (owned until
@@ -45561,6 +46170,20 @@ static void fork_release(TTForkCtx *fk)
             if (fk->clone_vr[i])
                 free_var_ref(fk->ctx->rt, fk->clone_vr[i]);
             break;
+        case TT_REC_PRESOLVED:
+            if (fk->clone_raw && fk->clone_raw[i])
+                js_promise_resolve_function_free_resolved(fk->ctx->rt,
+                                                          fk->clone_raw[i]);
+            break;
+        case TT_REC_PROMISE_FUNC:
+            if (fk->clone_raw && fk->clone_raw[i]) {
+                /* the object never adopted its data (early failure) */
+                JSPromiseFunctionData *fd = fk->clone_raw[i];
+                JS_FreeValue(fk->ctx, fd->promise);
+                js_free(fk->ctx, fd);
+            }
+            JS_FreeValue(fk->ctx, fk->clone_v[i]);
+            break;
         default:
             JS_FreeValue(fk->ctx, fk->clone_v[i]);
             break;
@@ -45570,6 +46193,7 @@ static void fork_release(TTForkCtx *fk)
     js_free(fk->ctx, fk->clone_vr);
     js_free(fk->ctx, fk->clone_st);
     js_free(fk->ctx, fk->clone_frame);
+    js_free(fk->ctx, fk->clone_raw);
 }
 
 /* fork_flow(): clone 'base'+'root' (a suspended generator flow) inside the
@@ -45613,7 +46237,9 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
                               sizeof(JSAsyncFunctionState *) * (w->rec_count + 1));
     fk->clone_frame = js_mallocz(ctx,
                                  sizeof(JSStackFrame *) * (w->frame_count + 1));
-    if (!fk->clone_v || !fk->clone_vr || !fk->clone_st || !fk->clone_frame)
+    fk->clone_raw = js_mallocz(ctx, sizeof(void *) * (w->rec_count + 1));
+    if (!fk->clone_v || !fk->clone_vr || !fk->clone_st || !fk->clone_frame ||
+        !fk->clone_raw)
         goto out;
     for (i = 0; i < w->rec_count; i++)
         fk->clone_v[i] = JS_UNDEFINED;
@@ -45718,6 +46344,55 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
                 rec->kind == TT_REC_STRING ? JS_TAG_STRING : JS_TAG_SYMBOL,
                 rec->ptr));
             break;
+        case TT_REC_PROMISE: {
+            JSPromiseData *pd;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    JS_CLASS_PROMISE);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            pd = js_mallocz(ctx, sizeof(*pd));
+            if (!pd)
+                goto out;
+            pd->promise_state = JS_PROMISE_PENDING;
+            init_list_head(&pd->promise_reactions[0]);
+            init_list_head(&pd->promise_reactions[1]);
+            pd->promise_result = JS_UNDEFINED;
+            JS_SetOpaque(fk->clone_v[i], pd);
+            break;
+        }
+        case TT_REC_PROMISE_FUNC: {
+            JSObject *src = rec->ptr;
+            JSPromiseFunctionData *fd;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    src->class_id);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            fd = js_mallocz(ctx, sizeof(*fd));
+            if (!fd)
+                goto out;
+            fd->promise = JS_UNDEFINED;
+            fk->clone_raw[i] = fd;    /* adopted in pass 2 */
+            break;
+        }
+        case TT_REC_PRESOLVED: {
+            JSPromiseFunctionDataResolved *src = rec->ptr, *sr;
+            sr = js_malloc(ctx, sizeof(*sr));
+            if (!sr)
+                goto out;
+            sr->ref_count = 1;
+            sr->already_resolved = src->already_resolved;
+            fk->clone_raw[i] = sr;
+            break;
+        }
+        case TT_REC_ASYNC_RESOLVE: {
+            JSObject *src = rec->ptr;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    src->class_id);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            JS_VALUE_GET_OBJ(fk->clone_v[i])->u.async_function_data = NULL;
+            break;
+        }
         }
     }
     /* frames: state-owned frames map to their clone states; arena frames
@@ -45944,6 +46619,14 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
                 goto out;
             st->this_val = v;
             st->frame.tt_this = st->this_val;
+            v = fork_map_value(fk, src->resolving_funcs[0]);
+            if (JS_IsException(v))
+                goto out;
+            st->resolving_funcs[0] = v;
+            v = fork_map_value(fk, src->resolving_funcs[1]);
+            if (JS_IsException(v))
+                goto out;
+            st->resolving_funcs[1] = v;
             dp2 = st->frame.arg_buf;
             for (sp = src->frame.arg_buf; sp < src->frame.cur_sp;
                  sp++, dp2++) {
@@ -45997,6 +46680,85 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
             if (JS_IsException(v))
                 goto out;
             fk->clone_vr[i]->value = v;
+            break;
+        }
+        case TT_REC_PROMISE: {
+            JSObject *src = rec->ptr;
+            JSPromiseData *spd = JS_GetOpaque(JS_MKPTR(JS_TAG_OBJECT, src),
+                                              JS_CLASS_PROMISE);
+            JSPromiseData *dpd = JS_GetOpaque(fk->clone_v[i],
+                                              JS_CLASS_PROMISE);
+            struct list_head *el;
+            int k;
+            JSValue v;
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            dpd->promise_state = spd->promise_state;
+            dpd->is_handled = spd->is_handled;
+            v = fork_map_value(fk, spd->promise_result);
+            if (JS_IsException(v))
+                goto out;
+            dpd->promise_result = v;
+            for (k = 0; k < 2; k++) {
+                list_for_each(el, &spd->promise_reactions[k]) {
+                    JSPromiseReactionData *srd =
+                        list_entry(el, JSPromiseReactionData, link);
+                    JSPromiseReactionData *drd =
+                        js_mallocz(ctx, sizeof(*drd));
+                    int m;
+                    if (!drd)
+                        goto out;
+                    for (m = 0; m < 2; m++)
+                        drd->resolving_funcs[m] = JS_UNDEFINED;
+                    drd->handler = JS_UNDEFINED;
+                    list_add_tail(&drd->link, &dpd->promise_reactions[k]);
+                    for (m = 0; m < 2; m++) {
+                        v = fork_map_value(fk, srd->resolving_funcs[m]);
+                        if (JS_IsException(v))
+                            goto out;
+                        drd->resolving_funcs[m] = v;
+                    }
+                    v = fork_map_value(fk, srd->handler);
+                    if (JS_IsException(v))
+                        goto out;
+                    drd->handler = v;
+                }
+            }
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        }
+        case TT_REC_PROMISE_FUNC: {
+            JSObject *src = rec->ptr;
+            JSPromiseFunctionData *sfd = src->u.promise_function_data;
+            JSPromiseFunctionData *dfd = fk->clone_raw[i];
+            uint32_t pidx = tt_ptrmap_get(&w->map, sfd->presolved);
+            JSValue v;
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            v = fork_map_value(fk, sfd->promise);
+            if (JS_IsException(v))
+                goto out;
+            dfd->promise = v;
+            dfd->presolved = fk->clone_raw[pidx - 1];
+            dfd->presolved->ref_count++;
+            JS_VALUE_GET_OBJ(fk->clone_v[i])->u.promise_function_data = dfd;
+            fk->clone_raw[i] = NULL;  /* owned by the object now */
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        }
+        case TT_REC_ASYNC_RESOLVE: {
+            JSObject *src = rec->ptr;
+            uint32_t sidx = tt_ptrmap_get(&w->map,
+                                          src->u.async_function_data);
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            JS_VALUE_GET_OBJ(fk->clone_v[i])->u.async_function_data =
+                fk->clone_st[sidx - 1];
+            js_rc(fk->clone_st[sidx - 1])->ref_count++;
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
             break;
         }
         default:
@@ -46098,6 +46860,44 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
         fk->m->base_frame = &cbase->frame;
         cbase->tt_machine = fk->m;
         fk->m = NULL;
+    }
+
+    /* the flow's captured pending jobs: the sibling gets its own copies */
+    if (base->tt_jobs) {
+        uint32_t bidx = tt_ptrmap_get(&w->map, base);
+        JSAsyncFunctionState *cbase = fk->clone_st[bidx - 1];
+        struct list_head *el;
+        cbase->tt_jobs = js_mallocz(ctx, sizeof(*cbase->tt_jobs));
+        if (!cbase->tt_jobs)
+            goto out;
+        init_list_head(&cbase->tt_jobs->jobs);
+        list_for_each(el, &base->tt_jobs->jobs) {
+            JSJobEntry *se = list_entry(el, JSJobEntry, link);
+            JSJobEntry *de;
+            int j;
+            de = js_mallocz(ctx, sizeof(*de) + se->argc * sizeof(JSValue));
+            if (!de)
+                goto out;
+            de->realm = JS_DupContext(ctx);
+            de->job_func = se->job_func;
+            de->argc = se->argc;
+            for (j = 0; j < se->argc; j++)
+                de->argv[j] = JS_UNDEFINED;
+            list_add_tail(&de->link, &cbase->tt_jobs->jobs);
+            cbase->tt_jobs->count++;
+            for (j = 0; j < se->argc; j++) {
+                JSValue v = fork_map_value(fk, se->argv[j]);
+                if (JS_IsException(v))
+                    goto out;
+                de->argv[j] = v;
+            }
+        }
+    }
+
+    /* async flows: the sibling's result promise regains its handle link */
+    for (i = 0; i < w->rec_count; i++) {
+        if (w->recs[i].kind == TT_REC_STATE && fk->clone_st[i])
+            tt_async_flow_link_from_state(ctx, fk->clone_st[i]);
     }
 
     /* reconciliation: the handle keeps the graph, construction refs drop */
@@ -46417,8 +47217,20 @@ uint8_t *JS_TTMachineEvict(JSContext *ctx, JSValueConst flow, size_t *plen)
     bytes = serialize_flow(ctx, st, flow, 1, plen);
     if (!bytes)
         return NULL;
-    gd = JS_GetOpaque(flow, JS_CLASS_GENERATOR);
-    free_generator_stack_rt(ctx->rt, gd);
+    if (JS_VALUE_GET_OBJ(flow)->class_id == JS_CLASS_PROMISE) {
+        /* sever the handle's flow link; the orphaned await graph (state,
+           awaited promise, continuation handlers -- one cycle) collects
+           right here, freeing the hot copy */
+        JSPromiseData *pd = JS_GetOpaque(flow, JS_CLASS_PROMISE);
+        if (pd && pd->tt_flow_state == st) {
+            pd->tt_flow_state = NULL;
+            async_func_free(ctx->rt, st);
+        }
+        JS_RunGC(ctx->rt);
+    } else {
+        gd = JS_GetOpaque(flow, JS_CLASS_GENERATOR);
+        free_generator_stack_rt(ctx->rt, gd);
+    }
     return bytes;
 }
 
@@ -62386,29 +63198,8 @@ static const JSCFunctionListEntry js_generator_proto_funcs[] = {
 
 /* Promise */
 
-typedef struct JSPromiseData {
-    JSPromiseStateEnum promise_state;
-    /* 0=fulfill, 1=reject, list of JSPromiseReactionData.link */
-    struct list_head promise_reactions[2];
-    BOOL is_handled; /* Note: only useful to debug */
-    JSValue promise_result;
-} JSPromiseData;
-
-typedef struct JSPromiseFunctionDataResolved {
-    int ref_count;
-    BOOL already_resolved;
-} JSPromiseFunctionDataResolved;
-
-typedef struct JSPromiseFunctionData {
-    JSValue promise;
-    JSPromiseFunctionDataResolved *presolved;
-} JSPromiseFunctionData;
-
-typedef struct JSPromiseReactionData {
-    struct list_head link; /* not used in promise_reaction_job */
-    JSValue resolving_funcs[2];
-    JSValue handler;
-} JSPromiseReactionData;
+/* (JSPromiseData and friends are defined before the TimeTravelJS flow
+   serialization section, which classifies and clones them) */
 
 JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValue promise)
 {
@@ -63010,6 +63801,8 @@ static void js_promise_finalizer(JSRuntime *rt, JSValue val)
             promise_reaction_data_free(rt, rd);
         }
     }
+    if (s->tt_flow_state)
+        async_func_free(rt, s->tt_flow_state);
     JS_FreeValueRT(rt, s->promise_result);
     js_free_rt(rt, s);
 }
@@ -63032,6 +63825,8 @@ static void js_promise_mark(JSRuntime *rt, JSValueConst val,
             JS_MarkValue(rt, rd->handler, mark_func);
         }
     }
+    if (s->tt_flow_state)
+        mark_func(rt, &s->tt_flow_state->header);
     JS_MarkValue(rt, s->promise_result, mark_func);
 }
 
@@ -70828,8 +71623,8 @@ static JSFunctionBytecode *tt_frame_bytecode(JSStackFrame *sf)
     if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
         return NULL;
     p = JS_VALUE_GET_OBJ(sf->cur_func);
-    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
-        return NULL;
+    if (!js_class_has_bytecode(p->class_id))
+        return NULL;          /* generator/async frames carry bytecode too */
     return p->u.func.function_bytecode;
 }
 
@@ -71217,24 +72012,94 @@ JS_BOOL JS_TTSetLocal(JSContext *ctx, int level, JSAtom name, JSValueConst value
                              value);
 }
 
-/* The same edit against a flow suspended as a machine handle: the walk
-   starts at the handle's parked innermost frame, so level 0 is the frame
-   the machine will execute next. */
+/* the frame a suspended flow executes next: a machine handle's parked
+   innermost frame, or the suspended (yield/await) state's own frame */
+static JSStackFrame *tt_flow_start_frame(JSValueConst flow)
+{
+    JSAsyncFunctionState *s = NULL;
+    if (JS_VALUE_GET_TAG(flow) != JS_TAG_OBJECT)
+        return NULL;
+    switch (JS_VALUE_GET_OBJ(flow)->class_id) {
+    case JS_CLASS_GENERATOR: {
+        JSGeneratorData *gd = JS_GetOpaque(flow, JS_CLASS_GENERATOR);
+        if (gd)
+            s = gd->func_state;
+        break;
+    }
+    case JS_CLASS_PROMISE:
+        s = tt_promise_flow_state(flow);
+        break;
+    }
+    if (!s || s->is_completed)
+        return NULL;
+    if (s->tt_machine && s->tt_machine->parked_frame)
+        return s->tt_machine->parked_frame;
+    if (s->frame.cur_sp)
+        return &s->frame;
+    return NULL;
+}
+
+/* The same edit against a suspended flow handle (a generator object or an
+   async flow's result promise): the walk starts at the frame the flow will
+   execute next -- a machine's parked innermost frame, or the suspended
+   yield/await frame itself. */
 JS_BOOL JS_TTFlowSetLocal(JSContext *ctx, JSValueConst flow, int level,
                           JSAtom name, JSValueConst value)
 {
-    JSGeneratorData *gd;
-    struct TTMachine *m;
-    if (JS_VALUE_GET_TAG(flow) != JS_TAG_OBJECT ||
-        JS_VALUE_GET_OBJ(flow)->class_id != JS_CLASS_GENERATOR)
+    JSStackFrame *sf = tt_flow_start_frame(flow);
+    if (!sf)
         return FALSE;
-    gd = JS_GetOpaque(flow, JS_CLASS_GENERATOR);
-    if (!gd || !gd->func_state)
-        return FALSE;
-    m = gd->func_state->tt_machine;
-    if (!m || !m->parked_frame)
-        return FALSE;
-    return tt_set_local_from(ctx, m->parked_frame, level, name, value);
+    return tt_set_local_from(ctx, sf, level, name, value);
+}
+
+/* Read a live frame local out of a suspended flow (the debugger dual of
+   JS_TTFlowSetLocal); JS_UNDEFINED when the binding is not found. The way
+   a host reaches an arm's own resolver/iterator to settle its awaits. */
+JSValue JS_TTFlowGetLocal(JSContext *ctx, JSValueConst flow, int level,
+                          JSAtom name)
+{
+    JSStackFrame *sf = tt_flow_start_frame(flow);
+    JSFunctionBytecode *b;
+    JSObject *p;
+    int i;
+
+    if (!sf)
+        return JS_UNDEFINED;
+    while (sf && (tt_frame_bytecode(sf) == NULL))
+        sf = sf->prev_frame;
+    while (sf && level > 0) {
+        sf = sf->prev_frame;
+        while (sf && (tt_frame_bytecode(sf) == NULL))
+            sf = sf->prev_frame;
+        level--;
+    }
+    if (!sf)
+        return JS_UNDEFINED;
+    b = tt_frame_bytecode(sf);
+    p = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (b->vardefs) {
+        if (sf->arg_buf) {
+            for (i = 0; i < b->arg_count && i < sf->arg_count; i++) {
+                if (b->vardefs[i].var_name == name)
+                    return JS_DupValue(ctx, sf->arg_buf[i]);
+            }
+        }
+        if (sf->var_buf) {
+            for (i = 0; i < b->var_count; i++) {
+                if (b->vardefs[b->arg_count + i].var_name == name)
+                    return JS_DupValue(ctx, sf->var_buf[i]);
+            }
+        }
+    }
+    if (p->u.func.var_refs) {
+        for (i = 0; i < b->closure_var_count; i++) {
+            JSVarRef *var_ref = p->u.func.var_refs[i];
+            if (b->closure_var[i].var_name == name && var_ref &&
+                var_ref->pvalue)
+                return JS_DupValue(ctx, *var_ref->pvalue);
+        }
+    }
+    return JS_UNDEFINED;
 }
 
 /* ===================== TimeTravelJS __wasi__ host interface ==========

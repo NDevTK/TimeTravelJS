@@ -1031,10 +1031,18 @@ JSValue JS_TTFlowFork(JSContext *ctx, JSValueConst flow);
    (handler returns 0 to run on, 2 to park; resume with JS_TTCallResume).
    OP_if_true on an unknown: both arms run. */
 JSValue JS_TTForkHere(JSContext *ctx);
-/* rebind a local in a machine-parked flow's frames (level 0 = the frame
-   the machine executes next); the flow-handle twin of JS_TTSetLocal. */
+/* rebind a local in a suspended flow's frames (level 0 = the frame the
+   flow executes next: a machine's parked innermost frame or the suspended
+   yield/await frame); the flow-handle twin of JS_TTSetLocal. Flow handles
+   are generator objects, or -- for async-function flows -- the function's
+   RESULT PROMISE. */
 JS_BOOL JS_TTFlowSetLocal(JSContext *ctx, JSValueConst flow, int level,
                           JSAtom name, JSValueConst value);
+/* read a live frame local out of a suspended flow (JS_UNDEFINED when not
+   found): how a host reaches a forked arm's own resolver or iterator to
+   settle that arm's awaits independently. */
+JSValue JS_TTFlowGetLocal(JSContext *ctx, JSValueConst flow, int level,
+                          JSAtom name);
 /* storage footprint of a flow's suspended machine: *pused = bytes its
    parked chain's arena frames occupy, *preserved = RAM held for them
    (demand-grown segments track used: N machines cost the sum of their

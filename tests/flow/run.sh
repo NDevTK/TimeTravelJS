@@ -61,4 +61,6 @@ echo "== deep (chains across segment boundaries) =="
 "$BUILD/flow-harness" deep
 echo "== evict (cold machines to bytes and back) =="
 "$BUILD/flow-harness" evict
+echo "== asynctest (per-flow job queues, await fork, evict+microtask) =="
+"$BUILD/flow-harness" asynctest
 echo "PASS: flow serialization suite"
