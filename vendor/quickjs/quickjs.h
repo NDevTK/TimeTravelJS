@@ -1035,6 +1035,21 @@ JSValue JS_TTForkHere(JSContext *ctx);
    the machine executes next); the flow-handle twin of JS_TTSetLocal. */
 JS_BOOL JS_TTFlowSetLocal(JSContext *ctx, JSValueConst flow, int level,
                           JSAtom name, JSValueConst value);
+/* storage footprint of a flow's suspended machine: *pused = bytes its
+   parked chain's arena frames occupy, *preserved = RAM held for them
+   (demand-grown segments track used: N machines cost the sum of their
+   chain depths, not N fixed slabs), *psegments = segment count.
+   Returns 0, or -1 (no exception) when the flow holds no machine. */
+int JS_TTFlowMachineStats(JSContext *ctx, JSValueConst flow, size_t *pused,
+                          size_t *preserved, int *psegments);
+/* cold eviction: serialize a suspended machine (chain + private graph +
+   COW delta) to js_malloc'd bytes and free its RAM -- the handle becomes
+   a completed husk. Hydrate rebuilds a live suspended machine from those
+   bytes (here or in any runtime with the identically rebuilt baseline);
+   resume with JS_TTFlowResumeParked / next() as before. Requires the
+   flow checked out; the live legacy machine refuses. */
+uint8_t *JS_TTMachineEvict(JSContext *ctx, JSValueConst flow, size_t *plen);
+JSValue JS_TTMachineHydrate(JSContext *ctx, const uint8_t *buf, size_t len);
 /* per-flow COW delta: record-once first-write against a baseline property
    or closure cell, then write through; checkout parks the flow's view
    (baseline shows pristine values), checkin installs it. Pure swaps. */

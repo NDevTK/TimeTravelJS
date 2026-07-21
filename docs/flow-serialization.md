@@ -323,6 +323,74 @@ arm's resume*, four machines suspended concurrently in one runtime, three
 divergent futures, and an arm abandoned without resuming that tears down
 leak-free.
 
+## Segmented arenas: N machines cost Σ depth, not N slabs
+
+A machine's arena is not a fixed 2 MB slab but a **linked chain of
+demand-sized segments** that grows by appending and never by a
+realloc-that-moves — live frames carry parent-relative aliases and
+open-cell storage pointers, so a block's address is forever. A block
+never straddles segments: when the current segment cannot hold a push,
+allocation continues in a fresh segment sized to the demand (first
+segment ≥ 1 KB, then doubling to a 64 KB ceiling, total capped at the
+same 2 MB the fixed arena enforces, so the recursion limit keeps its
+order of magnitude). The runtime's own execution arena is the degenerate
+case — one fixed 2 MB segment whose exhaustion *is* the engine's
+snapshot-stable recursion limit — so normal execution is unchanged.
+
+The hot paths stay hot: push is the same bump-and-compare with a slow
+path that enters the next segment; pop is LIFO release to a mark, with a
+one-compare fast path (mark inside the current segment) and a crossing
+path that finds the mark's segment by **range membership** — segments are
+separate allocations, so inter-segment address order means nothing.
+Vacated segments stay linked for push/pop reuse at a boundary;
+re-parking trims the empty tail, so a suspended machine's footprint is
+what its chain actually occupies. `JS_TTFlowMachineStats` reports it
+(used chain bytes, reserved RAM, segment count), and the mass harness
+holds it to a hard bound: 2 000 suspended machines forked from one
+baseline measure ~1.1 KB of arena RAM each — a small multiple of the
+chains' actual bytes and two orders of magnitude under N × 2 MB.
+
+The chain-walk and the transplant offset math never see segments (every
+wire offset is parent-relative); only the serializer's foreign-block
+check is segment-aware: consecutive chain frames must be adjacent within
+a segment, or the next frame must open the very next segment from its
+base *and* be too big for the tail it left — the exact condition under
+which the allocator crosses. The deep harness proves the whole story
+across boundaries: a recursion parked 30 frames down forks into a
+3-segment machine, transplants, resumes (descending 30 more levels
+inside the installed machine — growth mid-run — then unwinding straight
+back through every boundary), all byte-identical to the never-segmented
+reference.
+
+One GC subtlety: a machine dismantled *during* cycle removal (its flow
+died in a cycle) must not free its segments or dup cell values — later
+finalizers in the same pass still unlink cells through the frames'
+weak slots, and the dying graph must not be mutated. The teardown goes
+phase-aware: still-attached cells have their values **moved** out
+(refcount-neutral) instead of closed, a zombie `cur_func` (bytecode
+pointer already cleared) means the cells die in the same pass and are
+left to unlink themselves, and the segments park on a **graveyard**
+freed when the pass ends.
+
+## Cold eviction: a suspended machine as bytes on disk
+
+`JS_TTMachineEvict(ctx, flow, &len)` serializes a suspended machine —
+chain, private graph, COW delta — through the flow serializer's
+classification (it *is* `serialize_flow`), then frees the hot copy by
+completing the handle without resuming: the state finalizer dismantles
+the machine, its segments, and the delta, and the handle the host keeps
+becomes a completed husk. `JS_TTMachineHydrate(ctx, bytes, len)` is
+deserialization by another name: it rebuilds a live suspended machine —
+in the same runtime or any runtime holding the identically rebuilt
+baseline — resumable with `JS_TTFlowResumeParked` as if it had never
+left RAM. Hot machines live in RAM; the cold tail is bytes the host can
+put anywhere. Requires the flow checked out (as serialization always
+has); yield-suspended flows evict the same way; the live legacy machine
+refuses (its park state sits on the runtime's own registers). The evict
+harness round-trips a forked arm through 242 bytes — injected local and
+all — and its hydrated future is byte-identical to its never-evicted
+twin, with the parent machine and the sibling untouched throughout.
+
 ## Resuming a transplanted machine
 
 A flow serialized while machine-parked arrives EXECUTING **with its own

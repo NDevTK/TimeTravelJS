@@ -55,4 +55,10 @@ echo "== forktest =="
 "$BUILD/flow-harness" forktest
 echo "== forkhere (machine-as-value) =="
 "$BUILD/flow-harness" forkhere
+echo "== mass (segmented arenas: N machines, O(sum depth) RAM) =="
+"$BUILD/flow-harness" mass
+echo "== deep (chains across segment boundaries) =="
+"$BUILD/flow-harness" deep
+echo "== evict (cold machines to bytes and back) =="
+"$BUILD/flow-harness" evict
 echo "PASS: flow serialization suite"

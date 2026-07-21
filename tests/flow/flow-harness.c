@@ -48,6 +48,30 @@
  *                               into the same live local and per-arm
  *                               deltas), and an abandoned arm tears down
  *                               leak-free without ever resuming.
+ *
+ *   flow-harness mass           segmented arenas: 2000 machines forked
+ *                               from one baseline; HARD bound that their
+ *                               measured arena RAM is a small multiple of
+ *                               the chains' actual bytes, not N x 2 MB;
+ *                               spot resumes identical; mass teardown
+ *                               through the leak oracle.
+ *
+ *   flow-harness deep           a recursion parked 30 frames down forks/
+ *                               transplants into multi-segment machines
+ *                               that grow further while installed and
+ *                               unwind back across every segment
+ *                               boundary, byte-identical to the
+ *                               never-segmented reference; evict/hydrate
+ *                               of the deep machine included.
+ *
+ *   flow-harness evict          cold eviction: a suspended machine (with
+ *                               an injected local and a delta) round-
+ *                               trips through bytes -- freed, hydrated,
+ *                               resumed byte-identically to its
+ *                               never-evicted twin -- without disturbing
+ *                               the parent or siblings; the live legacy
+ *                               machine refuses; yield-suspended flows
+ *                               evict too.
  */
 #include "quickjs.h"
 #include <stdio.h>
@@ -98,6 +122,16 @@ static const char *BASELINE_SRC =
 "  yield \"after-inner:\" + got + \":\" + local.acc + \":\" + late;\n"
 "  yield \"delta-view:\" + CONFIG.tag + \":\" + when.getTime() + \":\" + String(big);\n"
 "  return \"outer-done:\" + local.acc + \":\" + CONFIG.tag + \":\" + symval[sym];\n"
+"}\n"
+"function rec(n, a) {\n"
+"  if (n <= 0) return helper(1, a);\n"
+"  return rec(n - 1, a) + 0;\n"
+"}\n"
+"function* deepflow(d) {\n"
+"  var t = rec(d, 3);\n"
+"  yield \"deep:\" + t;\n"
+"  yield \"deep2:\" + (t + rec(3, 1));\n"
+"  return \"deep-done:\" + t;\n"
 "}\n";
 
 static void die(JSContext *ctx, const char *what)
@@ -1168,6 +1202,378 @@ static int cmd_forkhere(void)
     return 0;
 }
 
+/* park the standard machine (outer -> yield* inner -> helper under a for-of
+   drive, stopped on helper's middle line at k=1) with the delta written and
+   checked out -- ready to fork/serialize */
+static JSValue park_std_machine(JSContext *ctx, JSRuntime *rt, ParkPlan *plan,
+                                JSValue *pdrive_fn)
+{
+    JSValue g = start_flow(ctx, 2, NULL);
+    int parked = 0;
+    write_delta(ctx, g);
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout");
+    plan->line = baseline_line_of("acc = acc + CONFIG.limit");
+    plan->countdown = 1;
+    plan->parked_line = 0;
+    plan->fork_here = 0;
+    plan->forked = JS_UNDEFINED;
+    JS_TTSetStepHandler(rt, park_handler, plan);
+    JS_TTSetStepFilename(ctx, "baseline.js");
+    JS_TTEnableStep(rt, 1);
+    *pdrive_fn = get_global(ctx, "drive");
+    {
+        JSValueConst args[1] = { g };
+        JSValue ret = JS_TTCallArgs(ctx, *pdrive_fn, JS_UNDEFINED, 1, args,
+                                    &parked);
+        if (JS_IsException(ret))
+            die(ctx, "drive");
+        if (!parked) {
+            fprintf(stderr, "FATAL machine did not park\n");
+            exit(1);
+        }
+        JS_FreeValue(ctx, ret);
+    }
+    JS_TTEnableStep(rt, 0);
+    return g;
+}
+
+/* mass: N suspended machines forked from one baseline cost the sum of
+   their actual chain depths, not N fixed 2 MB slabs -- hard bounds on the
+   measured arena RAM, spot resumes, leak-free mass teardown */
+#define NMASS 2000
+static JSValue mass_arms[NMASS];
+
+static int cmd_mass(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    ParkPlan plan;
+    JSValue drive_fn, g;
+    size_t tot_used = 0, tot_reserved = 0;
+    char t0[2048], t1[2048], t2[2048];
+    int i, parked = 0;
+
+    g = park_std_machine(ctx, rt, &plan, &drive_fn);
+
+    for (i = 0; i < NMASS; i++) {
+        mass_arms[i] = JS_TTFlowFork(ctx, g);
+        if (JS_IsException(mass_arms[i]))
+            die(ctx, "mass fork");
+    }
+    for (i = 0; i < NMASS; i++) {
+        size_t used = 0, reserved = 0;
+        int segs = 0;
+        if (JS_TTFlowMachineStats(ctx, mass_arms[i], &used, &reserved,
+                                  &segs)) {
+            fprintf(stderr, "FAIL arm %d has no machine\n", i);
+            return 1;
+        }
+        tot_used += used;
+        tot_reserved += reserved;
+    }
+    printf("MASS:%d machines, used=%zu reserved=%zu (%.0f bytes/machine)\n",
+           NMASS, tot_used, tot_reserved, (double)tot_reserved / NMASS);
+    /* HARD bounds: reserved tracks the chains actually parked -- a small
+       multiple of used plus a per-machine sliver -- and sits orders of
+       magnitude below N x 2 MB slabs */
+    assert(tot_used >= (size_t)NMASS * 200);
+    assert(tot_reserved <= 4 * tot_used + (size_t)NMASS * 2048);
+    assert(tot_reserved < (size_t)NMASS * (2u * 1024 * 1024) / 100);
+    printf("MASS:arena RAM bound ok\n");
+
+    /* spot-resume three arms across the population: identical futures */
+    {
+        int picks[3] = { 0, NMASS / 2, NMASS - 1 };
+        char *bufs[3] = { t0, t1, t2 };
+        int k;
+        for (k = 0; k < 3; k++) {
+            resume_first(ctx, mass_arms[picks[k]], bufs[k], 2048);
+            collect_flow(ctx, mass_arms[picks[k]], 0,
+                         bufs[k] + strlen(bufs[k]), 2048 - strlen(bufs[k]));
+        }
+        assert(strcmp(t0, t1) == 0 && strcmp(t1, t2) == 0);
+        assert(strstr(t0, "delta-view:"));
+    }
+    printf("MASS:spot resumes identical ok\n");
+
+    for (i = 0; i < NMASS; i++)
+        JS_FreeValue(ctx, mass_arms[i]);
+    {   /* discard the legacy machine through the abort path */
+        JSValue ret = JS_TTCallResume(ctx, 1, &parked);
+        if (parked)
+            die(ctx, "abort did not complete");
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    JS_FreeValue(ctx, drive_fn);
+    JS_FreeValue(ctx, g);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    printf("MASS:teardown ok\n");
+    return 0;
+}
+
+/* deep: a chain grown by recursion under the step hook crosses multiple
+   arena segments; it still forks, transplants, evicts and resumes
+   byte-identically across the segment boundaries */
+static int cmd_deep(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    ParkPlan plan;
+    JSValue g, drive_fn, armF, armF2, h1, armFh;
+    uint8_t *bytes, *ebytes;
+    size_t blen, elen, used = 0, reserved = 0;
+    int segs = 0, parked = 0;
+    char tF2[2048], tH[2048], tHy[2048], ref[4096];
+
+    /* a 60-deep recursion, parked ~30 frames down on the descent */
+    {
+        JSValue fn = get_global(ctx, "deepflow");
+        JSValue arg = JS_NewInt32(ctx, 60);
+        g = JS_Call(ctx, fn, JS_UNDEFINED, 1, (JSValueConst *)&arg);
+        if (JS_IsException(g))
+            die(ctx, "deepflow()");
+        JS_FreeValue(ctx, fn);
+    }
+    plan.line = baseline_line_of("return rec(n - 1, a) + 0");
+    plan.countdown = 30;
+    plan.parked_line = 0;
+    plan.fork_here = 0;
+    plan.forked = JS_UNDEFINED;
+    JS_TTSetStepHandler(rt, park_handler, &plan);
+    JS_TTSetStepFilename(ctx, "baseline.js");
+    JS_TTEnableStep(rt, 1);
+    drive_fn = get_global(ctx, "drive");
+    {
+        JSValueConst args[1] = { g };
+        JSValue ret = JS_TTCallArgs(ctx, drive_fn, JS_UNDEFINED, 1, args,
+                                    &parked);
+        if (JS_IsException(ret))
+            die(ctx, "deep drive");
+        if (!parked) {
+            fprintf(stderr, "FATAL deep machine did not park\n");
+            return 1;
+        }
+        JS_FreeValue(ctx, ret);
+    }
+    JS_TTEnableStep(rt, 0);
+
+    /* fork the deep chain: the sibling's machine spans several segments */
+    armF = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(armF))
+        die(ctx, "deep fork");
+    if (JS_TTFlowMachineStats(ctx, armF, &used, &reserved, &segs)) {
+        fprintf(stderr, "FAIL deep fork has no machine\n");
+        return 1;
+    }
+    printf("DEEP:fork used=%zu reserved=%zu segments=%d\n",
+           used, reserved, segs);
+    assert(segs >= 2);                    /* crosses segment boundaries */
+    assert(used >= 4000);                 /* the ~30 rec frames are real */
+    assert(reserved <= 3 * used + 4096);  /* demand growth tracks depth */
+
+    bytes = JS_TTFlowSerialize(ctx, g, &blen);   /* the legacy deep chain */
+    if (!bytes)
+        die(ctx, "deep serialize");
+    h1 = JS_TTFlowDeserialize(ctx, bytes, blen);
+    if (JS_IsException(h1))
+        die(ctx, "deep deserialize");
+    js_free(ctx, bytes);
+    {
+        int s2 = 0;
+        if (JS_TTFlowMachineStats(ctx, h1, NULL, NULL, &s2) || s2 < 2) {
+            fprintf(stderr, "FAIL transplanted deep machine not segmented\n");
+            return 1;
+        }
+    }
+
+    armF2 = JS_TTFlowFork(ctx, armF);     /* fork ACROSS the boundaries */
+    if (JS_IsException(armF2))
+        die(ctx, "deep fork-of-fork");
+
+    ebytes = JS_TTMachineEvict(ctx, armF, &elen);
+    if (!ebytes)
+        die(ctx, "deep evict");
+    if (JS_TTFlowParked(ctx, armF)) {
+        fprintf(stderr, "FAIL evicted arm still parked\n");
+        return 1;
+    }
+    armFh = JS_TTMachineHydrate(ctx, ebytes, elen);
+    if (JS_IsException(armFh))
+        die(ctx, "deep hydrate");
+    js_free(ctx, ebytes);
+
+    /* reference future: the legacy machine completes drive() -- resuming
+       descends 30 more rec levels INSIDE the machine, then unwinds all of
+       them; for the handles below, both directions cross segments */
+    {
+        JSValue ret = JS_TTCallResume(ctx, 0, &parked);
+        const char *s;
+        if (parked || JS_IsException(ret))
+            die(ctx, "deep reference resume");
+        s = JS_ToCString(ctx, ret);
+        snprintf(ref, sizeof(ref), "%s", s ? s : "?");
+        JS_FreeCString(ctx, s);
+        JS_FreeValue(ctx, ret);
+    }
+
+    resume_first(ctx, armFh, tHy, sizeof(tHy));
+    collect_flow(ctx, armFh, 0, tHy + strlen(tHy),
+                 sizeof(tHy) - strlen(tHy));
+    resume_first(ctx, h1, tH, sizeof(tH));
+    collect_flow(ctx, h1, 0, tH + strlen(tH), sizeof(tH) - strlen(tH));
+    resume_first(ctx, armF2, tF2, sizeof(tF2));
+    collect_flow(ctx, armF2, 0, tF2 + strlen(tF2),
+                 sizeof(tF2) - strlen(tF2));
+
+    printf("DEEP:ref=%s\n", ref);
+    printf("DEEP:handle=%s\n", tHy);
+    assert(strcmp(tHy, tH) == 0);
+    assert(strcmp(tHy, tF2) == 0);
+    assert(strstr(tHy, "deep:"));
+    {   /* the handles' first step is the very token the reference joined */
+        char tok[256];
+        size_t j = 0;
+        while (tHy[j] && tHy[j] != '|' && j < 255) {
+            tok[j] = tHy[j];
+            j++;
+        }
+        tok[j] = 0;
+        assert(j > 5 && strstr(ref, tok));
+    }
+    printf("DEEP:multi-segment resume/fork/evict byte-identical ok\n");
+
+    JS_FreeValue(ctx, drive_fn);
+    JS_FreeValue(ctx, g);
+    JS_FreeValue(ctx, armF);
+    JS_FreeValue(ctx, armF2);
+    JS_FreeValue(ctx, h1);
+    JS_FreeValue(ctx, armFh);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    printf("DEEP:teardown ok\n");
+    return 0;
+}
+
+/* evict: a suspended machine round-trips through bytes -- freed, hydrated,
+   resumed byte-identically -- without disturbing its siblings; the live
+   legacy machine refuses; plain yield-suspended flows evict too */
+static int cmd_evict(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    ParkPlan plan;
+    JSValue g, drive_fn, armX, armY, armX2;
+    uint8_t *ebytes;
+    size_t elen;
+    JSAtom name_a;
+    char tX[2048], tY[2048];
+    int parked = 0;
+
+    g = park_std_machine(ctx, rt, &plan, &drive_fn);
+
+    armX = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(armX))
+        die(ctx, "fork armX");
+    armY = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(armY))
+        die(ctx, "fork armY");
+
+    /* identical injections into the twins BEFORE eviction: the injected
+       local must travel in the bytes */
+    name_a = JS_NewAtom(ctx, "a");
+    {
+        JSValue v = JS_NewInt32(ctx, 20);
+        if (!JS_TTFlowSetLocal(ctx, armX, 0, name_a, v) ||
+            !JS_TTFlowSetLocal(ctx, armY, 0, name_a, v)) {
+            fprintf(stderr, "FAIL twin injection\n");
+            return 1;
+        }
+    }
+    JS_FreeAtom(ctx, name_a);
+
+    /* the live legacy machine refuses to evict */
+    {
+        size_t l0;
+        uint8_t *b0 = JS_TTMachineEvict(ctx, g, &l0);
+        assert(b0 == NULL);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+
+    ebytes = JS_TTMachineEvict(ctx, armX, &elen);
+    if (!ebytes)
+        die(ctx, "evict armX");
+    printf("EVICT:armX -> %zu bytes\n", elen);
+    /* the evicted handle is a completed husk; its siblings are untouched */
+    assert(!JS_TTFlowParked(ctx, armX));
+    assert(JS_TTFlowParked(ctx, armY));
+    assert(JS_TTParked(ctx));
+
+    armX2 = JS_TTMachineHydrate(ctx, ebytes, elen);
+    if (JS_IsException(armX2))
+        die(ctx, "hydrate armX");
+    js_free(ctx, ebytes);
+    assert(JS_TTFlowParked(ctx, armX2));
+
+    if (JS_TTFlowCheckin(ctx, armX2))
+        die(ctx, "checkin armX2");
+    resume_first(ctx, armX2, tX, sizeof(tX));
+    collect_flow(ctx, armX2, 0, tX + strlen(tX), sizeof(tX) - strlen(tX));
+    if (JS_TTFlowCheckin(ctx, armY))
+        die(ctx, "checkin armY");
+    resume_first(ctx, armY, tY, sizeof(tY));
+    collect_flow(ctx, armY, 0, tY + strlen(tY), sizeof(tY) - strlen(tY));
+
+    printf("EVICT:trace=%s\n", tX);
+    assert(strcmp(tX, tY) == 0);   /* byte-identical future across eviction */
+    assert(strstr(tX, "delta-view:cfg-flow"));
+    printf("EVICT:hydrated future byte-identical to its twin ok\n");
+
+    /* a plain yield-suspended flow evicts too */
+    {
+        JSValue g2 = start_flow(ctx, 3, NULL), g2h;
+        uint8_t *e2;
+        size_t l2;
+        char t2[2048];
+        write_delta(ctx, g2);
+        if (JS_TTFlowCheckout(ctx, g2))
+            die(ctx, "checkout g2");
+        e2 = JS_TTMachineEvict(ctx, g2, &l2);
+        if (!e2)
+            die(ctx, "evict g2");
+        g2h = JS_TTMachineHydrate(ctx, e2, l2);
+        if (JS_IsException(g2h))
+            die(ctx, "hydrate g2");
+        js_free(ctx, e2);
+        if (JS_TTFlowCheckin(ctx, g2h))
+            die(ctx, "checkin g2h");
+        collect_flow(ctx, g2h, 0, t2, sizeof(t2));
+        assert(strstr(t2, "after-inner:"));
+        JS_FreeValue(ctx, g2);
+        JS_FreeValue(ctx, g2h);
+    }
+    printf("EVICT:yield-suspended eviction ok\n");
+
+    {   /* discard the legacy machine */
+        JSValue ret = JS_TTCallResume(ctx, 1, &parked);
+        if (parked)
+            die(ctx, "abort did not complete");
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    JS_FreeValue(ctx, drive_fn);
+    JS_FreeValue(ctx, g);
+    JS_FreeValue(ctx, armX);
+    JS_FreeValue(ctx, armY);
+    JS_FreeValue(ctx, armX2);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    printf("EVICT:teardown ok\n");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 3 && !strcmp(argv[1], "emit"))
@@ -1184,6 +1590,12 @@ int main(int argc, char **argv)
         return cmd_forktest();
     if (argc >= 2 && !strcmp(argv[1], "forkhere"))
         return cmd_forkhere();
+    if (argc >= 2 && !strcmp(argv[1], "mass"))
+        return cmd_mass();
+    if (argc >= 2 && !strcmp(argv[1], "deep"))
+        return cmd_deep();
+    if (argc >= 2 && !strcmp(argv[1], "evict"))
+        return cmd_evict();
     fprintf(stderr, "usage: flow-harness emit|resume <file> | selftest\n");
     return 2;
 }

@@ -391,9 +391,19 @@ struct JSRuntime {
        in this arena (linear memory), so when no native C frame is below the
        dispatch loop, suspending is just returning to the host and resuming
        is a fresh call — no stack switching machinery at all. */
-    uint8_t *tt_arena_base;
-    uint8_t *tt_arena_top;
-    uint8_t *tt_arena_limit;
+    uint8_t *tt_arena_base;   /* CURRENT segment's storage range: frames of */
+    uint8_t *tt_arena_top;    /* the active machine bump-allocate here and */
+    uint8_t *tt_arena_limit;  /* release LIFO (tt_arena_pop_to)            */
+    struct TTArenaSeg *tt_arena_seg; /* segment holding tt_arena_top */
+    BOOL tt_arena_grow;       /* exhaustion appends a demand-sized segment
+                                 (per-machine arenas) instead of failing
+                                 (the fixed execution arena) */
+    size_t tt_arena_total;    /* Σ segment storage bytes (the growth cap) */
+    struct TTArenaSeg *tt_arena_graveyard; /* segments of machines freed
+                                 DURING cycle removal: late free_var_ref
+                                 unlinks still write into their frames, so
+                                 the memory stays mapped until the pass
+                                 ends */
     int tt_loop_depth;        /* dispatch-loop entries currently on the C stack */
     BOOL tt_park_ok;          /* the host entry point supports park-by-return */
     BOOL tt_park_abort;       /* deliver an abort on the next parked resume */
@@ -1511,6 +1521,9 @@ static void tt_machine_free(JSRuntime *rt, struct TTMachine *m,
 static void tt_machine_mark(JSRuntime *rt, struct TTMachine *m,
                             struct JSStackFrame *base_frame,
                             JS_MarkFunc *mark_func);
+struct TTArenaSeg;
+static void tt_arena_segs_free(JSRuntime *rt, struct TTArenaSeg *seg);
+static void tt_arena_flush_graveyard(JSRuntime *rt);
 static void tt_flow_delta_mark(JSRuntime *rt, struct TTFlowDelta *d,
                                JS_MarkFunc *mark_func);
 static JSValue js_new_promise_capability(JSContext *ctx,
@@ -2600,9 +2613,10 @@ void JS_FreeRuntime(JSRuntime *rt)
 
     JS_FreeValueRT(rt, rt->current_exception);
     JS_TTBaselineFree(rt);
-    if (rt->tt_arena_base) {
-        js_free_rt(rt, rt->tt_arena_base);
-        rt->tt_arena_base = NULL;
+    if (rt->tt_arena_seg) {
+        tt_arena_segs_free(rt, rt->tt_arena_seg);
+        rt->tt_arena_seg = NULL;
+        rt->tt_arena_base = rt->tt_arena_top = rt->tt_arena_limit = NULL;
     }
 
     list_for_each_safe(el, el1, &rt->job_list) {
@@ -7037,6 +7051,10 @@ static void JS_RunGCInternal(JSRuntime *rt, BOOL remove_weak_objects)
 
     /* free the GC objects in a cycle */
     gc_free_cycles(rt);
+
+    /* TimeTravelJS: machine arenas parked during the pass (their frames
+       stayed writable for late cell unlinks) can be released now */
+    tt_arena_flush_graveyard(rt);
 }
 
 void JS_RunGC(JSRuntime *rt)
@@ -18156,11 +18174,166 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
 #define JS_CALL_FLAG_TT_RESUME   (1 << 3)
 
 /* TimeTravelJS stackless interpreter: every frame (and its argument copy,
-   variables, operand stack and var-ref slots) is bump-allocated from a
-   fixed arena in linear memory instead of alloca. JS recursion depth
-   becomes an exact, snapshot-stable limit, and a suspended machine is
-   nothing but bytes. */
+   variables, operand stack and var-ref slots) is bump-allocated from an
+   arena in linear memory instead of alloca. JS recursion depth becomes an
+   exact, snapshot-stable limit, and a suspended machine is nothing but
+   bytes.
+
+   The arena is SEGMENTED: a linked chain of malloc'd segments, grown on
+   demand and never moved (live frames carry parent-relative aliases and
+   open-cell storage pointers, so a block's address is forever). A block
+   never straddles segments -- when the current segment cannot hold a
+   request, allocation continues in a fresh (or kept-for-reuse) successor
+   segment. The runtime's own execution arena is one fixed 2 MB segment
+   (exhaustion IS the engine's recursion limit); per-machine arenas start
+   at a demand-sized sliver and double up to TT_ARENA_SEG_MAX, capped at
+   the same 2 MB total, so N suspended machines cost the sum of their
+   actual chain depths, not N slabs. */
 #define TT_FRAME_ARENA_SIZE (2 * 1024 * 1024)
+#define TT_ARENA_SEG_MIN    1024
+#define TT_ARENA_SEG_MAX    (64 * 1024)
+
+typedef struct TTArenaSeg {
+    struct TTArenaSeg *prev;  /* toward older blocks */
+    struct TTArenaSeg *next;  /* kept when vacated, for push/pop reuse */
+    uint8_t *base, *limit;    /* the 16-aligned storage range */
+    size_t size;              /* limit - base */
+} TTArenaSeg;
+
+/* free the empty successors of 'seg' (kept earlier for reuse) */
+static void tt_arena_seg_free_tail(JSRuntime *rt, TTArenaSeg *seg,
+                                   size_t *ptotal)
+{
+    TTArenaSeg *t = seg->next, *n;
+    seg->next = NULL;
+    while (t) {
+        n = t->next;
+        if (ptotal)
+            *ptotal -= t->size;
+        js_free_rt(rt, t);
+        t = n;
+    }
+}
+
+/* free a whole segment chain, given any member */
+static void tt_arena_segs_free(JSRuntime *rt, struct TTArenaSeg *seg)
+{
+    TTArenaSeg *n;
+    if (!seg)
+        return;
+    while (seg->prev)
+        seg = seg->prev;
+    while (seg) {
+        n = seg->next;
+        js_free_rt(rt, seg);
+        seg = n;
+    }
+}
+
+/* a machine dismantled DURING cycle removal cannot free its segments yet:
+   cells dying later in the same pass still unlink through the frames'
+   var_refs slots. Park the chain on the graveyard; the pass's end frees
+   it. */
+static void tt_arena_segs_to_graveyard(JSRuntime *rt, TTArenaSeg *seg)
+{
+    TTArenaSeg *first, *last;
+    if (!seg)
+        return;
+    first = seg;
+    while (first->prev)
+        first = first->prev;
+    last = seg;
+    while (last->next)
+        last = last->next;
+    last->next = rt->tt_arena_graveyard;
+    rt->tt_arena_graveyard = first;
+}
+
+static void tt_arena_flush_graveyard(JSRuntime *rt)
+{
+    TTArenaSeg *seg = rt->tt_arena_graveyard, *n;
+    rt->tt_arena_graveyard = NULL;
+    while (seg) {
+        n = seg->next;
+        js_free_rt(rt, seg);
+        seg = n;
+    }
+}
+
+/* enter the segment after 'cur' that can hold an aligned block of 'need'
+   bytes: reuse a kept successor when it fits, else append a fresh
+   demand-sized one (dropping a too-small stale tail). Returns NULL at the
+   total growth cap or OOM. */
+static TTArenaSeg *tt_arena_seg_append(JSRuntime *rt, TTArenaSeg *cur,
+                                       size_t need, size_t *ptotal)
+{
+    TTArenaSeg *seg;
+    size_t want, cap_left;
+    uint8_t *storage;
+
+    if (cur && cur->next) {
+        if (cur->next->size >= need)
+            return cur->next;
+        tt_arena_seg_free_tail(rt, cur, ptotal);
+    }
+    if (*ptotal >= TT_FRAME_ARENA_SIZE)
+        return NULL;
+    cap_left = TT_FRAME_ARENA_SIZE - *ptotal;
+    want = cur ? cur->size * 2 : TT_ARENA_SEG_MIN;
+    if (want > TT_ARENA_SEG_MAX)
+        want = TT_ARENA_SEG_MAX;
+    if (want < need)
+        want = need;
+    if (want > cap_left)
+        want = cap_left;
+    if (want < need)
+        return NULL;
+    seg = js_malloc_rt(rt, sizeof(*seg) + want + 16);
+    if (!seg)
+        return NULL;
+    storage = (uint8_t *)(((uintptr_t)(seg + 1) + 15) & ~(uintptr_t)15);
+    seg->prev = cur;
+    seg->next = NULL;
+    seg->base = storage;
+    seg->limit = storage + want;
+    seg->size = want;
+    if (cur)
+        cur->next = seg;
+    *ptotal += want;
+    return seg;
+}
+
+/* the allocators' slow path: make the runtime's current-segment registers
+   able to hold 'size' more bytes. The fixed execution arena allocates its
+   single 2 MB segment lazily and then refuses (stack overflow); growable
+   (machine) arenas append segments up to the same total cap. */
+static no_inline BOOL tt_arena_extend(JSRuntime *rt, size_t size)
+{
+    TTArenaSeg *seg = rt->tt_arena_seg;
+
+    if (!rt->tt_arena_grow) {
+        if (seg || size > TT_FRAME_ARENA_SIZE)
+            return FALSE;
+        seg = js_malloc_rt(rt, sizeof(*seg) + TT_FRAME_ARENA_SIZE + 16);
+        if (!seg)
+            return FALSE;
+        seg->prev = seg->next = NULL;
+        seg->base = (uint8_t *)(((uintptr_t)(seg + 1) + 15) &
+                                ~(uintptr_t)15);
+        seg->limit = seg->base + TT_FRAME_ARENA_SIZE;
+        seg->size = TT_FRAME_ARENA_SIZE;
+        rt->tt_arena_total = seg->size;
+    } else {
+        seg = tt_arena_seg_append(rt, seg, size, &rt->tt_arena_total);
+        if (!seg)
+            return FALSE;
+    }
+    rt->tt_arena_seg = seg;
+    rt->tt_arena_base = seg->base;
+    rt->tt_arena_limit = seg->limit;
+    rt->tt_arena_top = seg->base;
+    return TRUE;
+}
 
 static JSStackFrame *tt_arena_push(JSRuntime *rt, size_t val_count,
                                    size_t ref_count, JSValue **pvals)
@@ -18169,28 +18342,50 @@ static JSStackFrame *tt_arena_push(JSRuntime *rt, size_t val_count,
     uint8_t *base;
     JSStackFrame *sf;
 
-    if (unlikely(!rt->tt_arena_base)) {
-        rt->tt_arena_base = js_malloc_rt(rt, TT_FRAME_ARENA_SIZE);
-        if (!rt->tt_arena_base)
-            return NULL;
-        rt->tt_arena_top = rt->tt_arena_base;
-        rt->tt_arena_limit = rt->tt_arena_base + TT_FRAME_ARENA_SIZE;
-    }
     size = sizeof(JSStackFrame) + sizeof(JSValue) * val_count +
         sizeof(JSVarRef *) * ref_count;
     size = (size + 15) & ~(size_t)15;
     base = rt->tt_arena_top;
-    if (unlikely(size > (size_t)(rt->tt_arena_limit - base)))
-        return NULL;
+    if (unlikely(!rt->tt_arena_seg ||
+                 size > (size_t)(rt->tt_arena_limit - base))) {
+        if (!tt_arena_extend(rt, size))
+            return NULL;
+        base = rt->tt_arena_top;
+    }
     rt->tt_arena_top = base + size;
     sf = (JSStackFrame *)base;
     *pvals = (JSValue *)(sf + 1);
     return sf;
 }
 
+/* LIFO release back to 'mark' (the start of a block pushed earlier). The
+   mark may live in an earlier segment: cross back by range membership --
+   inter-segment address ORDER means nothing -- keeping the vacated
+   segments linked for push/pop reuse. */
+static no_inline void tt_arena_pop_cross(JSRuntime *rt, uint8_t *mark)
+{
+    TTArenaSeg *seg = rt->tt_arena_seg;
+    do {
+        seg = seg->prev;
+    } while (!(mark >= seg->base && mark < seg->limit));
+    rt->tt_arena_seg = seg;
+    rt->tt_arena_base = seg->base;
+    rt->tt_arena_limit = seg->limit;
+    rt->tt_arena_top = mark;
+}
+
+static force_inline void tt_arena_pop_to(JSRuntime *rt, void *mark)
+{
+    uint8_t *m = (uint8_t *)mark;
+    if (likely(m >= rt->tt_arena_base && m < rt->tt_arena_limit))
+        rt->tt_arena_top = m;
+    else
+        tt_arena_pop_cross(rt, m);
+}
+
 static force_inline void tt_arena_pop(JSRuntime *rt, JSStackFrame *sf)
 {
-    rt->tt_arena_top = (uint8_t *)sf;
+    tt_arena_pop_to(rt, sf);
 }
 
 /* raw value block from the arena (for synthesized argument vectors); freed
@@ -18200,17 +18395,14 @@ static JSValue *tt_arena_alloc_vals(JSRuntime *rt, size_t n)
     size_t size;
     uint8_t *base;
 
-    if (unlikely(!rt->tt_arena_base)) {
-        rt->tt_arena_base = js_malloc_rt(rt, TT_FRAME_ARENA_SIZE);
-        if (!rt->tt_arena_base)
-            return NULL;
-        rt->tt_arena_top = rt->tt_arena_base;
-        rt->tt_arena_limit = rt->tt_arena_base + TT_FRAME_ARENA_SIZE;
-    }
     size = (sizeof(JSValue) * n + 15) & ~(size_t)15;
     base = rt->tt_arena_top;
-    if (unlikely(size > (size_t)(rt->tt_arena_limit - base)))
-        return NULL;
+    if (unlikely(!rt->tt_arena_seg ||
+                 size > (size_t)(rt->tt_arena_limit - base))) {
+        if (!tt_arena_extend(rt, size))
+            return NULL;
+        base = rt->tt_arena_top;
+    }
     rt->tt_arena_top = base + size;
     return (JSValue *)base;
 }
@@ -18690,13 +18882,13 @@ static int tt_append_step(JSContext *ctx, JSValue *sp, JSValue *blk,
  finished:
     JS_FreeValue(ctx, blk[0]);
     JS_FreeValue(ctx, blk[1]);
-    rt->tt_arena_top = (uint8_t *)blk;
+    tt_arena_pop_to(rt, blk);
     return 1;
  fail:
     JS_IteratorClose(ctx, blk[0], TRUE);
     JS_FreeValue(ctx, blk[0]);
     JS_FreeValue(ctx, blk[1]);
-    rt->tt_arena_top = (uint8_t *)blk;
+    tt_arena_pop_to(rt, blk);
     return -1;
 }
 
@@ -19085,13 +19277,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         pu->nargs = 0;                                                      \
         pact = tt_pump_step(ctx, pu, JS_UNDEFINED, TRUE, &pfn, &pth, &pres);\
         if (pact < 0) {                                                     \
-            rt->tt_arena_top = (uint8_t *)pu;                               \
+            tt_arena_pop_to(rt, pu);                               \
             goto exception;                                                 \
         }                                                                   \
         if (pact == 0) {                                                    \
             if (unlikely(js_poll_interrupts(ctx))) {                        \
                 tt_pump_abort(ctx, pu);                                     \
-                rt->tt_arena_top = (uint8_t *)pu;                           \
+                tt_arena_pop_to(rt, pu);                           \
                 goto exception;                                             \
             }                                                               \
             sf->cur_sp = sp;                                                \
@@ -19108,7 +19300,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             pf_cargc = pu->cargc;                                           \
             goto push_frame;                                                \
         }                                                                   \
-        rt->tt_arena_top = (uint8_t *)pu;                                   \
+        tt_arena_pop_to(rt, pu);                                   \
         ret_val = pres;                                                     \
     }
 
@@ -23477,7 +23669,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_IteratorClose(ctx, gablk[0], TRUE);
                     JS_FreeValue(ctx, gablk[0]);
                     JS_FreeValue(ctx, gablk[1]);
-                    rt->tt_arena_top = (uint8_t *)gablk;
+                    tt_arena_pop_to(rt, gablk);
                     goto exception;
                 }
                 ap_r = tt_append_step(ctx, sp, gablk, ret_val,
@@ -23543,12 +23735,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         tt_arena_pop(rt, sf);
         if (kind == TT_FRAME_BOUND_CALL || kind == TT_FRAME_BOUND_METHOD) {
             /* release the synthesized (borrowed) argument block */
-            rt->tt_arena_top = (uint8_t *)kaux_p;
+            tt_arena_pop_to(rt, kaux_p);
         }
         if (kind == TT_FRAME_TOPRIM && kaux_p) {
             /* exotic @@toPrimitive: hint-string argument block */
             JS_FreeValue(ctx, ((JSValue *)kaux_p)[0]);
-            rt->tt_arena_top = (uint8_t *)kaux_p;
+            tt_arena_pop_to(rt, kaux_p);
         }
         if (kind == TT_FRAME_ENTRY) {
             rt->tt_loop_depth--;
@@ -23572,14 +23764,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, pg_blk[1]);
                 JS_FreeValue(ctx, pg_blk[2]);
                 JS_FreeValue(ctx, pg_blk[3]);
-                rt->tt_arena_top = (uint8_t *)pg_blk;
+                tt_arena_pop_to(rt, pg_blk);
             }
             if (kind == TT_FRAME_APPEND_NEXT) {
                 JSValue *ap_eb = (JSValue *)kaux_p;
                 JS_IteratorClose(ctx, ap_eb[0], TRUE);
                 JS_FreeValue(ctx, ap_eb[0]);
                 JS_FreeValue(ctx, ap_eb[1]);
-                rt->tt_arena_top = (uint8_t *)ap_eb;
+                tt_arena_pop_to(rt, ap_eb);
             }
             if (kind == TT_FRAME_PROXY_SET || kind == TT_FRAME_PROXY_DEFINE) {
                 JSValue *pt_eb = (JSValue *)kaux_p;
@@ -23587,18 +23779,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, ctor_this);
                 for (pt_i = 0; pt_i < 5; pt_i++)
                     JS_FreeValue(ctx, pt_eb[pt_i]);
-                rt->tt_arena_top = (uint8_t *)pt_eb;
+                tt_arena_pop_to(rt, pt_eb);
             }
             if (kind == TT_FRAME_INIT_CTOR) {
                 JSValue *ic_eb = (JSValue *)kaux_p;
                 JS_FreeValue(ctx, ctor_this);
                 JS_FreeValue(ctx, ic_eb[0]); /* super */
-                rt->tt_arena_top = (uint8_t *)ic_eb;
+                tt_arena_pop_to(rt, ic_eb);
             }
             if (kind == TT_FRAME_PUMP) {
                 TTPump *pu = (TTPump *)kaux_p;
                 tt_pump_abort(ctx, pu);
-                rt->tt_arena_top = (uint8_t *)pu;
+                tt_arena_pop_to(rt, pu);
             }
             if (kind == TT_FRAME_APPLY)
                 free_arg_list(ctx, kaux_p, (uint32_t)kaux);
@@ -23769,7 +23961,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, ps_blk[2]);
             JS_FreeValue(ctx, ps_blk[3]);
             JS_FreeValue(ctx, ps_blk[4]);
-            rt->tt_arena_top = (uint8_t *)ps_blk;
+            tt_arena_pop_to(rt, ps_blk);
             if (kaux == 0) { /* put_field / with_put_var: [.. x value-ish obj-ish] */
                 JS_FreeValue(ctx, sp[-1]);
                 JS_FreeValue(ctx, sp[-2]);
@@ -23786,7 +23978,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, ps_blk[2]);
             JS_FreeValue(ctx, ps_blk[3]);
             JS_FreeValue(ctx, ps_blk[4]);
-            rt->tt_arena_top = (uint8_t *)ps_blk;
+            tt_arena_pop_to(rt, ps_blk);
             goto exception;
         }
         if (kind == TT_FRAME_PROXY_DEFINE) {
@@ -23848,7 +24040,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, pd_blk[2]);
             JS_FreeValue(ctx, pd_blk[3]);
             JS_FreeValue(ctx, pd_blk[4]);
-            rt->tt_arena_top = (uint8_t *)pd_blk;
+            tt_arena_pop_to(rt, pd_blk);
             JS_FreeValue(ctx, sp[-1]); /* the dead value slot */
             sp--;
             goto restart;
@@ -23858,7 +24050,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, pd_blk[2]);
             JS_FreeValue(ctx, pd_blk[3]);
             JS_FreeValue(ctx, pd_blk[4]);
-            rt->tt_arena_top = (uint8_t *)pd_blk;
+            tt_arena_pop_to(rt, pd_blk);
             goto exception;
         }
         if (kind == TT_FRAME_APPEND_NEXT) {
@@ -23912,7 +24104,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, pg_blk[1]);
             JS_FreeValue(ctx, pg_blk[2]);
             JS_FreeValue(ctx, pg_blk[3]);
-            rt->tt_arena_top = (uint8_t *)pg_blk;
+            tt_arena_pop_to(rt, pg_blk);
             switch (kaux) {
             case 0: /* get_field / with_get_var */
                 JS_FreeValue(ctx, sp[-1]);
@@ -23940,7 +24132,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, pg_blk[1]);
             JS_FreeValue(ctx, pg_blk[2]);
             JS_FreeValue(ctx, pg_blk[3]);
-            rt->tt_arena_top = (uint8_t *)pg_blk;
+            tt_arena_pop_to(rt, pg_blk);
             goto exception;
         }
         if (kind == TT_FRAME_TOPRIM) {
@@ -24049,7 +24241,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                the object-result-wins-else-`this` rule. */
             JSValue *ic_blk = (JSValue *)kaux_p;
             JS_FreeValue(ctx, ic_blk[0]); /* super */
-            rt->tt_arena_top = (uint8_t *)ic_blk;
+            tt_arena_pop_to(rt, ic_blk);
             if (JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) {
                 JS_FreeValue(ctx, ctor_this);
             } else {
@@ -24064,13 +24256,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JSValue pfn, pth, pres;
             int pact = tt_pump_step(ctx, pu, ret_val, FALSE, &pfn, &pth, &pres);
             if (pact < 0) {
-                rt->tt_arena_top = (uint8_t *)pu;
+                tt_arena_pop_to(rt, pu);
                 goto exception;
             }
             if (pact == 0) {
                 if (unlikely(js_poll_interrupts(ctx))) {
                     tt_pump_abort(ctx, pu);
-                    rt->tt_arena_top = (uint8_t *)pu;
+                    tt_arena_pop_to(rt, pu);
                     goto exception;
                 }
                 sf->cur_sp = sp;
@@ -24090,7 +24282,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 int p_cargc = pu->cargc, p_base = pu->base, p_tail = pu->tail;
                 JSValue *cav;
-                rt->tt_arena_top = (uint8_t *)pu;
+                tt_arena_pop_to(rt, pu);
                 cav = sp - p_cargc;
                 for (i = p_base; i < p_cargc; i++)
                     JS_FreeValue(ctx, cav[i]);
@@ -24280,7 +24472,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         JS_IteratorClose(ctx, ap_blk[0], TRUE);
         JS_FreeValue(ctx, ap_blk[0]);
         JS_FreeValue(ctx, ap_blk[1]);
-        rt->tt_arena_top = (uint8_t *)ap_blk;
+        tt_arena_pop_to(rt, ap_blk);
         goto exception;
     }
 
@@ -42370,83 +42562,107 @@ int JS_TTFlowDeltaCount(JSContext *ctx, JSValueConst flow)
 /* -- per-flow suspended machines ------------------------------------------ */
 
 /* A suspended machine as a first-class value: one flow's parked TrampFrame
-   chain with its OWN frame arena, so any number of machines can be
-   suspended in a runtime at once and resumed in any order (a shared bump
-   arena would be clobbered by out-of-LIFO resumes). The runtime's
-   arena/park fields act as the ACTIVE machine's registers -- installed
-   around a resume, captured back at a park. The legacy host-entered
-   machine (JS_TTCallStart/Args/Resume) keeps using the runtime fields
-   directly, unchanged. */
+   chain with its OWN segmented frame arena, so any number of machines can
+   be suspended in a runtime at once and resumed in any order (a shared
+   bump arena would be clobbered by out-of-LIFO resumes). The arena starts
+   empty and grows by demand-sized segments -- a suspended machine costs
+   what its chain actually occupies. The runtime's arena/park fields act
+   as the ACTIVE machine's registers -- installed around a resume, captured
+   back at a park. The legacy host-entered machine (JS_TTCallStart/Args/
+   Resume) keeps using the runtime fields directly, unchanged. */
 typedef struct TTMachine {
     JSStackFrame *parked_frame;    /* innermost parked frame */
     JSStackFrame *base_frame;      /* the flow base's frame (outermost) */
-    uint8_t *arena_base, *arena_top, *arena_limit;
+    TTArenaSeg *arena_seg;         /* segment holding arena_top (NULL for
+                                      an all-heap chain: no arena frames) */
+    uint8_t *arena_top;
+    size_t arena_total;            /* Σ segment storage bytes */
 } TTMachine;
 
 typedef struct TTMachineSaved {
+    TTArenaSeg *arena_seg;
     uint8_t *arena_base, *arena_top, *arena_limit;
+    BOOL arena_grow;
+    size_t arena_total;
     JSStackFrame *parked_frame, *stack_frame;
 } TTMachineSaved;
 
 static TTMachine *tt_machine_new(JSContext *ctx)
 {
-    TTMachine *m = js_mallocz(ctx, sizeof(*m));
-    if (!m)
-        return NULL;
-    m->arena_base = js_malloc(ctx, TT_FRAME_ARENA_SIZE);
-    if (!m->arena_base) {
-        js_free(ctx, m);
-        return NULL;
-    }
-    m->arena_top = m->arena_base;
-    m->arena_limit = m->arena_base + TT_FRAME_ARENA_SIZE;
-    return m;
+    /* segments arrive on first demand, sized to it */
+    return js_mallocz(ctx, sizeof(TTMachine));
 }
 
 /* make the machine's arena and chain the runtime's active ones */
 static void tt_machine_install(JSRuntime *rt, TTMachine *m, TTMachineSaved *sv)
 {
+    sv->arena_seg = rt->tt_arena_seg;
     sv->arena_base = rt->tt_arena_base;
     sv->arena_top = rt->tt_arena_top;
     sv->arena_limit = rt->tt_arena_limit;
+    sv->arena_grow = rt->tt_arena_grow;
+    sv->arena_total = rt->tt_arena_total;
     sv->parked_frame = rt->tt_parked_frame;
     sv->stack_frame = rt->current_stack_frame;
-    rt->tt_arena_base = m->arena_base;
-    rt->tt_arena_top = m->arena_top;
-    rt->tt_arena_limit = m->arena_limit;
+    rt->tt_arena_seg = m->arena_seg;
+    if (m->arena_seg) {
+        rt->tt_arena_base = m->arena_seg->base;
+        rt->tt_arena_top = m->arena_top;
+        rt->tt_arena_limit = m->arena_seg->limit;
+    } else {
+        rt->tt_arena_base = rt->tt_arena_top = rt->tt_arena_limit = NULL;
+    }
+    rt->tt_arena_grow = TRUE;
+    rt->tt_arena_total = m->arena_total;
     rt->tt_parked_frame = m->parked_frame;
     rt->current_stack_frame = m->parked_frame;
 }
 
 /* capture the (possibly re-parked) machine back out of the runtime and
-   restore what the host had */
+   restore what the host had. Empty reuse segments beyond the captured top
+   are dropped: a suspended machine's footprint is its actual chain. */
 static void tt_machine_capture(JSRuntime *rt, TTMachine *m, TTMachineSaved *sv)
 {
-    m->arena_base = rt->tt_arena_base;
+    m->arena_seg = rt->tt_arena_seg;
     m->arena_top = rt->tt_arena_top;
-    m->arena_limit = rt->tt_arena_limit;
+    m->arena_total = rt->tt_arena_total;
     m->parked_frame = rt->tt_parked_frame;
+    if (m->arena_seg && m->arena_seg->next)
+        tt_arena_seg_free_tail(rt, m->arena_seg, &m->arena_total);
+    rt->tt_arena_seg = sv->arena_seg;
     rt->tt_arena_base = sv->arena_base;
     rt->tt_arena_top = sv->arena_top;
     rt->tt_arena_limit = sv->arena_limit;
+    rt->tt_arena_grow = sv->arena_grow;
+    rt->tt_arena_total = sv->arena_total;
     rt->tt_parked_frame = sv->parked_frame;
     rt->current_stack_frame = sv->stack_frame;
 }
 
-/* bump-allocate one frame in the machine's own arena (tt_arena_push's twin) */
+/* bump-allocate one frame in the machine's own segmented arena
+   (tt_arena_push's twin for chains built OUTSIDE a run: the deserializer
+   and the fork). Segments append on demand, sized to it. */
 static JSStackFrame *tt_machine_arena_push(JSContext *ctx, TTMachine *m,
                                            size_t val_count, size_t ref_count,
                                            JSValue **pvals)
 {
     size_t size = sizeof(JSStackFrame) + sizeof(JSValue) * val_count +
         sizeof(JSVarRef *) * ref_count;
-    uint8_t *base = m->arena_top;
+    uint8_t *base;
     JSStackFrame *sf;
     size = (size + 15) & ~(size_t)15;
-    if (size > (size_t)(m->arena_limit - base)) {
-        JS_ThrowStackOverflow(ctx);
-        return NULL;
+    if (!m->arena_seg ||
+        size > (size_t)(m->arena_seg->limit - m->arena_top)) {
+        TTArenaSeg *seg = tt_arena_seg_append(ctx->rt, m->arena_seg, size,
+                                              &m->arena_total);
+        if (!seg) {
+            JS_ThrowStackOverflow(ctx);
+            return NULL;
+        }
+        m->arena_seg = seg;
+        m->arena_top = seg->base;
     }
+    base = m->arena_top;
     m->arena_top = base + size;
     sf = (JSStackFrame *)base;
     *pvals = (JSValue *)(sf + 1);
@@ -42456,11 +42672,21 @@ static JSStackFrame *tt_machine_arena_push(JSContext *ctx, TTMachine *m,
 /* dismantle an un-resumed parked chain: mirror the engine's pop for each
    arena frame, innermost first -- close its cells (close_var_ref dups, so
    the range free below stays balanced), free its owned values -- then
-   release the arena. Heap frames belong to their states and free through
-   the normal state teardown. */
+   release the arena segments. Heap frames belong to their states and free
+   through the normal state teardown.
+
+   During REMOVE_CYCLES the rules change, exactly as __async_func_free's
+   own: closing cells would dup values -- mutating the dying graph -- so a
+   still-attached cell has its value MOVED out instead (refcount-neutral),
+   keeping any cell that outlives this machine valid. A zombie cur_func
+   (the closure died earlier in the same pass; its bytecode pointer is
+   cleared) means the frame's cells are dying in this very pass too: leave
+   them to unlink themselves. Either way the segments go to the graveyard,
+   not free(): those unlinks still write into the frames. */
 static void tt_machine_free(JSRuntime *rt, TTMachine *m,
                             JSStackFrame *base_frame)
 {
+    BOOL in_gc = (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES);
     JSStackFrame *sf = m->parked_frame;
     while (sf && sf != base_frame) {
         JSStackFrame *prev = sf->prev_frame;
@@ -42468,15 +42694,47 @@ static void tt_machine_free(JSRuntime *rt, TTMachine *m,
             JSObject *fo = JS_VALUE_GET_OBJ(sf->cur_func);
             JSFunctionBytecode *b = fo->u.func.function_bytecode;
             JSValue *pval;
-            if (b->var_ref_count)
-                close_var_refs(rt, b, sf);
+            if (b && b->var_ref_count) {
+                if (!in_gc) {
+                    close_var_refs(rt, b, sf);
+                } else {
+                    int i;
+                    for (i = 0; i < b->var_ref_count; i++) {
+                        JSVarRef *vr = sf->var_refs[i];
+                        if (!vr)
+                            continue;
+                        vr->value = *vr->pvalue;
+                        *vr->pvalue = JS_UNDEFINED;
+                        vr->pvalue = &vr->value;
+                        vr->is_detached = TRUE;
+                        sf->var_refs[i] = NULL;
+                    }
+                }
+            }
             for (pval = sf->tt_frame_base; pval < sf->cur_sp; pval++)
                 JS_FreeValueRT(rt, *pval);
         }
         sf = prev;
     }
-    js_free_rt(rt, m->arena_base);
+    if (in_gc)
+        tt_arena_segs_to_graveyard(rt, m->arena_seg);
+    else
+        tt_arena_segs_free(rt, m->arena_seg);
     js_free_rt(rt, m);
+}
+
+/* the aligned arena block size of a parked chain frame -- the exact bytes
+   its push took (geometry re-derives from the bytecode, as everywhere) */
+static size_t tt_chain_frame_size(JSStackFrame *f)
+{
+    JSObject *fo = JS_VALUE_GET_OBJ(f->cur_func);
+    JSFunctionBytecode *fb = fo->u.func.function_bytecode;
+    size_t val_count =
+        (f->arg_buf == f->tt_frame_base ? (size_t)fb->arg_count : 0) +
+        fb->var_count + fb->stack_size;
+    size_t size = sizeof(JSStackFrame) + sizeof(JSValue) * val_count +
+        sizeof(JSVarRef *) * fb->var_ref_count;
+    return (size + 15) & ~(size_t)15;
 }
 
 /* GC edge enumeration for a suspended machine: every owned slot of its
@@ -42531,6 +42789,7 @@ typedef struct TTFlowWr {
        walks from the live innermost frame instead of a parked handle */
     JSStackFrame *chain_innermost;
     uint8_t *chain_arena_top;
+    TTArenaSeg *chain_seg;
     JSAtom *atoms;            /* private atom table (borrowed from heap) */
     uint32_t atom_count, atom_size;
     TTPtrMap atom_map;        /* JSAtomStruct* -> atom-table idx + 1 */
@@ -42697,6 +42956,7 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
     int n = 0, i;
     JSStackFrame *sf;
     uint8_t *chain_top;
+    TTArenaSeg *chain_seg;
 
     /* where this flow's chain lives: an explicit override (forking the
        RUNNING machine from the step hook), the flow's own machine handle,
@@ -42704,12 +42964,15 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
     if (w->chain_innermost) {
         sf = w->chain_innermost;
         chain_top = w->chain_arena_top;
+        chain_seg = w->chain_seg;
     } else if (base->tt_machine) {
         sf = base->tt_machine->parked_frame;
         chain_top = base->tt_machine->arena_top;
+        chain_seg = base->tt_machine->arena_seg;
     } else {
         sf = rt->tt_parked_frame;
         chain_top = rt->tt_arena_top;
+        chain_seg = rt->tt_arena_seg;
     }
 
     while (sf && sf != &base->frame) {
@@ -42795,33 +43058,45 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
         }
     }
     /* contiguity: the arena extent must hold exactly the chain's arena
-       frames -- each next frame starts where the previous allocation ends,
-       and the innermost one ends at the arena top */
+       frames, in allocation order across the segment chain -- each next
+       frame starts where the previous allocation ends, or at the base of
+       the NEXT segment when (and only when) it could not have fit in the
+       remaining tail; the innermost one ends at the arena top. Foreign
+       blocks (pump descriptors, iterator blocks, ...) refuse loudly. */
     {
+        TTArenaSeg *first = chain_seg;
+        TTArenaSeg *cs = NULL;
         uint8_t *expect = NULL;
+        while (first && first->prev)
+            first = first->prev;
         for (i = 0; i < n; i++) {
             JSStackFrame *f = chain[n - 1 - i]; /* base first */
-            JSObject *fo;
-            JSFunctionBytecode *fb;
-            size_t val_count, size;
+            size_t size;
+            TTArenaSeg *seg;
             if (f->js_mode & JS_MODE_ASYNC)
                 continue;
-            if (expect && (uint8_t *)f != expect) {
+            size = tt_chain_frame_size(f);
+            for (seg = first; seg; seg = seg->next) {
+                if ((uint8_t *)f >= seg->base && (uint8_t *)f < seg->limit)
+                    break;
+            }
+            if (!seg) {
+                JS_ThrowTypeError(w->ctx, "flow serialization: chain frame "
+                                  "outside the machine's arena");
+                return -1;
+            }
+            if (expect &&
+                !((seg == cs && (uint8_t *)f == expect) ||
+                  (seg == cs->next && (uint8_t *)f == seg->base &&
+                   size > (size_t)(cs->limit - expect)))) {
                 JS_ThrowTypeError(w->ctx, "flow serialization: foreign arena "
                                   "blocks inside the parked chain");
                 return -1;
             }
-            fo = JS_VALUE_GET_OBJ(f->cur_func);
-            fb = fo->u.func.function_bytecode;
-            val_count = (f->arg_buf == f->tt_frame_base ? (size_t)fb->arg_count
-                                                        : 0) +
-                        fb->var_count + fb->stack_size;
-            size = sizeof(JSStackFrame) + sizeof(JSValue) * val_count +
-                   sizeof(JSVarRef *) * fb->var_ref_count;
-            size = (size + 15) & ~(size_t)15;
+            cs = seg;
             expect = (uint8_t *)f + size;
         }
-        if (expect && expect != chain_top) {
+        if (expect && (expect != chain_top || cs != chain_seg)) {
             JS_ThrowTypeError(w->ctx, "flow serialization: arena extent does "
                               "not end at the parked top");
             return -1;
@@ -45095,7 +45370,7 @@ fail:
         /* the un-adopted machine: its chain was already dismantled above
            (values freed, weak slots cleared by rd_release) -- raw-free the
            arena and the handle */
-        js_free_rt(rt, r->m->arena_base);
+        tt_arena_segs_free(rt, r->m->arena_seg);
         js_free_rt(rt, r->m);
     }
     return NULL;
@@ -45307,7 +45582,7 @@ static void fork_release(TTForkCtx *fk)
 static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
                          JSValueConst root,
                          JSStackFrame *chain_innermost,
-                         uint8_t *chain_arena_top)
+                         uint8_t *chain_arena_top, TTArenaSeg *chain_seg)
 {
     TTFlowWr w_s, *w = &w_s;
     TTForkCtx fk_s, *fk = &fk_s;
@@ -45323,6 +45598,7 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
     w->forking = TRUE;
     w->chain_innermost = chain_innermost;
     w->chain_arena_top = chain_arena_top;
+    w->chain_seg = chain_seg;
     memset(fk, 0, sizeof(*fk));
     fk->ctx = ctx;
     fk->w = w;
@@ -45844,7 +46120,7 @@ out:
             for (pval = nsf->tt_frame_base; pval < nsf->cur_sp; pval++)
                 JS_FreeValue(ctx, *pval);
         }
-        js_free_rt(ctx->rt, fk->m->arena_base);
+        tt_arena_segs_free(ctx->rt, fk->m->arena_seg);
         js_free_rt(ctx->rt, fk->m);
     }
     tt_ptrmap_free(ctx, &w->map);
@@ -45984,7 +46260,7 @@ JSValue JS_TTFlowFork(JSContext *ctx, JSValueConst flow)
     JSAsyncFunctionState *st = tt_flow_state_of(ctx, flow);
     if (!st)
         return JS_EXCEPTION;
-    return fork_flow(ctx, st, flow, NULL, NULL);
+    return fork_flow(ctx, st, flow, NULL, NULL, NULL);
 }
 
 /* TRUE if the flow is suspended as a parked machine (its own handle or the
@@ -46060,9 +46336,96 @@ JSValue JS_TTForkHere(JSContext *ctx)
        a running frame must never keep a stale cur_sp. */
     saved_cur_sp = inner->cur_sp;
     inner->cur_sp = rt->tt_step_sp;
-    result = fork_flow(ctx, base, root, inner, rt->tt_arena_top);
+    result = fork_flow(ctx, base, root, inner, rt->tt_arena_top,
+                       rt->tt_arena_seg);
     inner->cur_sp = saved_cur_sp;
     return result;
+}
+
+/* Storage footprint of a flow's suspended machine. *pused = the bytes its
+   parked chain's arena frames actually occupy; *preserved = the RAM the
+   machine holds for them (segment storage + headers + the handle). A
+   machine grows by demand-sized segments, so reserved tracks used --
+   N suspended machines cost the sum of their chain depths, not N slabs.
+   Returns 0, or -1 (no exception) when the flow holds no machine. */
+int JS_TTFlowMachineStats(JSContext *ctx, JSValueConst flow, size_t *pused,
+                          size_t *preserved, int *psegments)
+{
+    JSGeneratorData *gd;
+    TTMachine *m;
+    JSStackFrame *sf;
+    TTArenaSeg *seg;
+    size_t used = 0, reserved = sizeof(TTMachine);
+    int nsegs = 0;
+
+    if (pused)
+        *pused = 0;
+    if (preserved)
+        *preserved = 0;
+    if (psegments)
+        *psegments = 0;
+    if (JS_VALUE_GET_TAG(flow) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_OBJ(flow)->class_id != JS_CLASS_GENERATOR)
+        return -1;
+    gd = JS_GetOpaque(flow, JS_CLASS_GENERATOR);
+    if (!gd || !gd->func_state || !gd->func_state->tt_machine)
+        return -1;
+    m = gd->func_state->tt_machine;
+    for (sf = m->parked_frame; sf && sf != m->base_frame; sf = sf->prev_frame) {
+        if (!(sf->js_mode & JS_MODE_ASYNC))
+            used += tt_chain_frame_size(sf);
+    }
+    seg = m->arena_seg;
+    while (seg && seg->prev)
+        seg = seg->prev;
+    for (; seg; seg = seg->next) {
+        reserved += sizeof(TTArenaSeg) + seg->size + 16;
+        nsegs++;
+    }
+    if (pused)
+        *pused = used;
+    if (preserved)
+        *preserved = reserved;
+    if (psegments)
+        *psegments = nsegs;
+    return 0;
+}
+
+/* Evict a suspended machine to bytes: serialize the flow -- chain, private
+   graph, delta -- through the flow serializer's classification, then free
+   its RAM by completing the handle without resuming (the state finalizer
+   dismantles the machine, its arena segments, and the delta). The handle
+   the host keeps becomes a completed husk; JS_TTMachineHydrate rebuilds a
+   live suspended machine from the bytes -- in this runtime or any runtime
+   holding the identically rebuilt baseline. Requires the flow checked out
+   (as serialization does); works for yield-suspended flows too. The live
+   legacy machine refuses (its chain sits on the runtime's own registers --
+   park state the host cannot drop). */
+uint8_t *JS_TTMachineEvict(JSContext *ctx, JSValueConst flow, size_t *plen)
+{
+    JSAsyncFunctionState *st = tt_flow_state_of(ctx, flow);
+    uint8_t *bytes;
+    JSGeneratorData *gd;
+
+    if (!st)
+        return NULL;
+    if (!st->tt_machine && tt_flow_base_is_parked(ctx->rt, st)) {
+        JS_ThrowTypeError(ctx, "cannot evict the live legacy machine; "
+                          "fork it into a handle first");
+        return NULL;
+    }
+    bytes = serialize_flow(ctx, st, flow, 1, plen);
+    if (!bytes)
+        return NULL;
+    gd = JS_GetOpaque(flow, JS_CLASS_GENERATOR);
+    free_generator_stack_rt(ctx->rt, gd);
+    return bytes;
+}
+
+/* the cold half of eviction: bytes back to a live suspended machine */
+JSValue JS_TTMachineHydrate(JSContext *ctx, const uint8_t *buf, size_t len)
+{
+    return JS_TTFlowDeserialize(ctx, buf, len);
 }
 /*---------------------------------------------------------------------------*/
 /* end TimeTravelJS flow serialization                                        */
@@ -70674,7 +71037,19 @@ void JS_TTResetExecState(JSContext *ctx)
     rt->tt_park_ok = FALSE;
     rt->tt_park_abort = FALSE;
     rt->tt_skip_once = FALSE;
-    rt->tt_arena_top = rt->tt_arena_base;
+    if (rt->tt_arena_seg) {
+        /* empty the installed arena: back to its first segment, later
+           segments dropped */
+        TTArenaSeg *seg = rt->tt_arena_seg;
+        while (seg->prev)
+            seg = seg->prev;
+        tt_arena_seg_free_tail(rt, seg, NULL);
+        rt->tt_arena_seg = seg;
+        rt->tt_arena_base = seg->base;
+        rt->tt_arena_top = seg->base;
+        rt->tt_arena_limit = seg->limit;
+        rt->tt_arena_total = seg->size;
+    }
     rt->tt_exec_fn = JS_UNDEFINED; /* do not free: heap may be mid-heal */
     rt->tt_job_kind = 0;           /* abandoned job continuation, if any */
     rt->tt_job_aux = NULL;
