@@ -12,8 +12,8 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
 ```
 
 with the public wrappers `JS_TTFlowSerialize` / `JS_TTFlowDeserialize` /
-`JS_TTFlowResumeParked` and the baseline registry `JS_TTBaselineCapture*`
-(declared in `quickjs.h`). A *flow* is a suspended computation rooted at a
+`JS_TTFlowResumeParked` / `JS_TTFlowFork` and the baseline registry
+`JS_TTBaselineCapture*` (declared in `quickjs.h`). A *flow* is a suspended computation rooted at a
 `JSAsyncFunctionState` — the struct QuickJS uses for both generator and
 async-function activations — plus its parked TrampFrame chain and a
 per-flow COW delta of first-writes against shared baseline objects. The
@@ -227,6 +227,45 @@ installed*:
 Check-in/out are pure swaps: refcount-neutral by construction, in either
 process. The delta rides on the base `JSAsyncFunctionState` (`tt_delta`)
 and is freed with it.
+
+## Forking: the same swizzle, into live objects
+
+`JS_TTFlowFork(ctx, flow)` clones a suspended flow into a concurrent
+sibling **in the same runtime**: both resume and diverge independently
+over the shared baseline. It is the serializer with the byte buffer
+removed — pass A (`wr_enumerate`) classifies and indexes exactly as for
+serialization, then a clone pass allocates every sibling shell (assign)
+and a relink pass fills it from the *live* parent objects instead of
+decoding bytes:
+
+- **baseline entities share**: a registry hit costs one reference bump,
+  and both flows keep pointing at the very same object — the fork test
+  proves identity by mutating a baseline table row and seeing the change
+  in every fork's future.
+- **flow-private state deep-copies**: the `JSAsyncFunctionState` chain
+  (frames rebuilt with `async_func_init` geometry; `cur_pc` copies
+  verbatim — same runtime, same bytecode), private closures (bytecode
+  shared by refcount — fork does not require baseline membership, so
+  eval'd-code flows fork even though they refuse to serialize), plain
+  objects/arrays/wrappers, and closure cells. Open cells reattach over
+  the sibling stacks with `get_var_ref`'s rules (weak slot, state pin),
+  preserving the registration-frame/storage-frame distinction.
+- **strings and symbols share**: immutable, so siblings alias them —
+  a symbol keeps one identity across the family.
+- **the COW delta copies**: the sibling gets an independent first-write
+  log carrying the parent's fork-time view; each flow applies its own
+  delta on check-in and heals the baseline on check-out. Fork (like
+  serialization) requires the flow checked out — two checked-in deltas
+  over the same cells would corrupt the swap discipline — and the
+  sibling arrives checked out. Forks of forks nest arbitrarily; the
+  test drives three-way isolation.
+
+Reconciliation follows the deserializer: one construction reference per
+clone, dropped once the graph is linked; the returned handle keeps what
+it reaches. Machine-parked flows refuse to fork in place (a runtime has
+one parked machine — serialize into another runtime instead); async
+functions and exotic private classes refuse with the serializer's
+errors.
 
 ## Resuming a transplanted machine
 

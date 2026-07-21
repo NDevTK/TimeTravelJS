@@ -29,6 +29,14 @@
  *                               transplant into a second runtime, and the
  *                               original machine is discarded through the
  *                               abort-unwind path.
+ *
+ *   flow-harness forktest       JS_TTFlowFork: clone a parked flow (two
+ *                               frames deep in yield*, open cell, delta)
+ *                               into siblings; prove divergent futures
+ *                               under different next() feeds, two- and
+ *                               three-way delta isolation (fork-of-fork),
+ *                               baseline sharing by identity, refusal on
+ *                               completed flows, leak-free teardown.
  */
 #include "quickjs.h"
 #include <stdio.h>
@@ -58,8 +66,9 @@ static const char *BASELINE_SRC =
 "  var t = 0.5;\n"
 "  for (var k = 0; k < a; k++) {\n"
 "    t += helper(k, a);\n"
-"    try { yield \"inner:\" + k + \":\" + t + \":\" + TABLE[k % TABLE.length]; }\n"
+"    try { var fed = yield \"inner:\" + k + \":\" + t + \":\" + TABLE[k % TABLE.length]; }\n"
 "    catch (e) { yield \"caught:\" + e; }\n"
+"    if (fed) t += fed;\n"
 "  }\n"
 "  return \"inner-done:\" + t;\n"
 "}\n"
@@ -709,6 +718,189 @@ static int cmd_selftest(void)
     return 0;
 }
 
+/* drive a suspended flow to completion feeding next(feed) each step,
+   collecting "value|" into buf */
+static void collect_flow(JSContext *ctx, JSValueConst g, int feed,
+                         char *buf, size_t cap)
+{
+    JSAtom na = JS_NewAtom(ctx, "next");
+    buf[0] = 0;
+    for (;;) {
+        JSValue arg = JS_NewInt32(ctx, feed);
+        JSValue r = JS_Invoke(ctx, (JSValue)g, na, 1, (JSValueConst *)&arg);
+        JSValue val, done;
+        const char *str;
+        int isdone;
+        if (JS_IsException(r))
+            die(ctx, "next(feed)");
+        val = JS_GetPropertyStr(ctx, r, "value");
+        done = JS_GetPropertyStr(ctx, r, "done");
+        isdone = JS_ToBool(ctx, done);
+        str = JS_ToCString(ctx, val);
+        if (strlen(buf) + strlen(str) + 2 < cap) {
+            strcat(buf, str ? str : "?");
+            strcat(buf, "|");
+        }
+        JS_FreeCString(ctx, str);
+        JS_FreeValue(ctx, val);
+        JS_FreeValue(ctx, done);
+        JS_FreeValue(ctx, r);
+        if (isdone)
+            break;
+    }
+    JS_FreeAtom(ctx, na);
+}
+
+static void delta_mark(JSContext *ctx, JSValueConst g, const char *mark)
+{
+    JSValue cfg = get_global(ctx, "CONFIG");
+    JSAtom tag = JS_NewAtom(ctx, "tag");
+    JSValue nv = JS_NewString(ctx, mark);
+    if (JS_TTFlowDeltaWriteProp(ctx, g, cfg, tag, nv))
+        die(ctx, "delta mark");
+    JS_FreeValue(ctx, nv);
+    JS_FreeAtom(ctx, tag);
+    JS_FreeValue(ctx, cfg);
+}
+
+/* fork: clone a parked flow (two frames deep in yield*, open cell, delta),
+   prove independent divergence, two-way then three-way delta isolation,
+   baseline sharing by identity, and leak-free teardown */
+static int cmd_forktest(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    JSValue g, g2, g3;
+    char trace_p[2048], trace_s[2048], trace_g[2048];
+
+    /* park at the "inner:1" yield: [outer, inner] chain, mk closure over
+       a live local, one delta write, checked out */
+    g = start_flow(ctx, 3, NULL);
+    write_delta(ctx, g);
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout parent");
+    expect_str(ctx, "CONFIG.tag", "cfg", "pristine after checkout");
+
+    g2 = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(g2))
+        die(ctx, "fork");
+    printf("FORK:sibling ok\n");
+
+    /* (b) delta isolation, both directions */
+    if (JS_TTFlowCheckin(ctx, g))
+        die(ctx, "checkin parent");
+    expect_str(ctx, "CONFIG.tag", "cfg-flow", "parent view");
+    delta_mark(ctx, g, "parent-mark");
+    expect_str(ctx, "CONFIG.tag", "parent-mark", "parent write");
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout parent 2");
+    expect_str(ctx, "CONFIG.tag", "cfg", "pristine again");
+
+    if (JS_TTFlowCheckin(ctx, g2))
+        die(ctx, "checkin sibling");
+    expect_str(ctx, "CONFIG.tag", "cfg-flow",
+               "sibling sees fork-time view, not parent-mark");
+    delta_mark(ctx, g2, "sib-mark");
+    if (JS_TTFlowCheckout(ctx, g2))
+        die(ctx, "checkout sibling");
+    expect_str(ctx, "CONFIG.tag", "cfg", "pristine after sibling");
+
+    if (JS_TTFlowCheckin(ctx, g))
+        die(ctx, "checkin parent 3");
+    expect_str(ctx, "CONFIG.tag", "parent-mark",
+               "parent view survives sibling's writes");
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout parent 3");
+    printf("FORK:delta isolation ok\n");
+
+    /* (e) fork-of-fork: the grandchild carries the SIBLING's view */
+    g3 = JS_TTFlowFork(ctx, g2);
+    if (JS_IsException(g3))
+        die(ctx, "fork of fork");
+    if (JS_TTFlowCheckin(ctx, g3))
+        die(ctx, "checkin g3");
+    expect_str(ctx, "CONFIG.tag", "sib-mark", "grandchild inherits sibling");
+    delta_mark(ctx, g3, "g3-mark");
+    if (JS_TTFlowCheckout(ctx, g3))
+        die(ctx, "checkout g3");
+    if (JS_TTFlowCheckin(ctx, g2))
+        die(ctx, "checkin sibling 2");
+    expect_str(ctx, "CONFIG.tag", "sib-mark",
+               "sibling view survives grandchild's writes");
+    if (JS_TTFlowCheckout(ctx, g2))
+        die(ctx, "checkout sibling 2");
+    printf("FORK:three-way isolation ok\n");
+
+    /* (c) baseline shared by identity: a host-level mutation of TABLE is
+       visible to every fork's future (a clone would show pristine rows) */
+    {
+        JSValue v = JS_Eval(ctx, "TABLE[2] = 'row-2-mutated';", 26,
+                            "probe.js", JS_EVAL_TYPE_GLOBAL);
+        if (JS_IsException(v))
+            die(ctx, "table mutation");
+        JS_FreeValue(ctx, v);
+    }
+
+    /* (a) resume all three with different feeds; each under its own delta */
+    if (JS_TTFlowCheckin(ctx, g))
+        die(ctx, "checkin for run p");
+    collect_flow(ctx, g, 1, trace_p, sizeof(trace_p));
+    if (JS_TTFlowCheckin(ctx, g2))
+        die(ctx, "checkin for run s");
+    collect_flow(ctx, g2, 2, trace_s, sizeof(trace_s));
+    if (JS_TTFlowCheckin(ctx, g3))
+        die(ctx, "checkin for run g");
+    collect_flow(ctx, g3, 3, trace_g, sizeof(trace_g));
+
+    printf("TRACE_P:%s\n", trace_p);
+    printf("TRACE_S:%s\n", trace_s);
+    printf("TRACE_G:%s\n", trace_g);
+    assert(strcmp(trace_p, trace_s) != 0);
+    assert(strcmp(trace_s, trace_g) != 0);
+    assert(strcmp(trace_p, trace_g) != 0);
+    assert(strstr(trace_p, "delta-view:parent-mark"));
+    assert(strstr(trace_s, "delta-view:sib-mark"));
+    assert(strstr(trace_g, "delta-view:g3-mark"));
+    assert(strstr(trace_p, "row-2-mutated"));
+    assert(strstr(trace_s, "row-2-mutated"));
+    assert(strstr(trace_g, "row-2-mutated"));
+    printf("FORK:divergent futures ok\n");
+
+    /* also: forking a completed/running flow refuses cleanly */
+    {
+        JSValue bad = JS_TTFlowFork(ctx, g);   /* g completed above */
+        assert(JS_IsException(bad));
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+
+    /* (d) leak-free teardown: two completed flows, one abandoned fork */
+    {
+        JSValue g4 = JS_TTFlowFork(ctx, g3);   /* completed -> must refuse */
+        assert(JS_IsException(g4));
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    JS_FreeValue(ctx, g);
+    JS_FreeValue(ctx, g2);
+    JS_FreeValue(ctx, g3);
+    /* an extra suspended fork abandoned without resuming */
+    {
+        JSValue g5 = start_flow(ctx, 3, NULL);
+        JSValue g6;
+        if (JS_TTFlowCheckout(ctx, g5))
+            die(ctx, "checkout g5");
+        g6 = JS_TTFlowFork(ctx, g5);
+        if (JS_IsException(g6))
+            die(ctx, "fork g5");
+        JS_FreeValue(ctx, g5);
+        JS_FreeValue(ctx, g6);
+        JS_RunGC(rt);
+    }
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    printf("FORK:teardown ok\n");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 3 && !strcmp(argv[1], "emit"))
@@ -721,6 +913,8 @@ int main(int argc, char **argv)
         return cmd_resume2(argv[2]);
     if (argc >= 2 && !strcmp(argv[1], "selftest"))
         return cmd_selftest();
+    if (argc >= 2 && !strcmp(argv[1], "forktest"))
+        return cmd_forktest();
     fprintf(stderr, "usage: flow-harness emit|resume <file> | selftest\n");
     return 2;
 }

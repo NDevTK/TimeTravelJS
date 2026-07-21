@@ -1010,6 +1010,12 @@ JSValue JS_TTFlowDeserialize(JSContext *ctx, const uint8_t *buf, size_t len);
    Afterwards the flow is an ordinary suspended generator. */
 JSValue JS_TTFlowResumeParked(JSContext *ctx, JSValueConst flow, int cmd,
                               int *pdone, int *pparked);
+/* fork a suspended flow into a concurrent sibling in the same runtime:
+   baseline objects are shared (by reference), all flow-private state --
+   states, parked frames, closures, cells, the COW delta -- deep-copies,
+   so both flows resume and diverge independently. Requires the flow
+   checked out; the sibling arrives checked out. */
+JSValue JS_TTFlowFork(JSContext *ctx, JSValueConst flow);
 /* per-flow COW delta: record-once first-write against a baseline property
    or closure cell, then write through; checkout parks the flow's view
    (baseline shows pristine values), checkin installs it. Pure swaps. */

@@ -51,4 +51,6 @@ echo "PASS: machine-parked chain resumes byte-identically ($(wc -l < "$BUILD/a2.
 
 echo "== selftest =="
 "$BUILD/flow-harness" selftest
+echo "== forktest =="
+"$BUILD/flow-harness" forktest
 echo "PASS: flow serialization suite"
