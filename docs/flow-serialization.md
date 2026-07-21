@@ -149,9 +149,11 @@ once, with their owner. Geometry (`arg_alloc + var_count + stack_size`
 slots plus `var_ref_count` cells) re-derives from the function bytecode,
 never trusted from the wire; extents, offsets, and the step-hook line
 cache (carried so a stepping host resumes byte-identically) are all
-bounds-checked. On success the rebuilt chain is staged as the fresh
-runtime's parked machine (`rt->tt_parked_frame`), refusing to transplant
-into a runtime whose machine is already parked.
+bounds-checked. On success the rebuilt chain becomes the flow's **own
+suspended machine** — a `TTMachine` handle with its own arena, adopted by
+the base state — so any number of transplants coexist in one runtime and
+resume independently (see "The suspended machine as a first-class
+value").
 
 Closure cells rebuild over those stacks with a two-frame address: the
 frame the cell *registers on* (its `var_refs[]` slot) and the frame that
@@ -262,28 +264,88 @@ decoding bytes:
 
 Reconciliation follows the deserializer: one construction reference per
 clone, dropped once the graph is linked; the returned handle keeps what
-it reaches. Machine-parked flows refuse to fork in place (a runtime has
-one parked machine — serialize into another runtime instead); async
-functions and exotic private classes refuse with the serializer's
-errors.
+it reaches. Machine-parked flows fork **in place**: the parked TrampFrame
+chain rebuilds inside the sibling's own arena (next section) with
+identical geometry, so every parent-relative offset — argument windows,
+method receivers, open-cell storage slots — transfers verbatim, and the
+sibling arrives as an independently suspended machine. Async functions
+and exotic private classes refuse with the serializer's errors.
+
+## The suspended machine as a first-class value
+
+A parked machine used to be a runtime singleton (`rt->tt_parked_frame` +
+the shared frame arena). It is now a **per-flow value**: `TTMachine`, a
+handle owning the flow's parked chain *and its own frame arena*, hung off
+the base `JSAsyncFunctionState`. The private arena is not an indulgence —
+the engine's arena is a bump allocator, so two suspended chains sharing it
+could only be resumed LIFO; giving each machine its own arena makes any
+number of suspensions resumable in any order.
+
+The runtime's arena/park fields become the **active machine's registers**:
+`JS_TTFlowResumeParked` installs the handle's registers (saving the
+host's, which may themselves be a parked legacy machine's), re-enters the
+dispatch loop, and on a re-park captures the registers back into the
+handle. The legacy host-entered machine (`JS_TTCallStart`/`JS_TTCallArgs`/
+`JS_TTCallResume`, the wasm contract) still lives directly on the runtime
+fields, untouched — a handle can resume to completion *while the legacy
+machine stays parked*, and vice versa.
+
+Ownership is GC-honest, per the delta's rule (every owned reference must
+be a visible edge): the state's `mark_children` walks the suspended
+chain's arena frames and marks their owned slots, so cycles through a
+parked machine are collectable and nothing becomes a phantom root.
+While the machine is *installed* (running), its `parked_frame` is
+cleared and the chain is C-stack rooted, exactly like a live frame chain.
+Teardown needs no resume at all: `__async_func_free` dismantles an
+attached machine first — mirroring the engine's pop per frame (close the
+frame's cells, free its owned range) before releasing the arena — so
+dropping the last reference to a suspended arm is leak-free.
+
+`JS_TTForkHere(ctx)` is the seam the solver uses: callable **only from
+inside the step handler**, at any opcode. The running frame's `sp` exists
+only in the dispatch loop's locals, so `TT_STEP_CHECK` publishes it in a
+transient (`rt->tt_step_sp`) for the duration of the callback; ForkHere
+stamps it into the innermost frame, walks down to the outermost generator
+state on the chain (frames below it — the driver loop, the host entry —
+stay put), finds the flow's generator object by value on those driver
+frames, and runs the machine fork with the running chain as the override.
+It returns the **fork-arm**: a suspended machine handle that resumes from
+that very opcode via `JS_TTFlowResumeParked`. The **continue-arm** is the
+running machine itself — the handler returns 0 to let it run on, or 2 to
+park it for `JS_TTCallResume`. `OP_if_true` on an unknown becomes "both
+arms run": inject different values for the same live local per arm
+(`JS_TTSetLocal` through the parked chain, `JS_TTFlowSetLocal` through a
+handle) and the futures diverge from the same program counter.
+`JS_TTFlowParked` reports whether a handle currently holds a parked
+machine. The forkhere harness drives the whole property: a fork taken
+mid-arithmetic four frames deep, a second fork taken *inside the first
+arm's resume*, four machines suspended concurrently in one runtime, three
+divergent futures, and an arm abandoned without resuming that tears down
+leak-free.
 
 ## Resuming a transplanted machine
 
-A flow serialized while machine-parked arrives EXECUTING: its base frame is
-rebuilt as a C entry (`TT_FRAME_ENTRY`), so when the chain finishes or the
-generator yields, the dispatch loop returns to the host instead of to a
-caller frame that stayed behind in the source process — the fresh process's
-host *becomes* the driver. `JS_TTFlowResumeParked(ctx, flow, cmd, &done,
-&parked)` re-enters the loop at the innermost frame (`JS_CALL_FLAG_TT_RESUME`)
-and completes the interrupted `next()`: `done` follows the generator
-protocol (0 yield, 1 return, 2 `yield*` delegation result), `parked`
-reports a re-park if the fresh host steps too. `cmd 1` aborts instead: an
+A flow serialized while machine-parked arrives EXECUTING **with its own
+machine handle** — deserialization rebuilds the chain straight into a
+fresh `TTMachine`'s arena, so any number of transplants coexist in one
+runtime (the old one-parked-machine-per-runtime guard is gone; the
+resume2 harness now proves two transplants of the same bytes park and
+resume independently). The base frame is rebuilt as a C entry
+(`TT_FRAME_ENTRY`), so when the chain finishes or the generator yields,
+the dispatch loop returns to the host instead of to a caller frame that
+stayed behind in the source process — the fresh process's host *becomes*
+the driver. `JS_TTFlowResumeParked(ctx, flow, cmd, &done, &parked)`
+installs the machine's registers and re-enters the loop at the innermost
+frame (`JS_CALL_FLAG_TT_RESUME`), completing the interrupted `next()`:
+`done` follows the generator protocol (0 yield, 1 return, 2 `yield*`
+delegation result), `parked` reports a re-park (captured back into the
+handle) if the fresh host steps too. `cmd 1` aborts instead: an
 Interrupted error unwinds helper → nested generators → base through the
-engine's own exception path, completing the flow — the leak-free way to
-discard a transplanted parked flow. Afterwards the flow is an ordinary
-suspended generator, driven with `next()`. A flow still parked inside a
-*live* machine (its base frame not yet transplant-rewritten) is refused
-with a pointer to `JS_TTCallResume`.
+engine's own exception path, completing the flow — one leak-free way to
+discard a parked flow (simply dropping the handle is the other).
+Afterwards the flow is an ordinary suspended generator, driven with
+`next()`. A flow parked inside the *live legacy* machine is refused with
+a pointer to `JS_TTCallResume`.
 
 ## Wire format (`TTFL02`)
 

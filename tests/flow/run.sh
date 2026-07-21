@@ -53,4 +53,6 @@ echo "== selftest =="
 "$BUILD/flow-harness" selftest
 echo "== forktest =="
 "$BUILD/flow-harness" forktest
+echo "== forkhere (machine-as-value) =="
+"$BUILD/flow-harness" forkhere
 echo "PASS: flow serialization suite"

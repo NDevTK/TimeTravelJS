@@ -37,6 +37,17 @@
  *                               three-way delta isolation (fork-of-fork),
  *                               baseline sharing by identity, refusal on
  *                               completed flows, leak-free teardown.
+ *
+ *   flow-harness forkhere       the suspended machine as a first-class
+ *                               per-flow value: JS_TTForkHere splits the
+ *                               RUNNING machine mid-opcode from the step
+ *                               hook (four frames deep in helper()); the
+ *                               legacy machine plus three forked handles
+ *                               stay suspended concurrently, resume
+ *                               independently (with per-arm injections
+ *                               into the same live local and per-arm
+ *                               deltas), and an abandoned arm tears down
+ *                               leak-free without ever resuming.
  */
 #include "quickjs.h"
 #include <stdio.h>
@@ -204,23 +215,32 @@ static void expect_str(JSContext *ctx, const char *expr, const char *want,
     free(got);
 }
 
-/* park the machine at the Nth arrival on a target source line */
+/* park the machine at the Nth arrival on a target source line; with
+   fork_here set, split the running machine there first (the fork-arm handle
+   lands in plan->forked, the continue-arm parks by the returned 2) */
 typedef struct ParkPlan {
     int line;
     int countdown;
     int parked_line;
+    int fork_here;
+    JSValue forked;
 } ParkPlan;
 
 static int park_handler(JSContext *ctx, int line, int col, int depth,
                         int parkable, void *opaque)
 {
     ParkPlan *plan = opaque;
-    (void)ctx; (void)col; (void)depth;
+    (void)col; (void)depth;
     if (getenv("FLOW_DEBUG_STEPS"))
         fprintf(stderr, "[step] line=%d depth=%d parkable=%d\n",
                 line, depth, parkable);
     if (parkable && line == plan->line && --plan->countdown == 0) {
         plan->parked_line = line;
+        if (plan->fork_here) {
+            plan->forked = JS_TTForkHere(ctx);
+            if (JS_IsException(plan->forked))
+                return 1;     /* abort; the command dies on the exception */
+        }
         return 2;
     }
     return 0;
@@ -396,6 +416,8 @@ static int cmd_emit2(const char *path)
     plan.line = baseline_line_of("acc = acc + CONFIG.limit");
     plan.countdown = 1;
     plan.parked_line = 0;
+    plan.fork_here = 0;
+    plan.forked = JS_UNDEFINED;
     JS_TTSetStepHandler(rt, park_handler, &plan);
     JS_TTSetStepFilename(ctx, "baseline.js");
     JS_TTEnableStep(rt, 1);
@@ -506,21 +528,37 @@ static int cmd_resume2(const char *path)
     g = JS_TTFlowDeserialize(ctx, bytes, blen);
     if (JS_IsException(g))
         die(ctx, "deserialize");
-    if (!JS_TTParked(ctx)) {
-        fprintf(stderr, "FATAL machine not staged as parked\n");
+    if (!JS_TTFlowParked(ctx, g)) {
+        fprintf(stderr, "FATAL flow did not arrive as a parked machine\n");
         return 1;
     }
     printf("PARKED:transplanted\n");
 
-    /* one parked machine per runtime: a second transplant must refuse */
+    /* suspended machines are per-flow values now: a second transplant of
+       the same bytes must SUCCEED and park independently -- and resuming
+       (aborting) it must leave the first machine untouched */
     {
+        int d2 = 0, p2 = 0;
         JSValue dup = JS_TTFlowDeserialize(ctx, bytes, (size_t)blen);
-        if (!JS_IsException(dup)) {
-            fprintf(stderr, "FAIL busy-machine guard\n");
+        JSValue ret;
+        if (JS_IsException(dup))
+            die(ctx, "second transplant");
+        if (!JS_TTFlowParked(ctx, dup)) {
+            fprintf(stderr, "FAIL second machine not parked\n");
+            return 1;
+        }
+        ret = JS_TTFlowResumeParked(ctx, dup, 1, &d2, &p2);   /* abort */
+        if (p2 || !JS_IsException(ret)) {
+            fprintf(stderr, "FAIL abort of second machine\n");
             return 1;
         }
         JS_FreeValue(ctx, JS_GetException(ctx));
-        printf("SELF:busy-guard ok\n");
+        JS_FreeValue(ctx, dup);
+        if (!JS_TTFlowParked(ctx, g)) {
+            fprintf(stderr, "FAIL first machine lost its park\n");
+            return 1;
+        }
+        printf("SELF:concurrent transplant ok\n");
     }
     /* re-serializing the transplanted parked chain reproduces the bytes:
        arena offsets are relative, ids deterministic */
@@ -901,6 +939,235 @@ static int cmd_forktest(void)
     return 0;
 }
 
+/* the first resumed step of a machine-parked arm, stringified into buf
+   (unwraps a done==2 yield* delegation result exactly like print_step) */
+static void resume_first(JSContext *ctx, JSValueConst arm, char *buf,
+                         size_t cap)
+{
+    int done = 0, parked = 0;
+    JSValue v = JS_TTFlowResumeParked(ctx, (JSValue)arm, 0, &done, &parked);
+    const char *s;
+    if (parked || JS_IsException(v))
+        die(ctx, "resume arm");
+    if (done == 2) {
+        JSValue v2 = JS_GetPropertyStr(ctx, v, "value");
+        JS_FreeValue(ctx, v);
+        v = v2;
+    }
+    s = JS_ToCString(ctx, v);
+    snprintf(buf, cap, "%s|", s ? s : "?");
+    JS_FreeCString(ctx, s);
+    JS_FreeValue(ctx, v);
+}
+
+/* forkhere: fork the RUNNING machine from inside the step hook, at an
+   opcode boundary in the middle of helper()'s arithmetic, four frames deep
+   (helper <- inner <- outer <- for-of drive). armA = the continue-arm (the
+   legacy parked machine), armB/armC = JS_TTForkHere handles, armD = a
+   host-side JS_TTFlowFork of the parked machine, abandoned unresumed.
+   Proves: (a) diverging futures from the same opcode under per-arm
+   injections of the same live local, (b) delta isolation across arms,
+   (c) 4 independently suspended machines coexisting in one runtime, a
+   handle resuming to completion while the legacy machine stays parked,
+   (d) leak-free teardown of an abandoned arm through the state finalizer. */
+static int cmd_forkhere(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    JSValue g, armB, armC, armD, drive_fn;
+    ParkPlan plan;
+    JSAtom name_a;
+    char traceA[2048], traceB[2048], traceC[2048];
+    int parked = 0;
+
+    g = start_flow(ctx, 2, NULL);     /* suspended at inner's k=0 yield */
+    write_delta(ctx, g);
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout");
+
+    /* drive under opcode-granularity stepping; the trigger sits on the
+       SECOND opcode boundary of helper's middle line at k=1 -- genuinely
+       mid-statement, four frames deep */
+    plan.line = baseline_line_of("acc = acc + CONFIG.limit");
+    plan.countdown = 2;
+    plan.parked_line = 0;
+    plan.fork_here = 1;
+    plan.forked = JS_UNDEFINED;
+    JS_TTSetStepHandler(rt, park_handler, &plan);
+    JS_TTSetStepFilename(ctx, "baseline.js");
+    JS_TTSetGranularity(ctx, 1);
+    JS_TTEnableStep(rt, 1);
+    drive_fn = get_global(ctx, "drive");
+    {
+        JSValueConst args[1] = { g };
+        JSValue ret = JS_TTCallArgs(ctx, drive_fn, JS_UNDEFINED, 1, args,
+                                    &parked);
+        if (JS_IsException(ret))
+            die(ctx, "fork-here drive");
+        if (!parked) {
+            fprintf(stderr, "FATAL machine did not park at the fork point\n");
+            return 1;
+        }
+        JS_FreeValue(ctx, ret);
+    }
+    JS_TTEnableStep(rt, 0);
+    armB = plan.forked;
+    if (!JS_TTParked(ctx) || !JS_TTFlowParked(ctx, armB)) {
+        fprintf(stderr, "FAIL fork-here arms not both suspended\n");
+        return 1;
+    }
+    printf("FORKHERE:split at line %d, both arms suspended\n",
+           plan.parked_line);
+
+    /* (d-setup) a host-side fork of the legacy parked machine: a third
+       independently suspended machine, to be abandoned unresumed */
+    armD = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(armD))
+        die(ctx, "host-side fork of parked machine");
+    if (!JS_TTFlowParked(ctx, armD)) {
+        fprintf(stderr, "FAIL armD not suspended\n");
+        return 1;
+    }
+
+    /* (b) delta isolation across arms: distinct marks, both checked out */
+    if (JS_TTFlowCheckin(ctx, g))
+        die(ctx, "checkin A");
+    expect_str(ctx, "CONFIG.tag", "cfg-flow", "armA inherits pre-fork view");
+    delta_mark(ctx, g, "cfg-A");
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout A");
+    expect_str(ctx, "CONFIG.tag", "cfg", "pristine after armA");
+    if (JS_TTFlowCheckin(ctx, armB))
+        die(ctx, "checkin B");
+    expect_str(ctx, "CONFIG.tag", "cfg-flow",
+               "armB inherits the fork-time view, not cfg-A");
+    delta_mark(ctx, armB, "cfg-B");
+    if (JS_TTFlowCheckout(ctx, armB))
+        die(ctx, "checkout B");
+    if (JS_TTFlowCheckin(ctx, g))
+        die(ctx, "checkin A2");
+    expect_str(ctx, "CONFIG.tag", "cfg-A", "armA view survives armB's mark");
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout A2");
+    printf("FORKHERE:delta isolation ok\n");
+
+    /* (a) inject different values into the SAME live local (helper's
+       argument `a`, an aliased-arg slot: armA through the running chain,
+       armB through its handle) */
+    name_a = JS_NewAtom(ctx, "a");
+    {
+        JSValue v = JS_NewInt32(ctx, 10);
+        if (!JS_TTSetLocal(ctx, 0, name_a, v)) {
+            fprintf(stderr, "FAIL inject armA\n");
+            return 1;
+        }
+        v = JS_NewInt32(ctx, 20);
+        if (!JS_TTFlowSetLocal(ctx, armB, 0, name_a, v)) {
+            fprintf(stderr, "FAIL inject armB\n");
+            return 1;
+        }
+    }
+
+    /* (c) a third ForkHere INSIDE armA's resume: two opcode boundaries
+       later on the same helper line (still k=1, before `a` is read) the
+       trigger fires again, the handler splits again, armA re-parks */
+    plan.countdown = 2;
+    plan.parked_line = 0;
+    plan.forked = JS_UNDEFINED;
+    JS_TTEnableStep(rt, 1);
+    {
+        JSValue ret = JS_TTCallResume(ctx, 0, &parked);
+        if (JS_IsException(ret))
+            die(ctx, "armA resume to second fork");
+        if (!parked) {
+            fprintf(stderr, "FATAL armA did not re-park\n");
+            return 1;
+        }
+        JS_FreeValue(ctx, ret);
+    }
+    JS_TTEnableStep(rt, 0);
+    armC = plan.forked;
+    if (!JS_TTParked(ctx) || !JS_TTFlowParked(ctx, armB) ||
+        !JS_TTFlowParked(ctx, armC) || !JS_TTFlowParked(ctx, armD)) {
+        fprintf(stderr, "FAIL four machines not all suspended\n");
+        return 1;
+    }
+    printf("FORKHERE:legacy + 3 handles suspended concurrently\n");
+    {
+        JSValue v = JS_NewInt32(ctx, 30);
+        if (!JS_TTFlowSetLocal(ctx, armC, 0, name_a, v)) {
+            fprintf(stderr, "FAIL inject armC\n");
+            return 1;
+        }
+    }
+    JS_FreeAtom(ctx, name_a);
+
+    /* armB runs to completion WHILE the legacy machine stays parked: the
+       handle's machine registers install and restore around the run */
+    if (JS_TTFlowCheckin(ctx, armB))
+        die(ctx, "checkin B2");
+    resume_first(ctx, armB, traceB, sizeof(traceB));
+    collect_flow(ctx, armB, 0, traceB + strlen(traceB),
+                 sizeof(traceB) - strlen(traceB));
+    if (!JS_TTParked(ctx)) {
+        fprintf(stderr, "FAIL legacy machine lost its park across armB\n");
+        return 1;
+    }
+    printf("FORKHERE:armB completed around the parked machine\n");
+
+    /* armA (the continue-arm) completes: drive() returns its whole trace */
+    if (JS_TTFlowCheckin(ctx, g))
+        die(ctx, "checkin A3");
+    {
+        JSValue ret = JS_TTCallResume(ctx, 0, &parked);
+        const char *s;
+        if (parked || JS_IsException(ret))
+            die(ctx, "armA final resume");
+        s = JS_ToCString(ctx, ret);
+        snprintf(traceA, sizeof(traceA), "%s", s ? s : "?");
+        JS_FreeCString(ctx, s);
+        JS_FreeValue(ctx, ret);
+    }
+
+    /* armC: its own mark, then its own future */
+    if (JS_TTFlowCheckin(ctx, armC))
+        die(ctx, "checkin C");
+    delta_mark(ctx, armC, "cfg-C");
+    resume_first(ctx, armC, traceC, sizeof(traceC));
+    collect_flow(ctx, armC, 0, traceC + strlen(traceC),
+                 sizeof(traceC) - strlen(traceC));
+
+    printf("TRACE_A:%s\n", traceA);
+    printf("TRACE_B:%s\n", traceB);
+    printf("TRACE_C:%s\n", traceC);
+    assert(strcmp(traceA, traceB) != 0);
+    assert(strcmp(traceA, traceC) != 0);
+    assert(strcmp(traceB, traceC) != 0);
+    assert(strstr(traceA, "delta-view:cfg-A"));
+    assert(strstr(traceB, "delta-view:cfg-B"));
+    assert(strstr(traceC, "delta-view:cfg-C"));
+    printf("FORKHERE:divergent futures ok\n");
+
+    /* (d) the abandoned arm: survives a full GC suspended, then tears
+       down leak-free through the state finalizer, never resumed */
+    JS_RunGC(rt);
+    if (!JS_TTFlowParked(ctx, armD)) {
+        fprintf(stderr, "FAIL armD lost its machine across GC\n");
+        return 1;
+    }
+    JS_FreeValue(ctx, armD);
+    JS_RunGC(rt);
+
+    JS_FreeValue(ctx, drive_fn);
+    JS_FreeValue(ctx, g);
+    JS_FreeValue(ctx, armB);
+    JS_FreeValue(ctx, armC);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);       /* the leak oracle: gc_obj_list must drain */
+    printf("FORKHERE:teardown ok\n");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 3 && !strcmp(argv[1], "emit"))
@@ -915,6 +1182,8 @@ int main(int argc, char **argv)
         return cmd_selftest();
     if (argc >= 2 && !strcmp(argv[1], "forktest"))
         return cmd_forktest();
+    if (argc >= 2 && !strcmp(argv[1], "forkhere"))
+        return cmd_forkhere();
     fprintf(stderr, "usage: flow-harness emit|resume <file> | selftest\n");
     return 2;
 }

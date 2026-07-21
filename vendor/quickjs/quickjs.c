@@ -399,6 +399,8 @@ struct JSRuntime {
     BOOL tt_park_abort;       /* deliver an abort on the next parked resume */
     BOOL tt_skip_once;        /* swallow the re-check at the resume pc */
     struct JSStackFrame *tt_parked_frame; /* set while parked-by-return */
+    JSValue *tt_step_sp;      /* transient: the running frame's sp during a
+                                 step-hook callback (JS_TTForkHere reads it) */
     JSValue tt_exec_fn;       /* callable held alive across a parked script */
     /* parked-job continuation (stackless job pump): inputs for the post
        half of a job whose user callback parked mid-run */
@@ -958,6 +960,9 @@ typedef struct JSAsyncFunctionState {
     /* TimeTravelJS flow serialization: per-flow COW delta of first-write
        records against shared baseline objects (NULL if none) */
     struct TTFlowDelta *tt_delta;
+    /* per-flow suspended machine: the parked TrampFrame chain rooted at
+       this state, with its own arena (NULL if not machine-parked) */
+    struct TTMachine *tt_machine;
     JSStackFrame frame;
     /* arg_buf, var_buf, stack_buf and var_refs follow */
 } JSAsyncFunctionState;
@@ -1500,6 +1505,12 @@ static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier, JSValue
 static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref);
 struct TTFlowDelta;
 static void tt_flow_delta_free(JSRuntime *rt, struct TTFlowDelta *d);
+struct TTMachine;
+static void tt_machine_free(JSRuntime *rt, struct TTMachine *m,
+                            struct JSStackFrame *base_frame);
+static void tt_machine_mark(JSRuntime *rt, struct TTMachine *m,
+                            struct JSStackFrame *base_frame,
+                            JS_MarkFunc *mark_func);
 static void tt_flow_delta_mark(JSRuntime *rt, struct TTFlowDelta *d,
                                JS_MarkFunc *mark_func);
 static JSValue js_new_promise_capability(JSContext *ctx,
@@ -6847,6 +6858,12 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                edges of the state and must be visible to the collector */
             if (s->tt_delta)
                 tt_flow_delta_mark(rt, s->tt_delta, mark_func);
+            /* TimeTravelJS: a per-flow suspended machine hangs its parked
+               TrampFrame chain off the base state; the arena frames' owned
+               slots are GC edges of the state (heap frames in the chain
+               mark through their own states above) */
+            if (s->tt_machine)
+                tt_machine_mark(rt, s->tt_machine, &s->frame, mark_func);
         }
         break;
     case JS_GC_OBJ_TYPE_SHAPE:
@@ -18998,7 +19015,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
    interpreter state. Resuming is a fresh call with JS_CALL_FLAG_TT_RESUME. */
 #define TT_STEP_CHECK() do {                                     \
         if (unlikely(rt->tt_step_enabled)) {                     \
-            int tt_r_ = js_tt_step_check(ctx, sf, b, pc);        \
+            int tt_r_;                                           \
+            rt->tt_step_sp = sp;                                 \
+            tt_r_ = js_tt_step_check(ctx, sf, b, pc);            \
+            rt->tt_step_sp = NULL;                               \
             if (unlikely(tt_r_)) {                               \
                 if (tt_r_ == 2) {                                \
                     sf->cur_pc = pc;                             \
@@ -24729,6 +24749,13 @@ static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
 
 static void __async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
 {
+    if (s->tt_machine) {
+        /* dismantle the parked chain first: arena frames' owned values
+           free while the nested states they reference (via this frame's
+           still-live stack) can be safely released */
+        tt_machine_free(rt, s->tt_machine, &s->frame);
+        s->tt_machine = NULL;
+    }
     /* cannot close the closure variables here because it would
        potentially modify the object graph */
     if (!s->is_completed) {
@@ -42340,6 +42367,139 @@ int JS_TTFlowDeltaCount(JSContext *ctx, JSValueConst flow)
     return st->tt_delta ? (int)st->tt_delta->count : 0;
 }
 
+/* -- per-flow suspended machines ------------------------------------------ */
+
+/* A suspended machine as a first-class value: one flow's parked TrampFrame
+   chain with its OWN frame arena, so any number of machines can be
+   suspended in a runtime at once and resumed in any order (a shared bump
+   arena would be clobbered by out-of-LIFO resumes). The runtime's
+   arena/park fields act as the ACTIVE machine's registers -- installed
+   around a resume, captured back at a park. The legacy host-entered
+   machine (JS_TTCallStart/Args/Resume) keeps using the runtime fields
+   directly, unchanged. */
+typedef struct TTMachine {
+    JSStackFrame *parked_frame;    /* innermost parked frame */
+    JSStackFrame *base_frame;      /* the flow base's frame (outermost) */
+    uint8_t *arena_base, *arena_top, *arena_limit;
+} TTMachine;
+
+typedef struct TTMachineSaved {
+    uint8_t *arena_base, *arena_top, *arena_limit;
+    JSStackFrame *parked_frame, *stack_frame;
+} TTMachineSaved;
+
+static TTMachine *tt_machine_new(JSContext *ctx)
+{
+    TTMachine *m = js_mallocz(ctx, sizeof(*m));
+    if (!m)
+        return NULL;
+    m->arena_base = js_malloc(ctx, TT_FRAME_ARENA_SIZE);
+    if (!m->arena_base) {
+        js_free(ctx, m);
+        return NULL;
+    }
+    m->arena_top = m->arena_base;
+    m->arena_limit = m->arena_base + TT_FRAME_ARENA_SIZE;
+    return m;
+}
+
+/* make the machine's arena and chain the runtime's active ones */
+static void tt_machine_install(JSRuntime *rt, TTMachine *m, TTMachineSaved *sv)
+{
+    sv->arena_base = rt->tt_arena_base;
+    sv->arena_top = rt->tt_arena_top;
+    sv->arena_limit = rt->tt_arena_limit;
+    sv->parked_frame = rt->tt_parked_frame;
+    sv->stack_frame = rt->current_stack_frame;
+    rt->tt_arena_base = m->arena_base;
+    rt->tt_arena_top = m->arena_top;
+    rt->tt_arena_limit = m->arena_limit;
+    rt->tt_parked_frame = m->parked_frame;
+    rt->current_stack_frame = m->parked_frame;
+}
+
+/* capture the (possibly re-parked) machine back out of the runtime and
+   restore what the host had */
+static void tt_machine_capture(JSRuntime *rt, TTMachine *m, TTMachineSaved *sv)
+{
+    m->arena_base = rt->tt_arena_base;
+    m->arena_top = rt->tt_arena_top;
+    m->arena_limit = rt->tt_arena_limit;
+    m->parked_frame = rt->tt_parked_frame;
+    rt->tt_arena_base = sv->arena_base;
+    rt->tt_arena_top = sv->arena_top;
+    rt->tt_arena_limit = sv->arena_limit;
+    rt->tt_parked_frame = sv->parked_frame;
+    rt->current_stack_frame = sv->stack_frame;
+}
+
+/* bump-allocate one frame in the machine's own arena (tt_arena_push's twin) */
+static JSStackFrame *tt_machine_arena_push(JSContext *ctx, TTMachine *m,
+                                           size_t val_count, size_t ref_count,
+                                           JSValue **pvals)
+{
+    size_t size = sizeof(JSStackFrame) + sizeof(JSValue) * val_count +
+        sizeof(JSVarRef *) * ref_count;
+    uint8_t *base = m->arena_top;
+    JSStackFrame *sf;
+    size = (size + 15) & ~(size_t)15;
+    if (size > (size_t)(m->arena_limit - base)) {
+        JS_ThrowStackOverflow(ctx);
+        return NULL;
+    }
+    m->arena_top = base + size;
+    sf = (JSStackFrame *)base;
+    *pvals = (JSValue *)(sf + 1);
+    return sf;
+}
+
+/* dismantle an un-resumed parked chain: mirror the engine's pop for each
+   arena frame, innermost first -- close its cells (close_var_ref dups, so
+   the range free below stays balanced), free its owned values -- then
+   release the arena. Heap frames belong to their states and free through
+   the normal state teardown. */
+static void tt_machine_free(JSRuntime *rt, TTMachine *m,
+                            JSStackFrame *base_frame)
+{
+    JSStackFrame *sf = m->parked_frame;
+    while (sf && sf != base_frame) {
+        JSStackFrame *prev = sf->prev_frame;
+        if (!(sf->js_mode & JS_MODE_ASYNC)) {
+            JSObject *fo = JS_VALUE_GET_OBJ(sf->cur_func);
+            JSFunctionBytecode *b = fo->u.func.function_bytecode;
+            JSValue *pval;
+            if (b->var_ref_count)
+                close_var_refs(rt, b, sf);
+            for (pval = sf->tt_frame_base; pval < sf->cur_sp; pval++)
+                JS_FreeValueRT(rt, *pval);
+        }
+        sf = prev;
+    }
+    js_free_rt(rt, m->arena_base);
+    js_free_rt(rt, m);
+}
+
+/* GC edge enumeration for a suspended machine: every owned slot of its
+   arena frames is a reference the base state holds (heap frames in the
+   chain mark through their own states; cur_func borrows the parent's
+   callee slot; frame var_refs[] stay weak, as on live frames). While the
+   machine is INSTALLED and running, parked_frame is cleared and nothing
+   marks -- a running chain is C-stack rooted, exactly like the legacy
+   host-entered machine. */
+static void tt_machine_mark(JSRuntime *rt, struct TTMachine *m,
+                            JSStackFrame *base_frame, JS_MarkFunc *mark_func)
+{
+    JSStackFrame *sf = m->parked_frame;
+    while (sf && sf != base_frame) {
+        if (!(sf->js_mode & JS_MODE_ASYNC) && sf->cur_sp) {
+            JSValue *pval;
+            for (pval = sf->tt_frame_base; pval < sf->cur_sp; pval++)
+                JS_MarkValue(rt, *pval, mark_func);
+        }
+        sf = sf->prev_frame;
+    }
+}
+
 /* -- serializer (write side) ---------------------------------------------- */
 
 typedef struct TTFlowWrRec {
@@ -42367,6 +42527,10 @@ typedef struct TTFlowWr {
     BOOL machine;             /* a parked chain travels in these bytes */
     BOOL forking;             /* in-heap clone: bytecode shares by refcount,
                                  so baseline membership is not required */
+    /* chain override: a fork taken from the RUNNING machine (JS_TTForkHere)
+       walks from the live innermost frame instead of a parked handle */
+    JSStackFrame *chain_innermost;
+    uint8_t *chain_arena_top;
     JSAtom *atoms;            /* private atom table (borrowed from heap) */
     uint32_t atom_count, atom_size;
     TTPtrMap atom_map;        /* JSAtomStruct* -> atom-table idx + 1 */
@@ -42382,11 +42546,15 @@ static JSValue *wr_frame_owned_start(TTFlowWrFrame *f)
     return f->owner ? f->sf->tt_frame_base : f->sf->arg_buf;
 }
 
-/* TRUE if the machine's parked chain runs through this state's frame:
-   the flow is suspended mid-call (EXECUTING), parked by the step hook */
+/* TRUE if the flow is suspended mid-call (EXECUTING) with its chain intact:
+   either it owns a first-class machine handle, or the legacy host-entered
+   machine's parked chain runs through its frame */
 static BOOL tt_flow_base_is_parked(JSRuntime *rt, JSAsyncFunctionState *st)
 {
-    JSStackFrame *sf = rt->tt_parked_frame;
+    JSStackFrame *sf;
+    if (st->tt_machine)
+        return TRUE;
+    sf = rt->tt_parked_frame;
     while (sf) {
         if (sf == &st->frame)
             return TRUE;
@@ -42527,7 +42695,22 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
     JSRuntime *rt = w->ctx->rt;
     JSStackFrame *chain[256];
     int n = 0, i;
-    JSStackFrame *sf = rt->tt_parked_frame;
+    JSStackFrame *sf;
+    uint8_t *chain_top;
+
+    /* where this flow's chain lives: an explicit override (forking the
+       RUNNING machine from the step hook), the flow's own machine handle,
+       or the legacy host-entered machine on the runtime registers */
+    if (w->chain_innermost) {
+        sf = w->chain_innermost;
+        chain_top = w->chain_arena_top;
+    } else if (base->tt_machine) {
+        sf = base->tt_machine->parked_frame;
+        chain_top = base->tt_machine->arena_top;
+    } else {
+        sf = rt->tt_parked_frame;
+        chain_top = rt->tt_arena_top;
+    }
 
     while (sf && sf != &base->frame) {
         if (n >= (int)countof(chain)) {
@@ -42638,7 +42821,7 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
             size = (size + 15) & ~(size_t)15;
             expect = (uint8_t *)f + size;
         }
-        if (expect && expect != rt->tt_arena_top) {
+        if (expect && expect != chain_top) {
             JS_ThrowTypeError(w->ctx, "flow serialization: arena extent does "
                               "not end at the parked top");
             return -1;
@@ -43102,7 +43285,7 @@ static int wr_enumerate(TTFlowWr *w, JSAsyncFunctionState *base,
     JSContext *ctx = w->ctx;
     uint32_t i, k;
 
-    if (tt_flow_base_is_parked(ctx->rt, base)) {
+    if (w->chain_innermost || tt_flow_base_is_parked(ctx->rt, base)) {
         if (wr_register_chain(w, base))
             return -1;
     }
@@ -43590,7 +43773,8 @@ typedef struct TTFlowRd {
     uint32_t frame_count;
     uint32_t chain_count;     /* leading chained frames (machine extent) */
     uint8_t machine;
-    uint8_t *arena_saved_top; /* error unwind: pre-rebuild arena top */
+    TTMachine *m;             /* the rebuilt chain's own machine (owned until
+                                 the base state adopts it) */
 } TTFlowRd;
 
 static JSFunctionBytecode *rd_fn(TTFlowRd *r, uint32_t fn_id)
@@ -43985,9 +44169,9 @@ static int rd_set_proto(TTFlowRd *r, JSValueConst obj)
 }
 
 /* error path: dismantle the arena frames built so far -- their owned live
-   slots plus any cur_func not yet converted to the engine's borrow -- and
-   restore the arena top (memory stays mapped; late free_var_ref calls that
-   clear frame slots remain safe) */
+   slots plus any cur_func not yet converted to the engine's borrow. The
+   machine's arena memory stays mapped until after rd_release: late
+   free_var_ref calls clear weak slots inside these frames. */
 static void rd_unwind_arena(TTFlowRd *r)
 {
     uint32_t i;
@@ -44002,10 +44186,6 @@ static void rd_unwind_arena(TTFlowRd *r)
             if (!fe->aux_i)   /* aux_i = 1 once cur_func became a borrow */
                 JS_FreeValue(r->ctx, fe->sf->cur_func);
         }
-    }
-    if (r->rt->tt_arena_base) {
-        r->rt->tt_arena_top = r->arena_saved_top ? r->arena_saved_top
-                                                 : r->rt->tt_arena_base;
     }
 }
 
@@ -44036,7 +44216,6 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
     r->bl = bl;
     r->rd.ptr = buf;
     r->rd.end = buf + len;
-    r->arena_saved_top = rt->tt_arena_top;
 
     /* ---- header ---- */
     {
@@ -44054,11 +44233,8 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
         goto fail;
     }
     r->machine = (tt_rd_leb(&r->rd) & TT_FLOWF_MACHINE) != 0;
-    if (r->machine && rt->tt_parked_frame) {
-        JS_ThrowTypeError(ctx, "flow bytes: a machine is already parked in "
-                          "this runtime");
-        goto fail;
-    }
+    /* a machine chain rebuilds into its OWN per-flow arena: any number of
+       parked machines coexist in one runtime, so there is no busy-guard */
 
     /* ---- private atoms ---- */
     r->atom_count = tt_rd_leb(&r->rd);
@@ -44388,10 +44564,18 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
                 JS_ThrowTypeError(ctx, "flow bytes: bad stack extent");
                 goto fail;
             }
-            sf = tt_arena_push(rt, val_count, b->var_ref_count, &vals);
+            if (!r->m) {
+                /* the chain's frames live in this flow's own arena */
+                r->m = tt_machine_new(ctx);
+                if (!r->m) {
+                    JS_FreeValue(ctx, f);
+                    goto fail;
+                }
+            }
+            sf = tt_machine_arena_push(ctx, r->m, val_count, b->var_ref_count,
+                                       &vals);
             if (!sf) {
                 JS_FreeValue(ctx, f);
-                JS_ThrowStackOverflow(ctx);
                 goto fail;
             }
             sf->js_mode = b->js_mode;
@@ -44876,11 +45060,20 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
         }
     }
 
-    /* ---- stage the transplanted machine: the rebuilt chain becomes the
-       runtime's parked chain, resumable with JS_TTFlowResumeParked ---- */
+    /* ---- adopt the transplanted machine: the rebuilt chain becomes this
+       flow's OWN suspended machine (a first-class per-flow value),
+       resumable any time with JS_TTFlowResumeParked. Any number of flows
+       can hold parked machines in one runtime at once. ---- */
     if (r->machine) {
-        rt->tt_parked_frame = r->frames[r->chain_count - 1].sf;
-        rt->current_stack_frame = rt->tt_parked_frame;
+        if (!r->m) {          /* an all-heap chain still gets its handle */
+            r->m = tt_machine_new(ctx);
+            if (!r->m)
+                goto fail;
+        }
+        r->m->parked_frame = r->frames[r->chain_count - 1].sf;
+        r->m->base_frame = &base->frame;
+        base->tt_machine = r->m;
+        r->m = NULL;
     }
 
     /* ---- reconciliation: keep the graph, drop construction refs ---- */
@@ -44898,6 +45091,13 @@ fail:
     JS_FreeValue(ctx, root_val);
     rd_unwind_arena(r);
     rd_release(r);
+    if (r->m) {
+        /* the un-adopted machine: its chain was already dismantled above
+           (values freed, weak slots cleared by rd_release) -- raw-free the
+           arena and the handle */
+        js_free_rt(rt, r->m->arena_base);
+        js_free_rt(rt, r->m);
+    }
     return NULL;
 }
 
@@ -44919,7 +45119,17 @@ typedef struct TTForkCtx {
     JSAsyncFunctionState **clone_st;
     /* per frame-table entry: the sibling frame */
     JSStackFrame **clone_frame;
+    /* machine-parked parent: the sibling chain's own machine (owned until
+       the sibling base adopts it) */
+    TTMachine *m;
 } TTForkCtx;
+
+/* the sibling counterpart of wr_frame_owned_start() */
+static JSValue *fork_frame_owned_start(TTForkCtx *fk, uint32_t i)
+{
+    return fk->w->frames[i].owner ? fk->clone_frame[i]->tt_frame_base
+                                  : fk->clone_frame[i]->arg_buf;
+}
 
 /* map a live parent value to the sibling's: baseline and immutable values
    share, private records map to their clones; returns an owned reference */
@@ -45088,9 +45298,16 @@ static void fork_release(TTForkCtx *fk)
 }
 
 /* fork_flow(): clone 'base'+'root' (a suspended generator flow) inside the
-   same runtime. Returns the sibling's handle. */
+   same runtime. Yield-suspended flows clone their state graph; machine-
+   parked flows (a handle, the legacy parked machine, or -- via the chain
+   override -- the RUNNING machine at a step point) additionally rebuild
+   the parked TrampFrame chain in the sibling's own arena, so the sibling
+   arrives as an independently suspended machine. Returns the sibling's
+   handle. */
 static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
-                         JSValueConst root)
+                         JSValueConst root,
+                         JSStackFrame *chain_innermost,
+                         uint8_t *chain_arena_top)
 {
     TTFlowWr w_s, *w = &w_s;
     TTForkCtx fk_s, *fk = &fk_s;
@@ -45100,16 +45317,12 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
     if (!ctx->rt->tt_flow_baseline) {
         return JS_ThrowTypeError(ctx, "flow fork: no baseline captured");
     }
-    if (tt_flow_base_is_parked(ctx->rt, base)) {
-        return JS_ThrowTypeError(ctx, "flow fork: a machine-parked flow "
-                                 "cannot fork in place (one parked machine "
-                                 "per runtime); serialize it into another "
-                                 "runtime instead");
-    }
     memset(w, 0, sizeof(*w));
     w->ctx = ctx;
     w->bl = ctx->rt->tt_flow_baseline;
     w->forking = TRUE;
+    w->chain_innermost = chain_innermost;
+    w->chain_arena_top = chain_arena_top;
     memset(fk, 0, sizeof(*fk));
     fk->ctx = ctx;
     fk->w = w;
@@ -45231,12 +45444,79 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
             break;
         }
     }
-    /* frames (all state-owned here: machine-parked forks are refused) */
+    /* frames: state-owned frames map to their clone states; arena frames
+       of a machine-parked chain rebuild in the sibling's OWN arena with
+       identical geometry, so every parent-relative offset (arg windows,
+       receivers, open-cell slots) transfers verbatim. Chain order puts
+       each parent at i-1, already cloned. */
     for (i = 0; i < w->frame_count; i++) {
-        JSAsyncFunctionState *src =
-            container_of(w->frames[i].sf, JSAsyncFunctionState, frame);
-        uint32_t idx = tt_ptrmap_get(&w->map, src);
-        fk->clone_frame[i] = &fk->clone_st[idx - 1]->frame;
+        if (w->frames[i].owner == 0) {
+            JSAsyncFunctionState *src =
+                container_of(w->frames[i].sf, JSAsyncFunctionState, frame);
+            uint32_t idx = tt_ptrmap_get(&w->map, src);
+            fk->clone_frame[i] = &fk->clone_st[idx - 1]->frame;
+        } else {
+            JSStackFrame *src = w->frames[i].sf;
+            JSObject *fo = JS_VALUE_GET_OBJ(src->cur_func);
+            JSFunctionBytecode *b = fo->u.func.function_bytecode;
+            JSStackFrame *nsf;
+            JSValue *vals;
+            JSValue *pstart, *cstart;
+            size_t val_count =
+                (size_t)(src->arg_buf == src->tt_frame_base ? b->arg_count
+                                                            : 0) +
+                b->var_count + b->stack_size;
+            uint32_t k;
+            if (!fk->m) {
+                fk->m = tt_machine_new(ctx);
+                if (!fk->m)
+                    goto out;
+            }
+            nsf = tt_machine_arena_push(ctx, fk->m, val_count,
+                                        b->var_ref_count, &vals);
+            if (!nsf)
+                goto out;
+            nsf->js_mode = src->js_mode;
+            nsf->cur_func = JS_UNDEFINED; /* borrow, bound after payloads */
+            nsf->cur_pc = src->cur_pc;    /* same bytecode: copies verbatim */
+            nsf->cur_sp = vals + (src->cur_sp - src->tt_frame_base);
+            nsf->tt_frame_kind = src->tt_frame_kind;
+            nsf->tt_call_argc = src->tt_call_argc;
+            nsf->tt_this = JS_UNDEFINED;  /* borrow, bound after payloads */
+            nsf->tt_new_target = JS_UNDEFINED;
+            nsf->tt_orig_argc = src->tt_orig_argc;
+            nsf->tt_frame_base = vals;
+            nsf->tt_ctor_this = JS_UNDEFINED;
+            nsf->tt_aux = NULL;
+            nsf->tt_aux_i = src->tt_aux_i;
+            nsf->arg_count = src->arg_count;
+            nsf->var_buf = vals + (src->var_buf - src->tt_frame_base);
+            nsf->var_refs = (JSVarRef **)(vals + val_count);
+            for (k = 0; k < (uint32_t)b->var_ref_count; k++)
+                nsf->var_refs[k] = NULL;
+            for (k = 0; k < (uint32_t)val_count; k++)
+                vals[k] = JS_UNDEFINED;
+            /* the argument window and receiver alias the PARENT's slots,
+               at the very offsets the parent's clone reproduces */
+            pstart = wr_frame_owned_start(&w->frames[i - 1]);
+            cstart = fork_frame_owned_start(fk, i - 1);
+            if (src->tt_orig_argv < pstart ||
+                src->tt_orig_argv + src->tt_orig_argc >
+                    w->frames[i - 1].sf->cur_sp) {
+                JS_ThrowInternalError(ctx, "flow fork: argument window "
+                                      "outside the parent frame");
+                goto out;
+            }
+            nsf->tt_orig_argv = cstart + (src->tt_orig_argv - pstart);
+            nsf->arg_buf = (src->arg_buf == src->tt_frame_base)
+                ? vals : cstart + (src->arg_buf - pstart);
+            nsf->prev_frame = fk->clone_frame[i - 1];
+            nsf->tt_last_line = src->tt_last_line;
+            nsf->tt_pc_lo = src->tt_pc_lo;
+            nsf->tt_pc_hi = src->tt_pc_hi;
+            nsf->tt_prev_off = src->tt_prev_off;
+            fk->clone_frame[i] = nsf;
+        }
     }
 
     /* open cells reattach over the sibling stacks (get_var_ref's rules:
@@ -45271,10 +45551,17 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
         vr->is_detached = FALSE;
         vr->var_ref_idx = src->var_ref_idx;
         vr->stack_frame = reg_sf;
-        vr->pvalue = fk->clone_frame[mem - 1]->arg_buf +
-            (src->pvalue - w->frames[mem - 1].sf->arg_buf);
+        /* the cell's storage slot is owned-start-relative: aliased-arg
+           cells live in the PARENT's block, and the clone reproduces the
+           exact offsets (mirrors the wire format's frame/off pairs) */
+        vr->pvalue = fork_frame_owned_start(fk, mem - 1) +
+            (src->pvalue - wr_frame_owned_start(&w->frames[mem - 1]));
         reg_sf->var_refs[src->var_ref_idx] = vr;
-        js_rc(container_of(reg_sf, JSAsyncFunctionState, frame))->ref_count++;
+        /* get_var_ref()'s rule: only a heap (async-state) frame pins its
+           owner; cells on arena frames close when the frame pops */
+        if (reg_sf->js_mode & JS_MODE_ASYNC)
+            js_rc(container_of(reg_sf, JSAsyncFunctionState,
+                               frame))->ref_count++;
     }
 
     /* pass 2 (relink): fill every sibling from its live parent */
@@ -45441,6 +45728,102 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
         }
     }
 
+    /* arena frame payloads + borrows: every heap frame is filled now, and
+       chain order fills each arena parent before its child, so the borrow
+       of the parent's callee/receiver slot always reads a finished clone */
+    for (i = 0; i < w->frame_count; i++) {
+        JSStackFrame *src, *nsf;
+        JSValue *pstart, *cstart;
+        uint32_t argv_off, k, live;
+        if (w->frames[i].owner != 1)
+            continue;
+        src = w->frames[i].sf;
+        nsf = fk->clone_frame[i];
+        live = (uint32_t)(src->cur_sp - src->tt_frame_base);
+        for (k = 0; k < live; k++) {
+            JSValue v = fork_map_value(fk, src->tt_frame_base[k]);
+            if (JS_IsException(v))
+                goto out;
+            nsf->tt_frame_base[k] = v;
+        }
+        /* the engine's borrows: the callee sits just below the argument
+           window on the parent's stack, the receiver just below that */
+        pstart = wr_frame_owned_start(&w->frames[i - 1]);
+        cstart = fork_frame_owned_start(fk, i - 1);
+        argv_off = (uint32_t)(src->tt_orig_argv - pstart);
+        if (argv_off < 1 ||
+            memcmp(&pstart[argv_off - 1], &src->cur_func,
+                   sizeof(JSValue)) != 0) {
+            JS_ThrowInternalError(ctx, "flow fork: arena frame function "
+                                  "does not match its call site");
+            goto out;
+        }
+        nsf->cur_func = cstart[argv_off - 1];
+        if (!JS_IsUndefined(src->tt_this)) {
+            if (argv_off < 2 ||
+                memcmp(&pstart[argv_off - 2], &src->tt_this,
+                       sizeof(JSValue)) != 0) {
+                JS_ThrowInternalError(ctx, "flow fork: `this` is not the "
+                                      "parent receiver slot");
+                goto out;
+            }
+            nsf->tt_this = cstart[argv_off - 2];
+        }
+    }
+
+    /* chained heap frames: rebind the in-loop generator splice linkage to
+       the SIBLING's generator objects; the base clone keeps its C-entry
+       shape (yields/returns come back to the host), exactly as a
+       transplanted machine does */
+    for (i = 1; i < w->frame_count; i++) {
+        JSStackFrame *srcf, *nsf;
+        JSGeneratorData *sgd, *ngd = NULL;
+        uint32_t k;
+        if (w->frames[i].owner != 0 || !w->frames[i].chained)
+            continue;
+        srcf = w->frames[i].sf;
+        nsf = fk->clone_frame[i];
+        sgd = srcf->tt_aux;
+        for (k = 0; k < w->rec_count; k++) {
+            if (w->recs[k].kind == TT_REC_GENOBJ &&
+                ((JSObject *)w->recs[k].ptr)->u.generator_data == sgd) {
+                ngd = JS_GetOpaque(fk->clone_v[k], JS_CLASS_GENERATOR);
+                break;
+            }
+        }
+        if (!ngd) {
+            JS_ThrowTypeError(ctx, "flow fork: chained generator object "
+                              "escaped the flow graph");
+            goto out;
+        }
+        nsf->tt_frame_kind = TT_FRAME_GEN;
+        nsf->tt_aux = ngd;
+        nsf->tt_aux_i = srcf->tt_aux_i;
+        nsf->tt_call_argc = srcf->tt_call_argc;
+        nsf->prev_frame = fk->clone_frame[i - 1];
+    }
+
+    /* the sibling adopts its machine: an independently suspended,
+       independently resumable parked chain */
+    if (w->machine) {
+        JSAsyncFunctionState *cbase;
+        uint32_t bidx = tt_ptrmap_get(&w->map, base);
+        uint32_t last = 0;
+        for (i = 0; i < w->frame_count; i++)
+            if (w->frames[i].chained)
+                last = i;
+        if (!fk->m) {         /* an all-heap chain still gets its handle */
+            fk->m = tt_machine_new(ctx);
+            if (!fk->m)
+                goto out;
+        }
+        cbase = fk->clone_st[bidx - 1];
+        fk->m->parked_frame = fk->clone_frame[last];
+        fk->m->base_frame = &cbase->frame;
+        cbase->tt_machine = fk->m;
+        fk->m = NULL;
+    }
+
     /* reconciliation: the handle keeps the graph, construction refs drop */
     {
         uint32_t ridx = tt_ptrmap_get(&w->map, JS_VALUE_GET_PTR(root));
@@ -45448,6 +45831,22 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
     }
 out:
     fork_release(fk);
+    if (fk->m) {
+        /* the fork failed before the sibling adopted its machine: free the
+           half-built chain's owned slots (unfilled ones are UNDEFINED,
+           cur_func/tt_this are borrows) after fork_release cleared the
+           weak cell slots inside these frames */
+        for (i = 0; i < w->frame_count; i++) {
+            JSStackFrame *nsf = fk->clone_frame ? fk->clone_frame[i] : NULL;
+            JSValue *pval;
+            if (w->frames[i].owner != 1 || !nsf)
+                continue;
+            for (pval = nsf->tt_frame_base; pval < nsf->cur_sp; pval++)
+                JS_FreeValue(ctx, *pval);
+        }
+        js_free_rt(ctx->rt, fk->m->arena_base);
+        js_free_rt(ctx->rt, fk->m);
+    }
     tt_ptrmap_free(ctx, &w->map);
     tt_ptrmap_free(ctx, &w->frame_map);
     tt_ptrmap_free(ctx, &w->atom_map);
@@ -45493,14 +45892,17 @@ JSValue JS_TTFlowDeserialize(JSContext *ctx, const uint8_t *buf, size_t len)
     return root;
 }
 
-/* Resume a transplanted machine-parked flow: completes the next() that the
-   park interrupted in the source process. cmd 0 continues, cmd 1 aborts
-   (an Interrupted error unwinds the whole chain, completing the flow --
-   the way to discard a transplanted parked flow without leaking it).
-   *pdone follows the generator protocol (0 yielded, 1 done, 2 yield*
-   delegation); *pparked = 1 means a step handler re-parked the machine --
-   call again to continue. Afterwards the flow is an ordinary suspended
-   generator: drive it with next(). */
+/* Resume a flow suspended as a machine handle: completes the next() the
+   park interrupted (in this or another process). cmd 0 continues, cmd 1
+   aborts (an Interrupted error unwinds the whole chain, completing the
+   flow -- the way to discard a parked flow without leaking it). *pdone
+   follows the generator protocol (0 yielded, 1 done, 2 yield* delegation);
+   *pparked = 1 means a step handler re-parked the machine back into its
+   handle -- call again to continue. Afterwards the flow is an ordinary
+   suspended generator: drive it with next(). The machine's own arena and
+   park registers are installed around the run and captured back at a
+   re-park, so any number of suspended machines resume independently --
+   even while the legacy host-entered machine is parked. */
 JSValue JS_TTFlowResumeParked(JSContext *ctx, JSValueConst flow, int cmd,
                               int *pdone, int *pparked)
 {
@@ -45509,6 +45911,9 @@ JSValue JS_TTFlowResumeParked(JSContext *ctx, JSValueConst flow, int cmd,
     JSAsyncFunctionState *s;
     JSValue func_ret, ret;
     BOOL gdone = TRUE;
+    TTMachine *m;
+    TTMachineSaved sv;
+    BOOL saved_park_ok;
 
     *pdone = 1;
     *pparked = 0;
@@ -45520,23 +45925,45 @@ JSValue JS_TTFlowResumeParked(JSContext *ctx, JSValueConst flow, int cmd,
     if (!gd || !gd->func_state || gd->state != JS_GENERATOR_STATE_EXECUTING)
         return JS_ThrowTypeError(ctx, "flow is not machine-parked");
     s = gd->func_state;
-    if (!rt->tt_parked_frame || !tt_flow_base_is_parked(rt, s))
+    m = s->tt_machine;
+    if (!m) {
+        if (tt_flow_base_is_parked(rt, s))
+            return JS_ThrowTypeError(ctx, "flow is parked inside a live "
+                                     "machine; resume it with "
+                                     "JS_TTCallResume instead");
         return JS_ThrowTypeError(ctx, "flow is not the parked machine");
+    }
+    if (!m->parked_frame)
+        return JS_ThrowTypeError(ctx, "flow's machine is already running");
     if (s->frame.tt_frame_kind != TT_FRAME_ENTRY ||
         s->frame.prev_frame != NULL)
-        return JS_ThrowTypeError(ctx, "flow is parked inside a live machine; "
-                                 "resume it with JS_TTCallResume instead");
+        return JS_ThrowInternalError(ctx, "parked machine base is not an "
+                                     "entry frame");
     if (js_check_stack_overflow(rt, 0))
         return JS_ThrowStackOverflow(ctx);
+    /* swap the machine's registers in (the host's -- possibly a parked
+       legacy machine's -- are saved either way) */
+    saved_park_ok = rt->tt_park_ok;
+    tt_machine_install(rt, m, &sv);
+    m->parked_frame = NULL;   /* running: GC must not walk the stale chain */
     rt->tt_park_ok = TRUE;
     rt->tt_park_abort = (cmd == 1);
     func_ret = JS_CallInternal(ctx, JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED,
                                0, NULL, JS_CALL_FLAG_TT_RESUME);
     if (rt->tt_parked_frame) {
+        /* re-parked: capture the machine back into its handle */
+        tt_machine_capture(rt, m, &sv);
+        rt->tt_park_ok = saved_park_ok;
         *pparked = 1;
         return JS_UNDEFINED;
     }
-    rt->tt_park_ok = FALSE;
+    /* ran to a yield / completion / throw: the chain unwound in full and
+       the machine is spent -- the flow is an ordinary generator again */
+    tt_machine_capture(rt, m, &sv);
+    rt->tt_park_ok = saved_park_ok;
+    rt->tt_park_abort = FALSE;
+    s->tt_machine = NULL;
+    tt_machine_free(rt, m, &s->frame);    /* empty chain: frees the arena */
     func_ret = async_func_finish(ctx, s, func_ret);
     ret = js_generator_resume_post(ctx, gd, func_ret, &gdone);
     *pdone = (int)gdone;
@@ -45546,15 +45973,96 @@ JSValue JS_TTFlowResumeParked(JSContext *ctx, JSValueConst flow, int cmd,
 /* Fork a suspended flow into a concurrent sibling: baseline entities are
    shared (a reference each), all flow-private state -- the state chain,
    parked frames, private closures and cells, the COW delta -- deep-copies.
-   Both flows resume and diverge independently; each applies its own delta
-   on check-in. The parent must be checked out (as for serialization);
-   the sibling arrives checked out. */
+   Works on yield-suspended flows AND machine-parked ones (a per-flow
+   handle or the legacy parked machine): a parked TrampFrame chain clones
+   into the sibling's own arena, arriving as an independently suspended
+   machine. Both flows resume and diverge independently; each applies its
+   own delta on check-in. The parent must be checked out (as for
+   serialization); the sibling arrives checked out. */
 JSValue JS_TTFlowFork(JSContext *ctx, JSValueConst flow)
 {
     JSAsyncFunctionState *st = tt_flow_state_of(ctx, flow);
     if (!st)
         return JS_EXCEPTION;
-    return fork_flow(ctx, st, flow);
+    return fork_flow(ctx, st, flow, NULL, NULL);
+}
+
+/* TRUE if the flow is suspended as a parked machine (its own handle or the
+   legacy host-entered park running through it) -- i.e. the resume that
+   applies is JS_TTFlowResumeParked / JS_TTCallResume, not next(). */
+JS_BOOL JS_TTFlowParked(JSContext *ctx, JSValueConst flow)
+{
+    JSGeneratorData *gd;
+    if (JS_VALUE_GET_TAG(flow) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_OBJ(flow)->class_id != JS_CLASS_GENERATOR)
+        return FALSE;
+    gd = JS_GetOpaque(flow, JS_CLASS_GENERATOR);
+    if (!gd || !gd->func_state || gd->state != JS_GENERATOR_STATE_EXECUTING)
+        return FALSE;
+    return tt_flow_base_is_parked(ctx->rt, gd->func_state);
+}
+
+/* Fork the RUNNING machine at the current step point. Callable ONLY from
+   inside the step handler (the transient sp published by TT_STEP_CHECK is
+   the running frame's only stack extent). The flow forked is the OUTERMOST
+   generator on the running chain; frames below it (the driver loop, the
+   host entry) stay put. Returns the fork-arm: an independently suspended
+   machine handle that resumes from this very opcode with
+   JS_TTFlowResumeParked. The continue-arm is the running machine itself --
+   return 0 from the handler to let it run on, or 2 to park it (resume
+   with JS_TTCallResume). This is OP_if_true on an unknown: both arms run. */
+JSValue JS_TTForkHere(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *inner, *sf, *base_sf = NULL;
+    JSAsyncFunctionState *base;
+    JSValue root = JS_UNDEFINED;
+    JSValue *saved_cur_sp;
+    JSValue result;
+
+    if (!rt->tt_step_sp)
+        return JS_ThrowTypeError(ctx, "JS_TTForkHere is only callable from "
+                                 "inside the step handler");
+    inner = rt->current_stack_frame;
+    if (!inner)
+        return JS_ThrowInternalError(ctx, "fork here: no running frame");
+    for (sf = inner; sf; sf = sf->prev_frame) {
+        if (sf->js_mode & JS_MODE_ASYNC)
+            base_sf = sf;
+    }
+    if (!base_sf)
+        return JS_ThrowTypeError(ctx, "fork here: no generator flow on the "
+                                 "running chain");
+    base = container_of(base_sf, JSAsyncFunctionState, frame);
+    /* the flow's host handle: the generator object the driver iterates,
+       found by value on the frames below the base */
+    for (sf = base_sf->prev_frame; sf && JS_IsUndefined(root);
+         sf = sf->prev_frame) {
+        JSValue *pv;
+        if ((sf->js_mode & JS_MODE_ASYNC) || !sf->cur_sp)
+            continue;
+        for (pv = sf->tt_frame_base; pv < sf->cur_sp; pv++) {
+            if (JS_VALUE_GET_TAG(*pv) == JS_TAG_OBJECT &&
+                JS_VALUE_GET_OBJ(*pv)->class_id == JS_CLASS_GENERATOR) {
+                JSGeneratorData *gd = JS_GetOpaque(*pv, JS_CLASS_GENERATOR);
+                if (gd && gd->func_state == base) {
+                    root = *pv;             /* borrowed from the frame slot */
+                    break;
+                }
+            }
+        }
+    }
+    if (JS_IsUndefined(root))
+        return JS_ThrowTypeError(ctx, "fork here: the flow's generator "
+                                 "handle is not on the driver frames");
+    /* the innermost frame is mid-opcode: its sp lives only in the step
+       hook's transient. Publish it for the clone walk, restore after --
+       a running frame must never keep a stale cur_sp. */
+    saved_cur_sp = inner->cur_sp;
+    inner->cur_sp = rt->tt_step_sp;
+    result = fork_flow(ctx, base, root, inner, rt->tt_arena_top);
+    inner->cur_sp = saved_cur_sp;
+    return result;
 }
 /*---------------------------------------------------------------------------*/
 /* end TimeTravelJS flow serialization                                        */
@@ -70161,6 +70669,7 @@ void JS_TTResetExecState(JSContext *ctx)
     JSRuntime *rt = ctx->rt;
     rt->current_stack_frame = NULL;
     rt->tt_parked_frame = NULL;
+    rt->tt_step_sp = NULL;
     rt->tt_loop_depth = 0;
     rt->tt_park_ok = FALSE;
     rt->tt_park_abort = FALSE;
@@ -70271,18 +70780,16 @@ JSValue JS_TTCallResume(JSContext *ctx, int cmd, int *pparked)
 }
 
 /* Write a frame local (argument, local variable, or closure capture) at the
-   given bytecode-frame level. Returns TRUE if the binding was found. Used by
-   the debugger's edit-and-continue: rebinding a name must reach the live
-   frame slot, not a copy. */
-JS_BOOL JS_TTSetLocal(JSContext *ctx, int level, JSAtom name, JSValueConst value)
+   given bytecode-frame level, starting the walk at `sf`. The core of the
+   debugger's edit-and-continue: rebinding a name must reach the live frame
+   slot, not a copy. */
+static JS_BOOL tt_set_local_from(JSContext *ctx, JSStackFrame *sf, int level,
+                                 JSAtom name, JSValueConst value)
 {
-    JSRuntime *rt = ctx->rt;
-    JSStackFrame *sf;
     JSFunctionBytecode *b;
     JSObject *p;
     int i;
 
-    sf = rt->current_stack_frame;
     while (sf && (tt_frame_bytecode(sf) == NULL))
         sf = sf->prev_frame;
     while (sf && level > 0) {
@@ -70327,6 +70834,32 @@ JS_BOOL JS_TTSetLocal(JSContext *ctx, int level, JSAtom name, JSValueConst value
         }
     }
     return FALSE;
+}
+
+JS_BOOL JS_TTSetLocal(JSContext *ctx, int level, JSAtom name, JSValueConst value)
+{
+    return tt_set_local_from(ctx, ctx->rt->current_stack_frame, level, name,
+                             value);
+}
+
+/* The same edit against a flow suspended as a machine handle: the walk
+   starts at the handle's parked innermost frame, so level 0 is the frame
+   the machine will execute next. */
+JS_BOOL JS_TTFlowSetLocal(JSContext *ctx, JSValueConst flow, int level,
+                          JSAtom name, JSValueConst value)
+{
+    JSGeneratorData *gd;
+    struct TTMachine *m;
+    if (JS_VALUE_GET_TAG(flow) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_OBJ(flow)->class_id != JS_CLASS_GENERATOR)
+        return FALSE;
+    gd = JS_GetOpaque(flow, JS_CLASS_GENERATOR);
+    if (!gd || !gd->func_state)
+        return FALSE;
+    m = gd->func_state->tt_machine;
+    if (!m || !m->parked_frame)
+        return FALSE;
+    return tt_set_local_from(ctx, m->parked_frame, level, name, value);
 }
 
 /* ===================== TimeTravelJS __wasi__ host interface ==========
