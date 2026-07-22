@@ -430,6 +430,8 @@ JSValue JS_TTMakeTagged(JSContext *ctx, JSValue payload, void *note);
 JSValue JS_TTPayload(JSContext *ctx, JSValueConst v);   /* dup of payload */
 void   *JS_TTNote(JSValueConst v);                      /* borrowed */
 JS_BOOL JS_TTIsTagged(JSValueConst v);
+int     JS_TTNarrow(JSContext *ctx, JSValueConst tagged, /* replace pair in place */
+                    JSValue new_payload, void *new_note);
 void JS_TTSetNoteHooks(JSRuntime*, JSTTNoteCloneFn*, JSTTNoteSerializeFn*,
                        JSTTNoteDeserializeFn*, JSTTNoteFreeFn*);
 ```
@@ -455,8 +457,17 @@ Graph integration follows the existing rules exactly:
 - **Refusals are loud.** A non-NULL note refuses fork without a clone
   hook and refuses the wire without the serialize (write side) or
   deserialize (read side) hook, with the missing hook named; a NULL note
-  never needs any hook. Payload-less mutation of the pair is impossible
-  by construction (the API has no setter).
+  never needs any hook.
+- **Narrowing.** `JS_TTNarrow(tagged, new_payload, new_note)` replaces the
+  pair in place: it frees the old payload and runs `NoteFree` on the old
+  note exactly once, taking ownership of the new pair (the
+  `JS_TTMakeTagged` convention). It refuses loudly on a non-tagged value,
+  freeing the caller's new pair so the error path leaks nothing. It
+  touches **only** its argument — no traversal, no aliasing — so narrowing
+  one fork arm's already-cloned tagged value cannot reach another arm's.
+  That isolation is what lets a host make a forked arm take a different
+  path (a narrowed payload evaluates a later branch differently) without
+  disturbing the primary arm's value.
 
 The taggedtest harness drives the oracle: accessor API, a
 payload↔tagged GC cycle, two forked arms with independent payload copies

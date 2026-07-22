@@ -2327,6 +2327,56 @@ static int cmd_taggedtest(void)
         JS_FreeValue(ctx, p2);
     }
     {
+        /* --- JS_TTNarrow: replace the pair in place --------------------- */
+        char *N1 = strdup("N-narrow-1"), *N2 = strdup("N-narrow-2");
+        JSValue tn, tn2;
+        int live0;
+        int32_t v = 0;
+        assert(N1 && N2);
+        tg_live += 2;                        /* N1, N2 enter accounting */
+        tn = JS_TTMakeTagged(ctx, JS_NewInt32(ctx, 5), N1);
+        if (JS_IsException(tn))
+            die(ctx, "narrow: make");
+        /* narrow 5/N1 -> 9/N2: old int payload dropped, N1 freed exactly once */
+        live0 = tg_live;
+        if (JS_TTNarrow(ctx, tn, JS_NewInt32(ctx, 9), N2) < 0)
+            die(ctx, "JS_TTNarrow");
+        assert(tg_live == live0 - 1);        /* N1 released; N2 already counted */
+        assert(JS_TTNote(tn) == N2);
+        {
+            JSValue p = JS_TTPayload(ctx, tn);
+            JS_ToInt32(ctx, &v, p);
+            JS_FreeValue(ctx, p);
+            assert(v == 9);
+        }
+        /* independence: narrowing tn does not touch a second tagged value */
+        tn2 = JS_TTMakeTagged(ctx, JS_NewInt32(ctx, 1), NULL);
+        if (JS_IsException(tn2))
+            die(ctx, "narrow: make2");
+        if (JS_TTNarrow(ctx, tn, JS_NewInt32(ctx, 100), NULL) < 0)
+            die(ctx, "JS_TTNarrow 2");       /* frees N2; tn's note now NULL */
+        {
+            JSValue p = JS_TTPayload(ctx, tn2);
+            v = 0; JS_ToInt32(ctx, &v, p);
+            JS_FreeValue(ctx, p);
+            assert(v == 1);                  /* tn2 unchanged */
+        }
+        /* refuse loudly on a non-tagged value, freeing the caller's new pair */
+        {
+            char *NR = strdup("N-refused");
+            JSValue plain = eval_val(ctx, "({})");
+            assert(NR);
+            tg_live++;                       /* NR enters accounting */
+            live0 = tg_live;
+            assert(JS_TTNarrow(ctx, plain, JS_NewInt32(ctx, 7), NR) == -1);
+            assert(tg_live == live0 - 1);    /* NR freed on the refusal path */
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            JS_FreeValue(ctx, plain);
+        }
+        JS_FreeValue(ctx, tn);               /* note already NULL: nothing owed */
+        JS_FreeValue(ctx, tn2);
+    }
+    {
         /* non-tagged probes answer, they do not crash */
         JSValue plain = eval_val(ctx, "({})");
         JSValue e;

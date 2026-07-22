@@ -49150,6 +49150,37 @@ void *JS_TTNote(JSValueConst v)
     return JS_VALUE_GET_OBJ(v)->u.tt_tagged.note;
 }
 
+/* Replace a tagged value's payload and note IN PLACE. Takes ownership of
+   new_payload and new_note (same convention as JS_TTMakeTagged): the old
+   payload is freed and the old note runs through NoteFree exactly once.
+   Refuses loudly on a non-tagged value, freeing the caller's new_payload
+   and new_note so the error path leaks nothing. Touches ONLY `tagged` --
+   no traversal, no aliasing side-effects -- which is what makes it safe to
+   narrow one fork arm's own (already-cloned) tagged value without reaching
+   the other arm's. */
+int JS_TTNarrow(JSContext *ctx, JSValueConst tagged, JSValue new_payload,
+                void *new_note)
+{
+    JSObject *p;
+    if (!JS_TTIsTagged(tagged)) {
+        JS_FreeValue(ctx, new_payload);
+        if (new_note && ctx->rt->tt_note_free)
+            ctx->rt->tt_note_free(ctx->rt, new_note);
+        JS_ThrowTypeError(ctx, "JS_TTNarrow on a non-tagged value");
+        return -1;
+    }
+    p = JS_VALUE_GET_OBJ(tagged);
+    if (p->u.tt_tagged.note) {
+        if (ctx->rt->tt_note_free)
+            ctx->rt->tt_note_free(ctx->rt, p->u.tt_tagged.note);
+        p->u.tt_tagged.note = NULL;
+    }
+    JS_FreeValue(ctx, p->u.tt_tagged.payload);
+    p->u.tt_tagged.payload = new_payload;
+    p->u.tt_tagged.note = new_note;
+    return 0;
+}
+
 /* the UNFORWARDED own-property count of v itself (shape-level; deleted
    slots excluded, fast-array elements not counted; -1 for non-objects).
    For a tagged value this is the WRAPPER's own view -- the JS-visible

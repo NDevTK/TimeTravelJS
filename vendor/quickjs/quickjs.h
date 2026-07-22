@@ -1110,6 +1110,11 @@ JSValue JS_TTPayload(JSContext *ctx, JSValueConst v);
 /* the note pointer (borrowed; NULL if v is not tagged) */
 void *JS_TTNote(JSValueConst v);
 JS_BOOL JS_TTIsTagged(JSValueConst v);
+/* replace a tagged value's payload and note in place; takes ownership of
+   new_payload and new_note. -1 + TypeError (and frees both) if not tagged.
+   Touches only `tagged`, so it is safe to narrow one fork arm's clone. */
+int JS_TTNarrow(JSContext *ctx, JSValueConst tagged, JSValue new_payload,
+                void *new_note);
 /* the UNFORWARDED own-property count of v ITSELF (shape-level; fast-array
    elements not included; -1 if v is not an object). For a tagged value
    this is the WRAPPER's own view -- has/enumerate forwarding makes the
