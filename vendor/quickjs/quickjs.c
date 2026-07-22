@@ -434,6 +434,10 @@ struct JSRuntime {
     JSValue tt_job_vals[4];
     void *tt_job_aux;         /* kind 2: JSAsyncFunctionState* */
     JSContext *tt_job_realm;  /* held ref while parked */
+    /* stackless module evaluation (JS_TTCallStart on a module): the
+       InnerModuleEvaluation DFS as heap state so a module body can park
+       with the dispatch loop as the only C frame */
+    struct TTModEval *tt_modeval;
     /* one-shot defer slot: when set, a BYTECODE getter/setter reached by
        the property machinery is handed back (dup'd into the slot, slot
        cleared) instead of being invoked from C — the dispatch loop then
@@ -36450,6 +36454,460 @@ static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
         assert(stack_top == NULL);
     }
     return JS_DupValue(ctx, m->promise);
+}
+
+/* TimeTravelJS stackless module evaluation ------------------------------
+
+   InnerModuleEvaluation with its recursion converted to an explicit heap
+   stack, so each synchronous module body runs with the dispatch loop as
+   the ONLY C frame below the host entry: a step can park the machine by
+   return in the middle of module top-level code, and JS_TTCallResume
+   rebuilds the frame and continues the DFS where it left off. Used by
+   JS_TTCallStart on a JS_TAG_MODULE value; js_evaluate_module (above)
+   stays for the classic embedder path and dynamic import jobs.
+
+   Bodies with top-level await and C module inits keep the classic C-driven
+   halves (their await continuations already run under the parkable job
+   pump); everything they execute inline is counted by the host as
+   suppressed, never skipped. */
+
+typedef struct TTModEvalFrame {
+    JSModuleDef *m;
+    int child_i;   /* next req_module_entry to visit */
+} TTModEvalFrame;
+
+typedef struct TTModEval {
+    JSContext *ctx;        /* realm evaluation started in (held ref) */
+    JSModuleDef *root;     /* cycle root the promise belongs to */
+    TTModEvalFrame *stack; /* explicit DFS stack */
+    int sp, size;
+    JSModuleDef *scc_top;  /* SCC chain through m->stack_prev */
+    int index;             /* [[DFSIndex]] counter */
+    /* the in-flight synchronous body (set while it runs / is parked) */
+    JSAsyncFunctionState *body;
+    JSModuleDef *body_m;
+    JSValue body_promise;
+} TTModEval;
+
+static void tt_modeval_free(JSRuntime *rt, TTModEval *me)
+{
+    JSContext *ctx = me->ctx;
+    js_free_rt(rt, me->stack);
+    JS_FreeValueRT(rt, me->body_promise);
+    js_free_rt(rt, me);
+    JS_FreeContext(ctx);
+    rt->tt_modeval = NULL;
+}
+
+static int tt_modeval_push(JSContext *ctx, TTModEval *me, JSModuleDef *m)
+{
+    if (me->sp >= me->size) {
+        int nsize = max_int(me->size * 2, 16);
+        TTModEvalFrame *ns = js_realloc(ctx, me->stack,
+                                        sizeof(*ns) * nsize);
+        if (!ns)
+            return -1;
+        me->stack = ns;
+        me->size = nsize;
+    }
+    me->stack[me->sp].m = m;
+    me->stack[me->sp].child_i = 0;
+    me->sp++;
+    return 0;
+}
+
+/* The post-recursion child processing of js_inner_module_evaluation:
+   parent m absorbing completed child m1. Returns -1 with *perr set. */
+static int tt_modeval_post_child(JSContext *ctx, JSModuleDef *m,
+                                 JSModuleDef *m1, JSValue *perr)
+{
+    assert(m1->status == JS_MODULE_STATUS_EVALUATING ||
+           m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+           m1->status == JS_MODULE_STATUS_EVALUATED);
+    if (m1->status == JS_MODULE_STATUS_EVALUATING) {
+        m->dfs_ancestor_index = min_int(m->dfs_ancestor_index,
+                                        m1->dfs_ancestor_index);
+    } else {
+        m1 = m1->cycle_root;
+        assert(m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+               m1->status == JS_MODULE_STATUS_EVALUATED);
+        if (m1->eval_has_exception) {
+            *perr = JS_DupValue(ctx, m1->eval_exception);
+            return -1;
+        }
+    }
+    if (m1->async_evaluation) {
+        m->pending_async_dependencies++;
+        if (js_resize_array(ctx, (void **)&m1->async_parent_modules,
+                            sizeof(m1->async_parent_modules[0]),
+                            &m1->async_parent_modules_size,
+                            m1->async_parent_modules_count + 1)) {
+            *perr = JS_GetException(ctx);
+            return -1;
+        }
+        m1->async_parent_modules[m1->async_parent_modules_count++] = m;
+    }
+    return 0;
+}
+
+/* Pop the completed top frame and feed its module into the parent's
+   post-child half (the code after the recursive call returns). */
+static int tt_modeval_pop(JSContext *ctx, TTModEval *me, JSValue *perr)
+{
+    JSModuleDef *m1 = me->stack[me->sp - 1].m;
+    me->sp--;
+    if (me->sp > 0)
+        return tt_modeval_post_child(ctx, me->stack[me->sp - 1].m, m1, perr);
+    return 0;
+}
+
+/* Start a synchronous module body as an in-loop activation. Returns 1 when
+   the body parked (me->body armed; resume completes it), 0 when it ran to
+   completion and its bookkeeping is done, -1 with *perr set. */
+static int tt_modeval_body_start(JSContext *ctx, TTModEval *me,
+                                 JSModuleDef *m, JSValue *perr)
+{
+    JSRuntime *rt = ctx->rt;
+    JSAsyncFunctionState *s;
+    JSValue promise, raw;
+
+    s = async_func_init(ctx, m->func_obj, JS_UNDEFINED, 0, NULL);
+    if (!s) {
+        *perr = JS_GetException(ctx);
+        return -1;
+    }
+    promise = JS_NewPromiseCapability(ctx, s->resolving_funcs);
+    if (JS_IsException(promise)) {
+        async_func_free(rt, s);
+        *perr = JS_GetException(ctx);
+        return -1;
+    }
+    tt_async_flow_link(ctx, promise, s);
+    rt->tt_park_ok = TRUE;
+    raw = JS_CallInternal(ctx, JS_MKPTR(JS_TAG_INT, s), s->this_val,
+                          JS_UNDEFINED, s->argc, s->frame.arg_buf,
+                          JS_CALL_FLAG_GENERATOR);
+    if (rt->tt_parked_frame) {
+        me->body = s;
+        me->body_m = m;
+        me->body_promise = promise;
+        return 1;
+    }
+    raw = async_func_finish(ctx, s, raw);
+    js_async_function_post(ctx, s, raw);
+    async_func_free(rt, s);
+    {
+        JSPromiseStateEnum state = JS_PromiseState(ctx, promise);
+        if (state == JS_PROMISE_FULFILLED) {
+            JS_FreeValue(ctx, promise);
+        } else if (state == JS_PROMISE_REJECTED) {
+            *perr = JS_PromiseResult(ctx, promise);
+            JS_FreeValue(ctx, promise);
+            return -1;
+        } else {
+            JS_FreeValue(ctx, promise);
+            JS_ThrowTypeError(ctx, "promise is pending");
+            *perr = JS_GetException(ctx);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Drive the DFS until it parks inside a body, fails, or completes the
+   graph. On entry the top frame's pre-order bookkeeping is already done
+   and its next action is visiting child child_i (or, children exhausted,
+   running its body). Returns the root promise (or JS_UNDEFINED while
+   parked with *pparked = 1). */
+static JSValue tt_modeval_run(JSContext *ctx, int *pparked)
+{
+    JSRuntime *rt = ctx->rt;
+    TTModEval *me = rt->tt_modeval;
+    JSValue err;
+    JSModuleDef *m, *m1;
+    TTModEvalFrame *f;
+    int r;
+
+    while (me->sp > 0) {
+        f = &me->stack[me->sp - 1];
+        m = f->m;
+
+        if (f->child_i < m->req_module_entries_count) {
+            m1 = m->req_module_entries[f->child_i].module;
+            f->child_i++;
+            /* the child's pre-order half (the top of the recursive
+               function): early-outs feed post-child directly */
+            if (m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+                m1->status == JS_MODULE_STATUS_EVALUATED) {
+                if (m1->eval_has_exception) {
+                    err = JS_DupValue(ctx, m1->eval_exception);
+                    goto fail;
+                }
+            } else if (m1->status == JS_MODULE_STATUS_EVALUATING) {
+                /* cycle back-edge */
+            } else {
+                assert(m1->status == JS_MODULE_STATUS_LINKED);
+                m1->status = JS_MODULE_STATUS_EVALUATING;
+                m1->dfs_index = me->index;
+                m1->dfs_ancestor_index = me->index;
+                m1->pending_async_dependencies = 0;
+                me->index++;
+                m1->stack_prev = me->scc_top;
+                me->scc_top = m1;
+                if (tt_modeval_push(ctx, me, m1)) {
+                    err = JS_GetException(ctx);
+                    goto fail;
+                }
+                continue;
+            }
+            if (tt_modeval_post_child(ctx, m, m1, &err))
+                goto fail;
+            continue;
+        }
+
+        /* children done: body half */
+        if (m->pending_async_dependencies > 0) {
+            assert(!m->async_evaluation);
+            m->async_evaluation = TRUE;
+            m->async_evaluation_timestamp =
+                rt->module_async_evaluation_next_timestamp++;
+        } else if (m->has_tla) {
+            assert(!m->async_evaluation);
+            m->async_evaluation = TRUE;
+            m->async_evaluation_timestamp =
+                rt->module_async_evaluation_next_timestamp++;
+            {
+                /* classic C halves; their awaits resume under the parkable
+                   job pump. Mask park support for the inline segment. */
+                BOOL saved = rt->tt_park_ok;
+                rt->tt_park_ok = FALSE;
+                js_execute_async_module(ctx, m);
+                rt->tt_park_ok = saved;
+            }
+        } else if (m->init_func) {
+            /* C module init: no JS runs */
+            if (m->init_func(ctx, m) < 0) {
+                err = JS_GetException(ctx);
+                goto fail;
+            }
+        } else {
+            r = tt_modeval_body_start(ctx, me, m, &err);
+            if (r < 0)
+                goto fail;
+            if (r > 0) {
+                *pparked = 1;
+                return JS_UNDEFINED;
+            }
+        }
+
+        assert(m->dfs_ancestor_index <= m->dfs_index);
+        if (m->dfs_index == m->dfs_ancestor_index) {
+            for (;;) {
+                m1 = me->scc_top;
+                assert(m1 != NULL);
+                me->scc_top = m1->stack_prev;
+                if (!m1->async_evaluation) {
+                    m1->status = JS_MODULE_STATUS_EVALUATED;
+                } else {
+                    m1->status = JS_MODULE_STATUS_EVALUATING_ASYNC;
+                }
+                /* spec bug: cycle_root must be assigned before the test */
+                m1->cycle_root = m;
+                if (m1 == m)
+                    break;
+            }
+        }
+        if (tt_modeval_pop(ctx, me, &err))
+            goto fail;
+        continue;
+    }
+
+    /* DFS complete: mirror js_evaluate_module's success tail */
+    {
+        JSModuleDef *root = me->root;
+        JSValue promise;
+        assert(me->scc_top == NULL);
+        assert(!root->eval_has_exception);
+        assert(root->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+               root->status == JS_MODULE_STATUS_EVALUATED);
+        if (!root->async_evaluation) {
+            JSValue value, ret_val;
+            assert(root->status == JS_MODULE_STATUS_EVALUATED);
+            value = JS_UNDEFINED;
+            ret_val = JS_Call(ctx, root->resolving_funcs[0], JS_UNDEFINED,
+                              1, (JSValueConst *)&value);
+            JS_FreeValue(ctx, ret_val);
+        }
+        promise = JS_DupValue(ctx, root->promise);
+        tt_modeval_free(rt, me);
+        return promise;
+    }
+
+ fail:
+    /* mirror js_evaluate_module's failure unwind over the SCC chain */
+    {
+        JSModuleDef *root = me->root;
+        JSValue promise, ret_val;
+        while (me->scc_top != NULL) {
+            m1 = me->scc_top;
+            assert(m1->status == JS_MODULE_STATUS_EVALUATING);
+            m1->status = JS_MODULE_STATUS_EVALUATED;
+            m1->eval_has_exception = TRUE;
+            m1->eval_exception = JS_DupValue(ctx, err);
+            m1->cycle_root = root;
+            me->scc_top = m1->stack_prev;
+        }
+        JS_FreeValue(ctx, err);
+        assert(root->status == JS_MODULE_STATUS_EVALUATED);
+        assert(root->eval_has_exception);
+        ret_val = JS_Call(ctx, root->resolving_funcs[1], JS_UNDEFINED,
+                          1, (JSValueConst *)&root->eval_exception);
+        JS_FreeValue(ctx, ret_val);
+        promise = JS_DupValue(ctx, root->promise);
+        tt_modeval_free(rt, me);
+        return promise;
+    }
+}
+
+/* Body-run completion fed back from JS_TTCallResume: finish the parked
+   module body with its raw completion, then keep driving the DFS. */
+static JSValue tt_modeval_body_resumed(JSContext *ctx, JSValue raw,
+                                       int *pparked)
+{
+    JSRuntime *rt = ctx->rt;
+    TTModEval *me = rt->tt_modeval;
+    JSAsyncFunctionState *s = me->body;
+    JSModuleDef *m = me->body_m;
+    JSValue promise = me->body_promise;
+    JSValue err;
+    JSPromiseStateEnum state;
+    TTModEvalFrame *f;
+
+    me->body = NULL;
+    me->body_m = NULL;
+    me->body_promise = JS_UNDEFINED;
+
+    raw = async_func_finish(ctx, s, raw);
+    js_async_function_post(ctx, s, raw);
+    async_func_free(rt, s);
+    state = JS_PromiseState(ctx, promise);
+    if (state == JS_PROMISE_FULFILLED) {
+        JS_FreeValue(ctx, promise);
+    } else if (state == JS_PROMISE_REJECTED) {
+        err = JS_PromiseResult(ctx, promise);
+        JS_FreeValue(ctx, promise);
+        goto fail;
+    } else {
+        JS_FreeValue(ctx, promise);
+        JS_ThrowTypeError(ctx, "promise is pending");
+        err = JS_GetException(ctx);
+        goto fail;
+    }
+
+    /* the body belonged to the top DFS frame: run its post-body half
+       (SCC pop + frame pop with parent notification), then continue */
+    assert(me->sp > 0 && me->stack[me->sp - 1].m == m);
+    assert(m->dfs_ancestor_index <= m->dfs_index);
+    if (m->dfs_index == m->dfs_ancestor_index) {
+        JSModuleDef *m1;
+        for (;;) {
+            m1 = me->scc_top;
+            assert(m1 != NULL);
+            me->scc_top = m1->stack_prev;
+            if (!m1->async_evaluation) {
+                m1->status = JS_MODULE_STATUS_EVALUATED;
+            } else {
+                m1->status = JS_MODULE_STATUS_EVALUATING_ASYNC;
+            }
+            m1->cycle_root = m;
+            if (m1 == m)
+                break;
+        }
+    }
+    if (tt_modeval_pop(ctx, me, &err))
+        goto fail;
+    return tt_modeval_run(ctx, pparked);
+
+ fail:
+    {
+        JSModuleDef *root = me->root;
+        JSModuleDef *m1;
+        JSValue promise2, ret_val;
+        while (me->scc_top != NULL) {
+            m1 = me->scc_top;
+            assert(m1->status == JS_MODULE_STATUS_EVALUATING);
+            m1->status = JS_MODULE_STATUS_EVALUATED;
+            m1->eval_has_exception = TRUE;
+            m1->eval_exception = JS_DupValue(ctx, err);
+            m1->cycle_root = root;
+            me->scc_top = m1->stack_prev;
+        }
+        JS_FreeValue(ctx, err);
+        assert(root->status == JS_MODULE_STATUS_EVALUATED);
+        assert(root->eval_has_exception);
+        ret_val = JS_Call(ctx, root->resolving_funcs[1], JS_UNDEFINED,
+                          1, (JSValueConst *)&root->eval_exception);
+        JS_FreeValue(ctx, ret_val);
+        promise2 = JS_DupValue(ctx, root->promise);
+        tt_modeval_free(rt, me);
+        return promise2;
+    }
+}
+
+/* Entry: evaluate a linked module graph under park-by-return. Mirrors
+   js_evaluate_module's prologue, then hands off to the machine. */
+static JSValue js_tt_evaluate_module_start(JSContext *ctx, JSModuleDef *m,
+                                           int *pparked)
+{
+    JSRuntime *rt = ctx->rt;
+    TTModEval *me;
+
+    assert(m->status == JS_MODULE_STATUS_LINKED ||
+           m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+           m->status == JS_MODULE_STATUS_EVALUATED);
+    if (m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+        m->status == JS_MODULE_STATUS_EVALUATED) {
+        m = m->cycle_root;
+    }
+    if (!JS_IsUndefined(m->promise))
+        return JS_DupValue(ctx, m->promise);
+    m->promise = JS_NewPromiseCapability(ctx, m->resolving_funcs);
+    if (JS_IsException(m->promise))
+        return JS_EXCEPTION;
+
+    me = js_mallocz(ctx, sizeof(*me));
+    if (!me)
+        return JS_EXCEPTION;
+    me->ctx = JS_DupContext(ctx);
+    me->root = m;
+    me->body_promise = JS_UNDEFINED;
+    rt->tt_modeval = me;
+
+    /* the root's own pre-order half (the recursion's first activation) */
+    m->status = JS_MODULE_STATUS_EVALUATING;
+    m->dfs_index = 0;
+    m->dfs_ancestor_index = 0;
+    m->pending_async_dependencies = 0;
+    me->index = 1;
+    m->stack_prev = NULL;
+    me->scc_top = m;
+    if (tt_modeval_push(ctx, me, m)) {
+        JSValue err = JS_GetException(ctx);
+        JSValue promise, ret_val;
+        m->status = JS_MODULE_STATUS_EVALUATED;
+        m->eval_has_exception = TRUE;
+        m->eval_exception = JS_DupValue(ctx, err);
+        m->cycle_root = m;
+        JS_FreeValue(ctx, err);
+        ret_val = JS_Call(ctx, m->resolving_funcs[1], JS_UNDEFINED,
+                          1, (JSValueConst *)&m->eval_exception);
+        JS_FreeValue(ctx, ret_val);
+        promise = JS_DupValue(ctx, m->promise);
+        me->scc_top = NULL;
+        tt_modeval_free(rt, me);
+        return promise;
+    }
+    return tt_modeval_run(ctx, pparked);
 }
 
 static __exception int js_parse_with_clause(JSParseState *s, JSReqModuleEntry *rme)
@@ -74047,6 +74505,13 @@ void JS_TTResetExecState(JSContext *ctx)
     rt->tt_job_realm = NULL;
     rt->tt_job_vals[0] = rt->tt_job_vals[1] = JS_UNDEFINED;
     rt->tt_job_vals[2] = rt->tt_job_vals[3] = JS_UNDEFINED;
+    if (rt->tt_modeval) {
+        /* abandoned module DFS: drop the C bookkeeping; heap refs stay
+           (same mid-heal doctrine as tt_exec_fn) */
+        js_free_rt(rt, rt->tt_modeval->stack);
+        js_free_rt(rt, rt->tt_modeval);
+        rt->tt_modeval = NULL;
+    }
 }
 
 /* Step granularity: 0 = source line (+ loop back-jumps), 1 = every opcode. */
@@ -74072,6 +74537,21 @@ JSValue JS_TTCallStart(JSContext *ctx, JSValue fun_obj, int *pparked)
     JSValue fun, ret;
 
     *pparked = 0;
+    if (JS_VALUE_GET_TAG(fun_obj) == JS_TAG_MODULE) {
+        /* modules run through the stackless InnerModuleEvaluation machine:
+           bodies park like scripts, the DFS survives in heap state */
+        JSModuleDef *m = JS_VALUE_GET_PTR(fun_obj);
+        JS_FreeValue(ctx, fun_obj);
+        if (js_create_module_function(ctx, m) < 0)
+            return JS_EXCEPTION;
+        if (js_link_module(ctx, m) < 0)
+            return JS_EXCEPTION;
+        rt->tt_park_ok = TRUE;
+        ret = js_tt_evaluate_module_start(ctx, m, pparked);
+        if (!*pparked)
+            rt->tt_park_ok = FALSE;
+        return ret;
+    }
     if (JS_VALUE_GET_TAG(fun_obj) == JS_TAG_FUNCTION_BYTECODE) {
         fun = js_closure(ctx, fun_obj, NULL, NULL, TRUE);
         if (JS_IsException(fun))
@@ -74130,6 +74610,14 @@ JSValue JS_TTCallResume(JSContext *ctx, int cmd, int *pparked)
     if (rt->tt_parked_frame) {
         *pparked = 1;
         return JS_UNDEFINED;
+    }
+    if (rt->tt_modeval && rt->tt_modeval->body) {
+        /* the parked activation was a module body: finish it and keep
+           driving the module DFS; later bodies may park again */
+        ret = tt_modeval_body_resumed(ctx, ret, pparked);
+        if (!*pparked)
+            rt->tt_park_ok = FALSE;
+        return ret;
     }
     rt->tt_park_ok = FALSE;
     if (rt->tt_job_kind) {
