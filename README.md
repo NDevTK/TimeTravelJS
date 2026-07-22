@@ -453,11 +453,35 @@ site nor the tests require a C toolchain.
 
 The rewritten core is checked against the full conformance suite with the
 official `run-test262` harness compiled natively against this repo's
-`quickjs.c`: **49 / 43 790 errors — the failing-test list is byte-identical
-to pristine QuickJS 2026-06-04**, before and after every stage of the
-stackless migration (inlined calls, arena frames, constructor/generator/
-async conversion, job pumps). The rewrite is semantics-preserving across
-the language surface.
+`quickjs.c` (`tools/test262/`, upstream QuickJS 2026-06-04's runner with
+quickjs-libc trimmed to three inlined helpers): **58 / 83 558 errors over
+the full corpus in both sloppy and strict variants — the failing-test
+list is byte-identical to pristine QuickJS 2026-06-04**, before and after
+every stage of the stackless migration (inlined calls, arena frames,
+constructor/generator/async conversion, job pumps, stackless module
+evaluation). The rewrite is semantics-preserving across the language
+surface.
+
+**Forced preemption is a first-class oracle, not a sample.** `run.sh
+preempt` drives every test through the exact stackless path the debugger
+uses: a step handler parks the machine at EVERY parkable step — each
+source line and each loop back-edge — the host resumes it from the heap
+frame chain, promise jobs pump through `JS_TTPumpJob`, and module bodies
+evaluate through the stackless InnerModuleEvaluation machine, so a test
+run is tens of thousands of park/resume round trips. The result is the
+**same 58 / 83 558, byte-identical to the classic list**, with
+engagement measured rather than assumed: **97.2% of 192 M park requests
+fired** (the rest are counted suppressed steps inside the documented
+reflective C residue), **every test that executes user code fired real
+parks — zero tests passed with preemption silently unengaged** — and
+per-test counters land in a CSV (`-M`). `run.sh opcode` repeats the
+whole corpus parking **between every two VM instructions**.
+
+```
+sh tools/test262/run.sh            # classic drive: must match test262_errors.txt
+sh tools/test262/run.sh preempt    # park at every step + engagement metric
+sh tools/test262/run.sh opcode     # park between every two VM instructions
+```
 
 On top of that, `tools/test262-stepped.mjs` runs a corpus sample through
 the ENGINE with per-step snapshotting enabled and lets each test's own
