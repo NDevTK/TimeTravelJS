@@ -105,8 +105,24 @@
  *                               round-trip of an auto-captured delta, the
  *                               per-arm promise-reaction oracle, and that
  *                               completion commits the winning arm's writes.
+ *
+ *   flow-harness taggedtest     tagged values: a JS_TTMakeTagged value
+ *                               (concrete payload + opaque host note) as a
+ *                               first-class citizen of fork / serialize /
+ *                               evict / GC. Asserts the accessor API, a
+ *                               payload<->tagged GC cycle, fork independence
+ *                               (own payload copy per arm, NoteClone'd
+ *                               notes, a mutation in one arm touching
+ *                               nobody), serialize->hydrate and evict->
+ *                               hydrate round trips through NoteSerialize/
+ *                               Deserialize, loud refusals when a needed
+ *                               hook is missing (NULL notes still pass),
+ *                               NoteFree exactly once per abandoned arm,
+ *                               and a note-liveness oracle over the whole
+ *                               run beside the runtime leak oracle.
  */
 #include "quickjs.h"
+#include "cutils.h"     /* DynBuf, for the tagged-value note hooks */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -208,6 +224,13 @@ static const char *BASELINE_SRC =
 "  SHP.then(sink(\"p\" + v));\n"
 "  var w = yield \"wrote:\" + SHOBJ.x + \":\" + SHARR.join(\",\") + \":\" + SHARR.length;\n"
 "  return \"done:\" + SHOBJ.x + \":\" + w;\n"
+"}\n"
+"function* tflow() {\n"
+"  var t = null;\n"
+"  var u = null;\n"
+"  var fed = yield \"t0\";\n"
+"  yield \"t1:\" + (t === null ? \"null\" : typeof t) + \":\" + fed;\n"
+"  return \"t-end\";\n"
 "}\n";
 
 static void die(JSContext *ctx, const char *what)
@@ -2111,6 +2134,359 @@ static int cmd_cowtest(void)
     return 0;
 }
 
+/* -- taggedtest: payload + host note as a first-class round-tripper ------- */
+
+/* the note is a malloc'd C string; the counters are the oracle: every hook
+   call is counted and tg_live tracks blobs the host still owes a free() */
+static int tg_clones, tg_serializes, tg_deserializes, tg_frees, tg_live;
+
+static void *tg_note_clone(JSRuntime *rt, void *note)
+{
+    char *c = strdup((char *)note);
+    (void)rt;
+    if (!c)
+        return NULL;
+    tg_clones++;
+    tg_live++;
+    return c;
+}
+
+static int tg_note_serialize(JSRuntime *rt, void *note, DynBuf *db)
+{
+    (void)rt;
+    tg_serializes++;
+    return dbuf_put(db, (const uint8_t *)note, strlen((char *)note) + 1);
+}
+
+static void *tg_note_deserialize(JSRuntime *rt, const uint8_t *buf, size_t len)
+{
+    char *c;
+    (void)rt;
+    if (len == 0 || len > 4096 || buf[len - 1] != '\0')
+        return NULL;          /* reject malformed blobs loudly */
+    c = malloc(len);
+    if (!c)
+        return NULL;
+    memcpy(c, buf, len);
+    tg_deserializes++;
+    tg_live++;
+    return c;
+}
+
+static void tg_note_free(JSRuntime *rt, void *note)
+{
+    (void)rt;
+    tg_frees++;
+    tg_live--;
+    free(note);
+}
+
+static void tg_set_hooks(JSRuntime *rt)
+{
+    JS_TTSetNoteHooks(rt, tg_note_clone, tg_note_serialize,
+                      tg_note_deserialize, tg_note_free);
+}
+
+static int tg_payload_a(JSContext *ctx, JSValueConst tagged)
+{
+    JSValue p = JS_TTPayload(ctx, tagged);
+    JSValue av;
+    int32_t a = -1;
+    if (JS_IsException(p))
+        die(ctx, "JS_TTPayload");
+    av = JS_GetPropertyStr(ctx, p, "a");
+    if (JS_ToInt32(ctx, &a, av))
+        die(ctx, "payload.a");
+    JS_FreeValue(ctx, av);
+    JS_FreeValue(ctx, p);
+    return (int)a;
+}
+
+static void tg_payload_set_a(JSContext *ctx, JSValueConst tagged, int v)
+{
+    JSValue p = JS_TTPayload(ctx, tagged);
+    if (JS_IsException(p))
+        die(ctx, "JS_TTPayload");
+    if (JS_SetPropertyStr(ctx, p, "a", JS_NewInt32(ctx, v)) < 0)
+        die(ctx, "set payload.a");
+    JS_FreeValue(ctx, p);
+}
+
+/* start tflow() and advance it to the "t0" yield */
+static JSValue tg_start_tflow(JSContext *ctx)
+{
+    JSValue g = eval_val(ctx, "tflow()");
+    JSValue r = JS_Invoke(ctx, g, JS_NewAtom(ctx, "next"), 0, NULL);
+    if (JS_IsException(r))
+        die(ctx, "tflow next");
+    JS_FreeValue(ctx, r);
+    return g;
+}
+
+static int cmd_taggedtest(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    JSValue t, tnil, g, g2, g3, gh, armA, armB, tP, tA, tB, t2, th;
+    JSAtom at_t, at_u;
+    char *H;
+    void *nA, *nB;
+    uint8_t *bytes;
+    size_t blen;
+
+    tg_clones = tg_serializes = tg_deserializes = tg_frees = tg_live = 0;
+    tg_set_hooks(rt);
+    at_t = JS_NewAtom(ctx, "t");
+    at_u = JS_NewAtom(ctx, "u");
+
+    /* --- the value itself: make, inspect, nest ------------------------- */
+    H = strdup("H-note-1");
+    assert(H);
+    tg_live++;                /* H enters the accounting by hand */
+    t = JS_TTMakeTagged(ctx, eval_val(ctx, "({a:1})"), H);
+    if (JS_IsException(t))
+        die(ctx, "JS_TTMakeTagged");
+    assert(JS_TTIsTagged(t));
+    assert(JS_TTNote(t) == H);
+    assert(tg_payload_a(ctx, t) == 1);
+    {
+        /* payload dups preserve identity */
+        JSValue p1 = JS_TTPayload(ctx, t), p2 = JS_TTPayload(ctx, t);
+        assert(JS_VALUE_GET_PTR(p1) == JS_VALUE_GET_PTR(p2));
+        JS_FreeValue(ctx, p1);
+        JS_FreeValue(ctx, p2);
+    }
+    {
+        /* non-tagged probes answer, they do not crash */
+        JSValue plain = eval_val(ctx, "({})");
+        JSValue e;
+        assert(!JS_TTIsTagged(plain));
+        assert(JS_TTNote(plain) == NULL);
+        e = JS_TTPayload(ctx, plain);
+        assert(JS_IsException(e));
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, plain);
+    }
+    {
+        /* nesting: a tagged value is a concrete payload like any other */
+        JSValue inner = JS_TTMakeTagged(ctx, JS_NewInt32(ctx, 5), NULL);
+        JSValue outer2 = JS_TTMakeTagged(ctx, inner, NULL);
+        JSValue got = JS_TTPayload(ctx, outer2);
+        assert(JS_TTIsTagged(got));
+        JS_FreeValue(ctx, got);
+        JS_FreeValue(ctx, outer2);  /* frees inner through the payload edge */
+    }
+    {
+        /* a payload<->tagged cycle collects through the mark edge */
+        JSValue cp = eval_val(ctx, "({})");
+        JSValue ct = JS_TTMakeTagged(ctx, JS_DupValue(ctx, cp), NULL);
+        if (JS_IsException(ct))
+            die(ctx, "cycle make");
+        if (JS_SetPropertyStr(ctx, cp, "cyc", JS_DupValue(ctx, ct)) < 0)
+            die(ctx, "cycle prop");
+        JS_FreeValue(ctx, cp);
+        JS_FreeValue(ctx, ct);
+        JS_RunGC(rt);
+    }
+    printf("TAGGED:make/inspect/nest/gc-cycle ok\n");
+
+    /* --- a suspended flow holds t in a local; fork the flow ------------ */
+    g = tg_start_tflow(ctx);
+    if (!JS_TTFlowSetLocal(ctx, g, 0, at_t, t)) {
+        fprintf(stderr, "FAIL: inject t into tflow\n");
+        return 1;
+    }
+    armA = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(armA))
+        die(ctx, "fork armA");
+    armB = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(armB))
+        die(ctx, "fork armB");
+    assert(tg_clones == 2);   /* one NoteClone per arm */
+
+    tP = JS_TTFlowGetLocal(ctx, g, 0, at_t);
+    tA = JS_TTFlowGetLocal(ctx, armA, 0, at_t);
+    tB = JS_TTFlowGetLocal(ctx, armB, 0, at_t);
+    assert(JS_TTIsTagged(tP) && JS_TTIsTagged(tA) && JS_TTIsTagged(tB));
+    /* the parent's local IS t; each arm's is an independent value */
+    assert(JS_VALUE_GET_PTR(tP) == JS_VALUE_GET_PTR(t));
+    assert(JS_VALUE_GET_PTR(tA) != JS_VALUE_GET_PTR(t));
+    assert(JS_VALUE_GET_PTR(tB) != JS_VALUE_GET_PTR(t));
+    assert(JS_VALUE_GET_PTR(tA) != JS_VALUE_GET_PTR(tB));
+    nA = JS_TTNote(tA);
+    nB = JS_TTNote(tB);
+    assert(nA && nB && nA != H && nB != H && nA != nB);
+    assert(strcmp((char *)nA, "H-note-1") == 0);
+    assert(strcmp((char *)nB, "H-note-1") == 0);
+    /* a payload mutation in one arm touches nobody else */
+    tg_payload_set_a(ctx, tA, 99);
+    assert(tg_payload_a(ctx, tA) == 99);
+    assert(tg_payload_a(ctx, tB) == 1);
+    assert(tg_payload_a(ctx, tP) == 1);
+    assert(tg_payload_a(ctx, t) == 1);
+    printf("TAGGED:fork independence ok (NoteClone x%d)\n", tg_clones);
+
+    /* --- serialize -> hydrate ------------------------------------------ */
+    bytes = JS_TTFlowSerialize(ctx, g, &blen);
+    if (!bytes)
+        die(ctx, "serialize");
+    assert(tg_serializes == 1);
+    g2 = JS_TTFlowDeserialize(ctx, bytes, blen);
+    if (JS_IsException(g2))
+        die(ctx, "deserialize");
+    assert(tg_deserializes == 1);
+    t2 = JS_TTFlowGetLocal(ctx, g2, 0, at_t);
+    assert(JS_TTIsTagged(t2));
+    assert(JS_VALUE_GET_PTR(t2) != JS_VALUE_GET_PTR(t));
+    assert(tg_payload_a(ctx, t2) == 1);
+    {
+        void *n2 = JS_TTNote(t2);
+        assert(n2 && n2 != H && strcmp((char *)n2, "H-note-1") == 0);
+    }
+    printf("TAGGED:serialize->hydrate ok (%u bytes)\n", (unsigned)blen);
+
+    /* --- truncation at every byte refuses loudly, note-leak-free -------- */
+    {
+        int live_before = tg_live;
+        size_t cut;
+        for (cut = 0; cut < blen; cut++) {
+            JSValue bad = JS_TTFlowDeserialize(ctx, bytes, cut);
+            assert(JS_IsException(bad));
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        }
+        /* cuts that deserialized the note before failing freed it again
+           through the shell's finalizer */
+        assert(tg_live == live_before);
+    }
+    printf("TAGGED:truncation fuzz ok\n");
+
+    /* --- loud refusals without hooks; NULL notes still pass ------------ */
+    JS_TTSetNoteHooks(rt, NULL, NULL, NULL, NULL);
+    {
+        uint8_t *b0;
+        size_t l0;
+        JSValue e;
+        b0 = JS_TTFlowSerialize(ctx, g, &l0);
+        assert(b0 == NULL);   /* non-NULL note, no NoteSerialize hook */
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        e = JS_TTFlowFork(ctx, g);
+        assert(JS_IsException(e));  /* non-NULL note, no NoteClone hook */
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        /* bytes carrying a note refuse to hydrate without the hook */
+        e = JS_TTFlowDeserialize(ctx, bytes, blen);
+        assert(JS_IsException(e));
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    js_free(ctx, bytes);
+    tnil = JS_TTMakeTagged(ctx, JS_NewInt32(ctx, 7), NULL);
+    g3 = tg_start_tflow(ctx);
+    if (!JS_TTFlowSetLocal(ctx, g3, 0, at_u, tnil)) {
+        fprintf(stderr, "FAIL: inject u into tflow\n");
+        return 1;
+    }
+    {
+        uint8_t *b1;
+        size_t l1;
+        JSValue g3h, u2, pv;
+        int32_t iv = 0;
+        b1 = JS_TTFlowSerialize(ctx, g3, &l1);
+        if (!b1)
+            die(ctx, "serialize NULL-note flow");
+        g3h = JS_TTFlowDeserialize(ctx, b1, l1);
+        if (JS_IsException(g3h))
+            die(ctx, "deserialize NULL-note flow");
+        js_free(ctx, b1);
+        u2 = JS_TTFlowGetLocal(ctx, g3h, 0, at_u);
+        assert(JS_TTIsTagged(u2));
+        assert(JS_TTNote(u2) == NULL);
+        pv = JS_TTPayload(ctx, u2);
+        if (JS_ToInt32(ctx, &iv, pv))
+            die(ctx, "NULL-note payload");
+        assert(iv == 7);
+        JS_FreeValue(ctx, pv);
+        JS_FreeValue(ctx, u2);
+        JS_FreeValue(ctx, g3h);
+    }
+    tg_set_hooks(rt);
+    printf("TAGGED:hookless refusals + NULL-note pass ok\n");
+
+    /* --- evict -> hydrate (cold bytes) --------------------------------- */
+    {
+        uint8_t *eb;
+        size_t el;
+        int sers = tg_serializes, desers = tg_deserializes;
+        eb = JS_TTMachineEvict(ctx, g, &el);
+        if (!eb)
+            die(ctx, "evict");
+        assert(tg_serializes == sers + 1);
+        /* the host reference keeps the parent's value alive across the
+           eviction: its note must NOT have been freed */
+        assert(JS_TTNote(t) == H);
+        gh = JS_TTMachineHydrate(ctx, eb, el);
+        if (JS_IsException(gh))
+            die(ctx, "hydrate");
+        js_free(ctx, eb);
+        assert(tg_deserializes == desers + 1);
+        th = JS_TTFlowGetLocal(ctx, gh, 0, at_t);
+        assert(JS_TTIsTagged(th));
+        assert(tg_payload_a(ctx, th) == 1);
+        {
+            void *nh = JS_TTNote(th);
+            assert(nh && strcmp((char *)nh, "H-note-1") == 0);
+        }
+    }
+    printf("TAGGED:evict->hydrate ok\n");
+
+    /* --- abandoning a forked arm frees its note exactly once ------------ */
+    {
+        int frees_before = tg_frees;
+        JS_FreeValue(ctx, tB);    /* drop the read handle first */
+        tB = JS_UNDEFINED;
+        JS_FreeValue(ctx, armB);  /* abandon the arm without resuming */
+        armB = JS_UNDEFINED;
+        assert(tg_frees == frees_before + 1);
+    }
+    printf("TAGGED:abandoned arm frees its note exactly once ok\n");
+
+    /* --- the surviving arm resumes and completes normally --------------- */
+    {
+        int frees_before = tg_frees;
+        char tr[512];
+        if (JS_TTFlowCheckin(ctx, armA))
+            die(ctx, "checkin armA");
+        collect_flow(ctx, armA, 0, tr, sizeof(tr));
+        assert(strstr(tr, "t1:object:0"));
+        assert(strstr(tr, "t-end"));
+        /* completion freed the frame; our tA dup still pins the arm's
+           value (and so its note) */
+        assert(tg_frees == frees_before);
+        JS_FreeValue(ctx, tA);
+        tA = JS_UNDEFINED;
+        assert(tg_frees == frees_before + 1);
+    }
+    printf("TAGGED:surviving arm completes ok\n");
+
+    /* --- teardown: every note followed its value ------------------------ */
+    JS_FreeAtom(ctx, at_t);
+    JS_FreeAtom(ctx, at_u);
+    JS_FreeValue(ctx, t);
+    JS_FreeValue(ctx, tnil);
+    JS_FreeValue(ctx, tP);
+    JS_FreeValue(ctx, t2);
+    JS_FreeValue(ctx, th);
+    JS_FreeValue(ctx, g);
+    JS_FreeValue(ctx, g2);
+    JS_FreeValue(ctx, g3);
+    JS_FreeValue(ctx, gh);
+    JS_FreeValue(ctx, armA);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);       /* the leak/double-free oracle */
+    assert(tg_live == 0);     /* the note-liveness oracle */
+    printf("TAGGED:teardown ok (clones=%d serializes=%d deserializes=%d "
+           "frees=%d)\n", tg_clones, tg_serializes, tg_deserializes, tg_frees);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 3 && !strcmp(argv[1], "emit"))
@@ -2137,6 +2513,8 @@ int main(int argc, char **argv)
         return cmd_asynctest();
     if (argc >= 2 && !strcmp(argv[1], "cowtest"))
         return cmd_cowtest();
+    if (argc >= 2 && !strcmp(argv[1], "taggedtest"))
+        return cmd_taggedtest();
     fprintf(stderr, "usage: flow-harness emit|resume <file> | selftest\n");
     return 2;
 }

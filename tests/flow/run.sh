@@ -65,4 +65,6 @@ echo "== asynctest (per-flow job queues, await fork, evict+microtask) =="
 "$BUILD/flow-harness" asynctest
 echo "== cowtest (automatic transparent COW capture) =="
 "$BUILD/flow-harness" cowtest
+echo "== taggedtest (tagged values: payload + host note round-trips) =="
+"$BUILD/flow-harness" taggedtest
 echo "PASS: flow serialization suite"

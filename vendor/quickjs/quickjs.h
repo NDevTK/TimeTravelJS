@@ -1069,6 +1069,43 @@ int JS_TTFlowDeltaWriteCell(JSContext *ctx, JSValueConst flow,
 int JS_TTFlowCheckout(JSContext *ctx, JSValueConst flow);
 int JS_TTFlowCheckin(JSContext *ctx, JSValueConst flow);
 int JS_TTFlowDeltaCount(JSContext *ctx, JSValueConst flow);
+
+/* TimeTravelJS tagged values: a first-class value carrying a concrete
+   payload (any JSValue) plus an opaque host annotation (the "note").
+   A tagged value just exists and round-trips: it is flow-private in the
+   serializer's classification (by value), its payload classifies
+   recursively like any field (by reference if baseline, by value if
+   private), and fork gives each arm an independent tagged value (own
+   cloned payload, NoteClone'd note). The engine never interprets the
+   note; GC marks the payload as an ordinary edge and the note is freed
+   through NoteFree at finalization. */
+struct DynBuf; /* cutils.h */
+/* Note lifecycle hooks (per runtime). Clone: return the fork-arm's note
+   (NULL = failure). Serialize: append the note's bytes to *db, return 0
+   (non-zero = failure). Deserialize: rebuild a note from bytes (NULL =
+   failure -- a host needing an "empty" note must return a sentinel).
+   Free: release a note (finalization, in any process). A NULL note never
+   invokes any hook; a non-NULL note refuses fork without a clone hook,
+   refuses serialization without the serialize hook, and refuses
+   deserialization without the deserialize hook -- loudly, at the
+   operation. */
+typedef void *JSTTNoteCloneFn(JSRuntime *rt, void *note);
+typedef int JSTTNoteSerializeFn(JSRuntime *rt, void *note, struct DynBuf *db);
+typedef void *JSTTNoteDeserializeFn(JSRuntime *rt, const uint8_t *buf,
+                                    size_t len);
+typedef void JSTTNoteFreeFn(JSRuntime *rt, void *note);
+void JS_TTSetNoteHooks(JSRuntime *rt, JSTTNoteCloneFn *clone_fn,
+                       JSTTNoteSerializeFn *serialize_fn,
+                       JSTTNoteDeserializeFn *deserialize_fn,
+                       JSTTNoteFreeFn *free_fn);
+/* make a tagged value; takes ownership of payload (and of note: the value
+   owns it from birth and NoteFree releases it) */
+JSValue JS_TTMakeTagged(JSContext *ctx, JSValue payload, void *note);
+/* a dup of the payload (TypeError if v is not tagged) */
+JSValue JS_TTPayload(JSContext *ctx, JSValueConst v);
+/* the note pointer (borrowed; NULL if v is not tagged) */
+void *JS_TTNote(JSValueConst v);
+JS_BOOL JS_TTIsTagged(JSValueConst v);
 /* select which debug info is stripped from the compiled code */
 #define JS_STRIP_SOURCE (1 << 0) /* strip source code */
 #define JS_STRIP_DEBUG  (1 << 1) /* strip all debug info including source code */

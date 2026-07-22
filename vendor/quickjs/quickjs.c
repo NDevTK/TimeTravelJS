@@ -183,7 +183,8 @@ enum {
     JS_CLASS_ASYNC_GENERATOR,   /* u.async_generator_data */
     JS_CLASS_WEAK_REF,
     JS_CLASS_FINALIZATION_REGISTRY,
-    
+    JS_CLASS_TT_TAGGED,         /* u.tt_tagged (TimeTravelJS tagged value) */
+
     JS_CLASS_INIT_COUNT, /* last entry for predefined classes */
 };
 
@@ -448,6 +449,13 @@ struct JSRuntime {
     /* TimeTravelJS flow serialization: the shared-baseline registry giving
        every baseline heap entity a process-stable id (NULL until captured) */
     struct TTFlowBaseline *tt_flow_baseline;
+    /* TimeTravelJS tagged values: host note lifecycle hooks (all optional;
+       a non-NULL note refuses fork/wire loudly when the hook it needs is
+       missing, and is simply not freed without a free hook) */
+    JSTTNoteCloneFn *tt_note_clone;
+    JSTTNoteSerializeFn *tt_note_serialize;
+    JSTTNoteDeserializeFn *tt_note_deserialize;
+    JSTTNoteFreeFn *tt_note_free;
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
@@ -1267,6 +1275,12 @@ struct JSObject {
         } array;    /* 12/20 bytes */
         JSRegExp regexp;    /* JS_CLASS_REGEXP: 8/16 bytes */
         JSValue object_data;    /* for JS_SetObjectData(): 8/16/16 bytes */
+        struct { /* JS_CLASS_TT_TAGGED: a concrete payload plus an opaque
+                    host annotation riding fork/wire/free via the runtime's
+                    note hooks */
+            JSValue payload;
+            void *note;
+        } tt_tagged;
         JSGlobalObject global_object;
     } u;
 };
@@ -1383,6 +1397,8 @@ static void js_mapped_arguments_finalizer(JSRuntime *rt, JSValue val);
 static void js_mapped_arguments_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 static void js_object_data_finalizer(JSRuntime *rt, JSValue val);
 static void js_object_data_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
+static void js_tt_tagged_finalizer(JSRuntime *rt, JSValue val);
+static void js_tt_tagged_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 static void js_c_function_finalizer(JSRuntime *rt, JSValue val);
 static void js_c_function_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 static void js_bytecode_function_finalizer(JSRuntime *rt, JSValue val);
@@ -2260,6 +2276,10 @@ static JSClassShortDef const js_std_class_def[] = {
     { JS_ATOM_Object, NULL, NULL }, /* JS_CLASS_RAWJSON */
 };
 
+static JSClassShortDef const js_tt_tagged_class_def[] = {
+    { JS_ATOM_TTTagged, js_tt_tagged_finalizer, js_tt_tagged_mark }, /* JS_CLASS_TT_TAGGED */
+};
+
 static int init_class_range(JSRuntime *rt, JSClassShortDef const *tab,
                             int start, int count)
 {
@@ -2341,6 +2361,11 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     /* create the object, array and function classes */
     if (init_class_range(rt, js_std_class_def, JS_CLASS_OBJECT,
                          countof(js_std_class_def)) < 0)
+        goto fail;
+    /* tagged values are host-made (JS_TTMakeTagged), so the class exists in
+       every runtime rather than behind an intrinsic init */
+    if (init_class_range(rt, js_tt_tagged_class_def, JS_CLASS_TT_TAGGED,
+                         countof(js_tt_tagged_class_def)) < 0)
         goto fail;
     rt->class_array[JS_CLASS_ARGUMENTS].exotic = &js_arguments_exotic_methods;
     rt->class_array[JS_CLASS_MAPPED_ARGUMENTS].exotic = &js_arguments_exotic_methods;
@@ -5961,6 +5986,11 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     case JS_CLASS_BIG_INT:
         p->u.object_data = JS_UNDEFINED;
         goto set_exotic;
+    case JS_CLASS_TT_TAGGED:
+        /* mark/finalizer-safe from birth */
+        p->u.tt_tagged.payload = JS_UNDEFINED;
+        p->u.tt_tagged.note = NULL;
+        break;
     case JS_CLASS_REGEXP:
         p->u.regexp.pattern = NULL;
         p->u.regexp.bytecode = NULL;
@@ -6463,6 +6493,25 @@ static void js_object_data_finalizer(JSRuntime *rt, JSValue val)
     JSObject *p = JS_VALUE_GET_OBJ(val);
     JS_FreeValueRT(rt, p->u.object_data);
     p->u.object_data = JS_UNDEFINED;
+}
+
+static void js_tt_tagged_finalizer(JSRuntime *rt, JSValue val)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    if (p->u.tt_tagged.note) {
+        if (rt->tt_note_free)
+            rt->tt_note_free(rt, p->u.tt_tagged.note);
+        p->u.tt_tagged.note = NULL;
+    }
+    JS_FreeValueRT(rt, p->u.tt_tagged.payload);
+    p->u.tt_tagged.payload = JS_UNDEFINED;
+}
+
+static void js_tt_tagged_mark(JSRuntime *rt, JSValueConst val,
+                              JS_MarkFunc *mark_func)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    JS_MarkValue(rt, p->u.tt_tagged.payload, mark_func);
 }
 
 static void js_object_data_mark(JSRuntime *rt, JSValueConst val,
@@ -38129,7 +38178,9 @@ typedef struct CodeContext {
 
 #define M2(op1, op2)            ((op1) | ((op2) << 8))
 #define M3(op1, op2, op3)       ((op1) | ((op2) << 8) | ((op3) << 16))
-#define M4(op1, op2, op3, op4)  ((op1) | ((op2) << 8) | ((op3) << 16) | ((op4) << 24))
+/* the top byte packs through uint32_t: an opcode >= 128 shifted into the
+   sign bit would be UB in int arithmetic */
+#define M4(op1, op2, op3, op4)  ((op1) | ((op2) << 8) | ((op3) << 16) | (int)((uint32_t)(op4) << 24))
 
 static BOOL code_match(CodeContext *s, int pos, ...)
 {
@@ -41847,7 +41898,7 @@ typedef struct JSPromiseReactionData {
 
 /* -- limits and wire constants -- */
 
-#define TT_FLOW_MAGIC     "TTFL04"
+#define TT_FLOW_MAGIC     "TTFL05"
 #define TT_FLOW_MAGIC_LEN 6
 
 /* header flag bits */
@@ -41868,7 +41919,8 @@ enum {                        /* private record kinds */
     TT_REC_PROMISE_FUNC,      /* resolve/reject capability function          */
     TT_REC_PRESOLVED,         /* the capability pair's shared resolved flag  */
     TT_REC_ASYNC_RESOLVE,     /* async-function await continuation handler   */
-    TT_REC_LAST = TT_REC_ASYNC_RESOLVE
+    TT_REC_TAGGED,            /* JS_CLASS_TT_TAGGED: payload + host note     */
+    TT_REC_LAST = TT_REC_TAGGED
 };
 
 enum {                        /* vref inline subtags */
@@ -42336,6 +42388,10 @@ static int tt_baseline_scan_object(JSContext *ctx, TTFlowBaseline *bl,
     case JS_CLASS_SYMBOL:
     case JS_CLASS_DATE:
         if (tt_baseline_queue_value(ctx, bl, q, p->u.object_data))
+            return -1;
+        break;
+    case JS_CLASS_TT_TAGGED:
+        if (tt_baseline_queue_value(ctx, bl, q, p->u.tt_tagged.payload))
             return -1;
         break;
     case JS_CLASS_GLOBAL_OBJECT:
@@ -44161,6 +44217,8 @@ static int wr_enum_object(TTFlowWr *w, JSObject *p)
     case JS_CLASS_ASYNC_FUNCTION_RESOLVE:
     case JS_CLASS_ASYNC_FUNCTION_REJECT:
         return wr_add_rec(w, TT_REC_ASYNC_RESOLVE, p, NULL);
+    case JS_CLASS_TT_TAGGED:
+        return wr_add_rec(w, TT_REC_TAGGED, p, NULL);
     default:
         return wr_unsupported(w, p);
     }
@@ -44416,6 +44474,18 @@ static int wr_scan_children(TTFlowWr *w, TTFlowWrRec *rec)
             wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
             return -1;
         if (wr_enum_value(w, p->u.object_data))
+            return -1;
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_TAGGED: {
+        /* the payload classifies recursively like any field (by reference
+           if baseline, by value if private); the note is not a graph edge --
+           it travels through the host's note hooks at emission */
+        JSObject *p = rec->ptr;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        if (wr_enum_value(w, p->u.tt_tagged.payload))
             return -1;
         return wr_scan_props(w, p, FALSE);
     }
@@ -44887,6 +44957,34 @@ static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
         case TT_REC_DATAOBJ:
             dbuf_put_leb128(&db, ((JSObject *)rec->ptr)->class_id);
             break;
+        case TT_REC_TAGGED: {
+            /* the host note rides the shell as an opaque blob: present flag,
+               then NoteSerialize's bytes (the read side hands them to
+               NoteDeserialize before the record links) */
+            void *note = ((JSObject *)rec->ptr)->u.tt_tagged.note;
+            if (!note) {
+                dbuf_putc(&db, 0);
+            } else if (!ctx->rt->tt_note_serialize) {
+                JS_ThrowTypeError(ctx, "flow serialization: tagged note "
+                                  "without a NoteSerialize hook");
+                goto fail;
+            } else {
+                DynBuf nb;
+                js_dbuf_init(ctx, &nb);
+                if (ctx->rt->tt_note_serialize(ctx->rt, note, &nb) ||
+                    nb.error || nb.size > UINT32_MAX) {
+                    dbuf_free(&nb);
+                    JS_ThrowTypeError(ctx, "flow serialization: tagged note "
+                                      "serialization failed");
+                    goto fail;
+                }
+                dbuf_putc(&db, 1);
+                dbuf_put_leb128(&db, (uint32_t)nb.size);
+                dbuf_put(&db, nb.buf, nb.size);
+                dbuf_free(&nb);
+            }
+            break;
+        }
         }
     }
 
@@ -45140,6 +45238,18 @@ static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
                             : JS_NULL))
                 goto fail;
             if (wr_put_vref(w, &db, p->u.object_data))
+                goto fail;
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_TAGGED: {
+            JSObject *p = rec->ptr;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            if (wr_put_vref(w, &db, p->u.tt_tagged.payload))
                 goto fail;
             if (wr_put_props(w, &db, p, FALSE))
                 goto fail;
@@ -45995,6 +46105,39 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
             JS_VALUE_GET_OBJ(rec->v)->u.object_data = JS_UNDEFINED;
             break;
         }
+        case TT_REC_TAGGED: {
+            uint32_t has = tt_rd_u8(&r->rd);
+            if (r->rd.err || has > 1)
+                goto trunc;
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_TT_TAGGED);
+            if (JS_IsException(rec->v))
+                goto fail;
+            if (has) {
+                uint32_t nlen = tt_rd_leb(&r->rd);
+                const uint8_t *nb;
+                void *note;
+                if (r->rd.err)
+                    goto trunc;
+                nb = tt_rd_bytes(&r->rd, nlen);
+                if (!nb)
+                    goto trunc;
+                if (!rt->tt_note_deserialize) {
+                    JS_ThrowTypeError(ctx, "flow bytes: tagged note without "
+                                      "a NoteDeserialize hook");
+                    goto fail;
+                }
+                note = rt->tt_note_deserialize(rt, nb, nlen);
+                if (!note) {
+                    JS_ThrowTypeError(ctx, "flow bytes: tagged note "
+                                      "deserialization failed");
+                    goto fail;
+                }
+                /* the shell owns its note from here on: rd_release covers
+                   any later failure through the object finalizer */
+                JS_VALUE_GET_OBJ(rec->v)->u.tt_tagged.note = note;
+            }
+            break;
+        }
         case TT_REC_PROMISE: {
             JSPromiseData *pd;
             rec->v = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_PROMISE);
@@ -46564,6 +46707,20 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
                 goto fail;
             }
             JS_VALUE_GET_OBJ(rec->v)->u.object_data = v;
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        }
+        case TT_REC_TAGGED: {
+            /* the payload is any value a vref can carry (the note already
+               arrived with the shell) */
+            JSValue v;
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            v = rd_get_vref(r);
+            if (JS_IsException(v))
+                goto fail;
+            JS_VALUE_GET_OBJ(rec->v)->u.tt_tagged.payload = v;
             if (rd_read_props(r, rec->v))
                 goto fail;
             break;
@@ -47256,6 +47413,34 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
                 JS_VALUE_GET_OBJ(fk->clone_v[i])->u.object_data =
                     JS_UNDEFINED;
             break;
+        case TT_REC_TAGGED: {
+            /* each arm gets an independent tagged value: its own payload
+               clone (relinked in pass 2) and a NoteClone'd note */
+            JSObject *src = rec->ptr;
+            void *note = src->u.tt_tagged.note;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    JS_CLASS_TT_TAGGED);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            if (note) {
+                void *note2;
+                if (!ctx->rt->tt_note_clone) {
+                    JS_ThrowTypeError(ctx, "flow fork: tagged note without "
+                                      "a NoteClone hook");
+                    goto out;
+                }
+                note2 = ctx->rt->tt_note_clone(ctx->rt, note);
+                if (!note2) {
+                    JS_ThrowTypeError(ctx, "flow fork: tagged note clone "
+                                      "failed");
+                    goto out;
+                }
+                /* the sibling owns its note from here on (fork_release
+                   covers failure through the object finalizer) */
+                JS_VALUE_GET_OBJ(fk->clone_v[i])->u.tt_tagged.note = note2;
+            }
+            break;
+        }
         case TT_REC_ARRAY:
             fk->clone_v[i] = JS_NewArray(ctx);
             if (JS_IsException(fk->clone_v[i]))
@@ -47552,6 +47737,19 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
             if (JS_IsException(v))
                 goto out;
             JS_VALUE_GET_OBJ(fk->clone_v[i])->u.object_data = v;
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        }
+        case TT_REC_TAGGED: {
+            JSObject *src = rec->ptr;
+            JSValue v;
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            v = fork_map_value(fk, src->u.tt_tagged.payload);
+            if (JS_IsException(v))
+                goto out;
+            JS_VALUE_GET_OBJ(fk->clone_v[i])->u.tt_tagged.payload = v;
             if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
                 goto out;
             break;
@@ -48372,6 +48570,61 @@ uint8_t *JS_TTMachineEvict(JSContext *ctx, JSValueConst flow, size_t *plen)
 JSValue JS_TTMachineHydrate(JSContext *ctx, const uint8_t *buf, size_t len)
 {
     return JS_TTFlowDeserialize(ctx, buf, len);
+}
+
+/* -- tagged values: a concrete payload plus an opaque host annotation ------ */
+
+void JS_TTSetNoteHooks(JSRuntime *rt, JSTTNoteCloneFn *clone_fn,
+                       JSTTNoteSerializeFn *serialize_fn,
+                       JSTTNoteDeserializeFn *deserialize_fn,
+                       JSTTNoteFreeFn *free_fn)
+{
+    rt->tt_note_clone = clone_fn;
+    rt->tt_note_serialize = serialize_fn;
+    rt->tt_note_deserialize = deserialize_fn;
+    rt->tt_note_free = free_fn;
+}
+
+/* Make a tagged value. Takes ownership of 'payload' and of 'note' (the
+   value owns the note from birth: NoteFree releases it at finalization,
+   whether the value ever traveled or not). */
+JSValue JS_TTMakeTagged(JSContext *ctx, JSValue payload, void *note)
+{
+    JSValue v;
+    JSObject *p;
+    if (JS_IsException(payload))
+        return payload;
+    v = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_TT_TAGGED);
+    if (JS_IsException(v)) {
+        JS_FreeValue(ctx, payload);
+        if (note && ctx->rt->tt_note_free)
+            ctx->rt->tt_note_free(ctx->rt, note);
+        return v;
+    }
+    p = JS_VALUE_GET_OBJ(v);
+    p->u.tt_tagged.payload = payload;
+    p->u.tt_tagged.note = note;
+    return v;
+}
+
+JSValue JS_TTPayload(JSContext *ctx, JSValueConst v)
+{
+    if (!JS_TTIsTagged(v))
+        return JS_ThrowTypeError(ctx, "not a tagged value");
+    return JS_DupValue(ctx, JS_VALUE_GET_OBJ(v)->u.tt_tagged.payload);
+}
+
+void *JS_TTNote(JSValueConst v)
+{
+    if (!JS_TTIsTagged(v))
+        return NULL;
+    return JS_VALUE_GET_OBJ(v)->u.tt_tagged.note;
+}
+
+JS_BOOL JS_TTIsTagged(JSValueConst v)
+{
+    return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(v)->class_id == JS_CLASS_TT_TAGGED;
 }
 /*---------------------------------------------------------------------------*/
 /* end TimeTravelJS flow serialization                                        */

@@ -417,14 +417,66 @@ Afterwards the flow is an ordinary suspended generator, driven with
 `next()`. A flow parked inside the *live legacy* machine is refused with
 a pointer to `JS_TTCallResume`.
 
-## Wire format (`TTFL04`)
+## Tagged values: a concrete payload plus an opaque host annotation
+
+`JS_CLASS_TT_TAGGED` is a first-class value holding a `JSValue payload`
+(any concrete value) and a `void *note` (a host blob the engine never
+interprets). It exists so a host can pin its own metadata to a value and
+have the pair ride every flow operation — no propagation or conditional
+behavior yet: a tagged value just exists and round-trips.
+
+```c
+JSValue JS_TTMakeTagged(JSContext *ctx, JSValue payload, void *note);
+JSValue JS_TTPayload(JSContext *ctx, JSValueConst v);   /* dup of payload */
+void   *JS_TTNote(JSValueConst v);                      /* borrowed */
+JS_BOOL JS_TTIsTagged(JSValueConst v);
+void JS_TTSetNoteHooks(JSRuntime*, JSTTNoteCloneFn*, JSTTNoteSerializeFn*,
+                       JSTTNoteDeserializeFn*, JSTTNoteFreeFn*);
+```
+
+Graph integration follows the existing rules exactly:
+
+- **Classification.** `wr_enumerate` classifies a tagged value as
+  flow-private (`TT_REC_TAGGED`, by value); its payload classifies
+  recursively like any field — by reference if baseline, by value if
+  private. Baseline capture walks the payload as an ordinary edge, so a
+  tagged value rooted before capture keeps the everything-reachable-has-
+  an-id invariant.
+- **GC.** The payload is a marked edge (`js_tt_tagged_mark`), so cycles
+  through a tagged value collect; the note is host-owned and released
+  through `NoteFree` at finalization — exactly once per living value, in
+  whichever process the value dies.
+- **Fork.** Each arm gets an independent tagged value: its own payload
+  clone (per the payload's own classification) and a `NoteClone`d note.
+- **Wire.** The note rides the record shell as an opaque blob
+  (`NoteSerialize` writes it, `NoteDeserialize` rebuilds it before the
+  record links); serialize→hydrate and evict→hydrate round-trip payload
+  and note together.
+- **Refusals are loud.** A non-NULL note refuses fork without a clone
+  hook and refuses the wire without the serialize (write side) or
+  deserialize (read side) hook, with the missing hook named; a NULL note
+  never needs any hook. Payload-less mutation of the pair is impossible
+  by construction (the API has no setter).
+
+A tagged value passing through an arithmetic/coerce/concat op behaves
+however the engine already treats an unknown object operand (its class
+has no exotic handlers and a NULL prototype); operator propagation is a
+follow-up. The taggedtest harness drives the oracle: accessor API, a
+payload↔tagged GC cycle, two forked arms with independent payload copies
+and cloned notes (a mutation in one arm touches nobody), wire and evict
+round trips through the note hooks, hookless refusals, `NoteFree` exactly
+once for an abandoned arm, and a note-liveness counter beside the runtime
+leak oracle.
+
+## Wire format (`TTFL05`)
 
 ```
 header    magic, baseline fingerprint (u64), baseline count, flags
           (bit 0: a machine-parked chain travels in these bytes)
 atoms     private name strings (interned on read)
 records   shell table: kind + allocation parameters (class, fn_id, argc,
-          element count, open-cell coordinates, string/symbol bytes)
+          element count, open-cell coordinates, string/symbol bytes,
+          tagged-note blob: present flag + NoteSerialize's bytes)
 frames    the TrampFrame chain, base first: owner byte (state | arena);
           state: record idx, pc offset, live extent, splice linkage;
           arena: cur_func vref, pc offset, frame kind, call-site argc,
@@ -432,7 +484,8 @@ frames    the TrampFrame chain, base first: owner byte (state | arena);
           both: the step-hook line cache
 payloads  per record: prototype, properties (atomref, 6-bit shape flags,
           kind-specific payload), fast elements, closure cells, state
-          fields; then per frame: the owned live JSValue range
+          fields, tagged payload vref; then per frame: the owned live
+          JSValue range
 delta     per-kind pre-image records: PROP obj+atom+saved, PROPX
           +presence+flags, CELL ref+saved, ARRAY element vector+length,
           PROMISE full state/reaction snapshot, PRESOLVED flag, ODATA
