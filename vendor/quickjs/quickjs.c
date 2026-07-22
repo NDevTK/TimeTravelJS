@@ -386,8 +386,18 @@ struct JSRuntime {
         uint8_t op;   /* 0 eq, 1 includes, 2 startsWith, 3 endsWith, 4 indexOf */
         char a[TT_CMP_STRMAX];
         char b[TT_CMP_STRMAX];
+        /* the host note of the tagged value this token probed (BORROWED
+           from that value -- valid while it lives; NULL for a compare
+           of concretes). Ties a recorded token to WHICH tracked input
+           was searched, since the C-builtin path has no result note to
+           hang the correlation on. Not part of dedup identity. */
+        void *note;
     } tt_cmp[TT_CMP_MAX];
     int tt_cmp_len;
+    /* staged journal note for the entry the CURRENT tagged string-search
+       re-entry is about to record (transient: set and restored around
+       one C call, never live across a park) */
+    void *tt_cmp_note_pending;
     /* TimeTravelJS stackless interpreter state. All interpreter frames live
        in this arena (linear memory), so when no native C frame is below the
        dispatch loop, suspending is just returning to the host and resuming
@@ -458,6 +468,9 @@ struct JSRuntime {
     JSTTNoteFreeFn *tt_note_free;
     /* tagged-value propagation: derive a result note from operand notes */
     JSTTCombineFn *tt_combine;
+    /* tagged-value conditionals: observe a control-flow branch over a
+       tagged value (payload-truthiness branch + the tested note) */
+    JSTTCondFn *tt_cond;
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
@@ -7997,9 +8010,15 @@ static void tt_cmp_store(JSRuntime *rt, struct TTCmpEnt *e)
     for (i = 0; i < rt->tt_cmp_len; i++) {
         if (rt->tt_cmp[i].h == h && rt->tt_cmp[i].op == e->op &&
             !memcmp(rt->tt_cmp[i].a, e->a, TT_CMP_STRMAX) &&
-            !memcmp(rt->tt_cmp[i].b, e->b, TT_CMP_STRMAX))
+            !memcmp(rt->tt_cmp[i].b, e->b, TT_CMP_STRMAX)) {
+            /* dedup keeps one entry per token: a tagged occurrence
+               still ties its note to the entry */
+            if (rt->tt_cmp_note_pending)
+                rt->tt_cmp[i].note = rt->tt_cmp_note_pending;
             return;
+        }
     }
+    e->note = rt->tt_cmp_note_pending;
     rt->tt_cmp[rt->tt_cmp_len++] = *e;
 }
 
@@ -8877,6 +8896,75 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     return 0;
 }
 
+/* TimeTravelJS: property GET on a tagged receiver forwards to the
+   payload -- the engine's own get, so a string payload's length/index
+   exotics and an object payload's own/inherited/getter lookups all
+   resolve against the payload (which is also the getter `this`) -- and
+   the result stays tracked: wrapped with a note combined from
+   JS_TT_OP_GET_FIELD over {receiver, key}. A nested tagged payload
+   reads off the DEEPEST concrete payload and wraps once with the outer
+   note (the truthiness recursion shape). Two deliberate carve-outs: a
+   FUNCTION result returns unwrapped -- method lookup is resolution,
+   not a data derivation, and the receiver (which get_field2 keeps as
+   `this`) stays the tracked carrier the builtin intercepts then see --
+   and a stored value that is itself tagged flattens to a SINGLE
+   wrapper over its payload, the stored value joining the hook args
+   with its note (never wrapper-in-wrapper). A throwing forwarded get
+   (payload null/undefined, a throwing getter) propagates unwrapped.
+   Payload getters are forced down the plain C call path (defer slots
+   disarmed) so their result flows back through this wrap instead of a
+   parked frame. Property SET, method-receiver semantics, and
+   enumeration/has stay named follow-ups. */
+static JSValue tt_tagged_get(JSContext *ctx, JSValueConst t, JSAtom prop)
+{
+    JSObject *pt = JS_VALUE_GET_OBJ(t);
+    JSValueConst payload = pt->u.tt_tagged.payload;
+    JSValueConst args[3];
+    void *notes[3], *note;
+    JSValue v, key_val, res;
+    int n;
+
+    if (unlikely(ctx->rt->tt_defer_slot != NULL))
+        ctx->rt->tt_defer_slot = NULL;
+    if (unlikely(ctx->rt->tt_defer_pending != NULL))
+        ctx->rt->tt_defer_pending = NULL;
+    while (unlikely(tt_value_is_tagged(payload)))
+        payload = JS_VALUE_GET_OBJ(payload)->u.tt_tagged.payload;
+    v = JS_GetPropertyInternal(ctx, payload, prop, payload, 0);
+    if (JS_IsException(v))
+        return v;
+    if (JS_IsFunction(ctx, v))
+        return v;
+    key_val = JS_AtomToValue(ctx, prop);
+    if (JS_IsException(key_val)) {
+        JS_FreeValue(ctx, v);
+        return key_val;
+    }
+    args[0] = t;
+    args[1] = key_val;
+    notes[0] = pt->u.tt_tagged.note;
+    notes[1] = NULL;
+    n = 2;
+    if (unlikely(tt_value_is_tagged(v))) {
+        JSValueConst pv = v;
+        JSValue inner;
+        args[2] = v;
+        notes[2] = JS_VALUE_GET_OBJ(v)->u.tt_tagged.note;
+        n = 3;
+        while (tt_value_is_tagged(pv))
+            pv = JS_VALUE_GET_OBJ(pv)->u.tt_tagged.payload;
+        inner = JS_DupValue(ctx, pv);
+        note = tt_combine_note(ctx, JS_TT_OP_GET_FIELD, args, notes, n);
+        JS_FreeValue(ctx, v);
+        v = inner;
+    } else {
+        note = tt_combine_note(ctx, JS_TT_OP_GET_FIELD, args, notes, n);
+    }
+    JS_FreeValue(ctx, key_val);
+    res = JS_TTMakeTagged(ctx, v, note);
+    return res;
+}
+
 JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                JSAtom prop, JSValueConst this_obj,
                                BOOL throw_ref_error)
@@ -8932,6 +9020,11 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
             return JS_UNDEFINED;
     } else {
         p = JS_VALUE_GET_OBJ(obj);
+        /* TimeTravelJS: a tagged RECEIVER forwards the get to its
+           payload and keeps the result tracked. (A tagged KEY never
+           reaches here: ToPropertyKey refuses it -- the pinned path.) */
+        if (unlikely(p->class_id == JS_CLASS_TT_TAGGED))
+            return tt_tagged_get(ctx, obj, prop);
     }
 
     for(;;) {
@@ -9640,6 +9733,20 @@ int JS_HasProperty(JSContext *ctx, JSValueConst obj, JSAtom prop)
     if (unlikely(JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT))
         return FALSE;
     p = JS_VALUE_GET_OBJ(obj);
+    /* TimeTravelJS: `k in t` asks about the PAYLOAD's chain. Existence
+       is not derived data -- a concrete boolean, no hooks (the
+       reflexive-identity discipline). A non-object payload gets the
+       operator's real TypeError, exactly as `k in payload` would. */
+    if (unlikely(p->class_id == JS_CLASS_TT_TAGGED)) {
+        JSValueConst pay = p->u.tt_tagged.payload;
+        while (tt_value_is_tagged(pay))
+            pay = JS_VALUE_GET_OBJ(pay)->u.tt_tagged.payload;
+        if (JS_VALUE_GET_TAG(pay) != JS_TAG_OBJECT) {
+            JS_ThrowTypeError(ctx, "invalid 'in' operand");
+            return -1;
+        }
+        return JS_HasProperty(ctx, pay, prop);
+    }
     for(;;) {
         if (p->is_exotic) {
             const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
@@ -10380,6 +10487,38 @@ static void js_free_desc(JSContext *ctx, JSPropertyDescriptor *desc)
    freed by the function. 'flags' is a bitmask of JS_PROP_THROW and
    JS_PROP_THROW_STRICT. 'this_obj' is the receiver. If obj !=
    this_obj, then obj must be an object (Reflect.set case). */
+/* TimeTravelJS: property SET on a tagged receiver forwards to the
+   payload -- the engine's own set, re-entered on the payload, so the
+   write lands on the payload's own/inherited setter or data slot (the
+   payload is the setter `this`), array/string exotics apply, and the
+   automatic-COW capture on that path fires exactly as for a direct
+   write to a baseline payload: flow isolation composes because the
+   REAL set path runs, nothing is re-implemented or bypassed. The
+   stored value is stored AS-IS -- a tagged v stays tagged in the
+   payload slot (no unwrap, no extra wrap); the get forward flattens
+   and combines on read-back, making get and set inverses. A nested
+   tagged payload writes through to the deepest concrete payload (the
+   get forward's shape). A throwing set (payload null/undefined, a
+   non-writable property in strict mode, a throwing setter) propagates
+   unwrapped. Payload setters are forced down the plain C call path
+   (defer slots disarmed) so their status flows back here, not into a
+   parked frame. delete / defineProperty / Reflect.set receiver-mixing
+   / enumeration stay named follow-ups. */
+static int tt_tagged_set(JSContext *ctx, JSValueConst t, JSAtom prop,
+                         JSValue val, int flags)
+{
+    JSObject *pt = JS_VALUE_GET_OBJ(t);
+    JSValueConst payload = pt->u.tt_tagged.payload;
+
+    if (unlikely(ctx->rt->tt_defer_slot != NULL))
+        ctx->rt->tt_defer_slot = NULL;
+    if (unlikely(ctx->rt->tt_defer_pending != NULL))
+        ctx->rt->tt_defer_pending = NULL;
+    while (unlikely(tt_value_is_tagged(payload)))
+        payload = JS_VALUE_GET_OBJ(payload)->u.tt_tagged.payload;
+    return JS_SetPropertyInternal(ctx, payload, prop, val, payload, flags);
+}
+
 int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
                            JSAtom prop, JSValue val, JSValueConst this_obj, int flags)
 {
@@ -10420,6 +10559,12 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
         p1 = JS_VALUE_GET_OBJ(obj);
         if (unlikely(p != p1))
             goto retry2;
+        /* TimeTravelJS: a set on a tagged RECEIVER forwards to its
+           payload (tt_tagged_set). A tagged KEY never reaches here:
+           ToPropertyKey refuses it -- the pinned path. Reflect.set
+           receiver-mixing (obj != this_obj) stays a follow-up. */
+        if (unlikely(p1->class_id == JS_CLASS_TT_TAGGED))
+            return tt_tagged_set(ctx, obj, prop, val, flags);
     }
 
     /* fast path if obj == this_obj */
@@ -11807,6 +11952,17 @@ static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint)
     JSValue method, ret;
     if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
         return val;
+    /* TimeTravelJS: a tagged value still refuses coercion here -- the
+       pinned behavior of every UNSUPPORTED pipeline (supported ones
+       intercept before ever reaching ToPrimitive). Without this,
+       property-get forwarding would leak the payload's toString /
+       valueOf / Symbol.toPrimitive into the probes below and silently
+       de-tag. Same TypeError the empty null-proto wrapper produced
+       before forwarding existed. */
+    if (unlikely(tt_value_is_tagged(val))) {
+        JS_FreeValue(ctx, val);
+        return JS_ThrowTypeError(ctx, "toPrimitive");
+    }
     force_ordinary = hint & HINT_FORCE_ORDINARY;
     hint &= ~HINT_FORCE_ORDINARY;
     if (!force_ordinary) {
@@ -11944,7 +12100,16 @@ static int JS_ToBoolFree(JSContext *ctx, JSValue val)
         {
             JSObject *p = JS_VALUE_GET_OBJ(val);
             BOOL ret;
-            ret = !p->is_HTMLDDA;
+            if (unlikely(p->class_id == JS_CLASS_TT_TAGGED)) {
+                /* a tagged value reports its PAYLOAD's truthiness
+                   (nested tagged payloads recurse). No hook here:
+                   internal coercions must stay unobserved -- only the
+                   control-flow branch opcodes fire the cond hook. */
+                ret = JS_ToBoolFree(ctx,
+                                    JS_DupValue(ctx, p->u.tt_tagged.payload));
+            } else {
+                ret = !p->is_HTMLDDA;
+            }
             JS_FreeValue(ctx, val);
             return ret;
         }
@@ -11963,6 +12128,26 @@ static int JS_ToBoolFree(JSContext *ctx, JSValue val)
 int JS_ToBool(JSContext *ctx, JSValueConst val)
 {
     return JS_ToBoolFree(ctx, JS_DupValue(ctx, val));
+}
+
+/* TimeTravelJS: a control-flow branch over a tagged value. The branch
+   takes the PAYLOAD-truthiness side (JS_ToBoolFree above recurses
+   through nested tagged payloads), and the per-runtime cond hook
+   observes it -- exactly once per conditional evaluated, with the
+   OUTER note of the tested value. Only the branch opcodes call this;
+   every other ToBool (lnot, Boolean(), internal protocol coercions)
+   stays a silent value coercion. Consumes v; the hook runs before the
+   free so the borrowed note cannot dangle. */
+static int tt_tagged_branch_bool(JSContext *ctx, JSValue v)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(v);
+    int res;
+
+    res = JS_ToBoolFree(ctx, JS_DupValue(ctx, p->u.tt_tagged.payload));
+    if (ctx->rt->tt_cond)
+        ctx->rt->tt_cond(ctx, p->u.tt_tagged.note, res);
+    JS_FreeValue(ctx, v);
+    return res;
 }
 
 static int skip_spaces(const char *pc)
@@ -15471,9 +15656,12 @@ enum {
     TT_TAGRUN_SHR,            /* js_shr_slow */
     TT_TAGRUN_REL,            /* js_relational_slow */
     TT_TAGRUN_EQ,             /* js_eq_slow */
+    TT_TAGRUN_STRICT_EQ,      /* js_strict_eq_slow */
 };
 static int tt_tagged_binary(JSContext *ctx, JSValue *sp, int kind, int arg,
                             int tt_op);
+static no_inline int js_strict_eq_slow(JSContext *ctx, JSValue *sp,
+                                       BOOL is_neq);
 static int tt_tagged_unary(JSContext *ctx, JSValue *sp, int is_not,
                            OPCodeEnum op);
 static int tt_tagged_post_inc(JSContext *ctx, JSValue *sp, OPCodeEnum op);
@@ -16625,6 +16813,9 @@ static int tt_tagged_binary(JSContext *ctx, JSValue *sp, int kind, int arg,
         ret = js_relational_slow(ctx, stk + 2, arg);
         tt_op = tt_tt_opcode(arg);
         break;
+    case TT_TAGRUN_STRICT_EQ:
+        ret = js_strict_eq_slow(ctx, stk + 2, arg);
+        break;
     default:
     case TT_TAGRUN_EQ:
         ret = js_eq_slow(ctx, stk + 2, arg);
@@ -16890,6 +17081,20 @@ static no_inline int js_strict_eq_slow(JSContext *ctx, JSValue *sp,
                                        BOOL is_neq)
 {
     BOOL res;
+
+    /* a tagged operand takes the same unwrap -> engine's own compare ->
+       re-wrap path as loose equality, with one carve-out: the reflexive
+       compare of a tagged value against ITSELF (the same object, e.g.
+       x === x) keeps its concrete identity answer and calls no hook.
+       Both operands must be checked tagged BEFORE the pointer compare:
+       only then are both pointer reads valid. */
+    if (unlikely(tt_value_is_tagged(sp[-2]) || tt_value_is_tagged(sp[-1]))) {
+        if (!(tt_value_is_tagged(sp[-2]) && tt_value_is_tagged(sp[-1]) &&
+              JS_VALUE_GET_OBJ(sp[-2]) == JS_VALUE_GET_OBJ(sp[-1])))
+            return tt_tagged_binary(ctx, sp, TT_TAGRUN_STRICT_EQ, is_neq,
+                                    is_neq ? JS_TT_OP_STRICT_NEQ
+                                           : JS_TT_OP_STRICT_EQ);
+    }
     res = js_strict_eq2(ctx, sp[-2], sp[-1], JS_EQ_STRICT);
     sp[-2] = JS_NewBool(ctx, res ^ is_neq);
     return 0;
@@ -17249,6 +17454,22 @@ static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
     uint32_t tag, tab_atom_count;
 
     tag = JS_VALUE_GET_TAG(obj);
+    if (unlikely(tag == JS_TAG_OBJECT &&
+                 JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_TT_TAGGED)) {
+        /* TimeTravelJS: for-in over a tagged value walks the PAYLOAD's
+           enumerable chain exactly as a direct for-in on the payload
+           would -- a string payload gets its index keys through the
+           ToObject below, a null/undefined payload the same empty
+           loop. Keys are payload property names: concrete. */
+        JSValueConst pay = JS_VALUE_GET_OBJ(obj)->u.tt_tagged.payload;
+        JSValue pv;
+        while (tt_value_is_tagged(pay))
+            pay = JS_VALUE_GET_OBJ(pay)->u.tt_tagged.payload;
+        pv = JS_DupValue(ctx, pay);
+        JS_FreeValue(ctx, obj);
+        obj = pv;
+        tag = JS_VALUE_GET_TAG(obj);
+    }
     if (tag != JS_TAG_OBJECT && tag != JS_TAG_NULL && tag != JS_TAG_UNDEFINED) {
         obj = JS_ToObjectFree(ctx, obj);
     }
@@ -21470,6 +21691,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 4;
                 if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
                     res = JS_VALUE_GET_INT(op1);
+                } else if (unlikely(tt_value_is_tagged(op1))) {
+                    res = tt_tagged_branch_bool(ctx, op1);
                 } else {
                     res = JS_ToBoolFree(ctx, op1);
                 }
@@ -21491,6 +21714,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* quick and dirty test for JS_TAG_INT, JS_TAG_BOOL, JS_TAG_NULL and JS_TAG_UNDEFINED */
                 if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
                     res = JS_VALUE_GET_INT(op1);
+                } else if (unlikely(tt_value_is_tagged(op1))) {
+                    res = tt_tagged_branch_bool(ctx, op1);
                 } else {
                     res = JS_ToBoolFree(ctx, op1);
                 }
@@ -21512,6 +21737,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 1;
                 if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
                     res = JS_VALUE_GET_INT(op1);
+                } else if (unlikely(tt_value_is_tagged(op1))) {
+                    res = tt_tagged_branch_bool(ctx, op1);
                 } else {
                     res = JS_ToBoolFree(ctx, op1);
                 }
@@ -21532,6 +21759,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 1;
                 if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
                     res = JS_VALUE_GET_INT(op1);
+                } else if (unlikely(tt_value_is_tagged(op1))) {
+                    res = tt_tagged_branch_bool(ctx, op1);
                 } else {
                     res = JS_ToBoolFree(ctx, op1);
                 }
@@ -22137,6 +22366,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-1];                                           \
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {   \
                     p = JS_VALUE_GET_OBJ(obj);                          \
+                    /* TimeTravelJS: a tagged receiver forwards through \
+                       the generic path (the inline walk would complete \
+                       the null-proto miss itself); untagged receivers  \
+                       pay this one class-id compare */                 \
+                    if (unlikely(p->class_id == JS_CLASS_TT_TAGGED))    \
+                        goto name ## _slow_path;                        \
                     for(;;) {                                           \
                         prs = find_own_property(&pr, p, atom);          \
                         if (prs) {                                      \
@@ -22228,6 +22463,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-2];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
+                    /* TimeTravelJS: a tagged receiver forwards through
+                       the generic path (a wrapper never owns props, so
+                       this is defensive: the fast path is own-prop
+                       gated, but nothing may ever write the wrapper);
+                       untagged receivers pay this one class-id compare */
+                    if (unlikely(p->class_id == JS_CLASS_TT_TAGGED))
+                        goto put_field_slow_path;
                     prs = find_own_property(&pr, p, atom);
                     if (!prs)
                         goto put_field_slow_path;
@@ -23863,11 +24105,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_nop):
             BREAK;
         CASE(OP_is_undefined_or_null):
-            if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_UNDEFINED ||
-                JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_NULL) {
-                goto set_true;
-            } else {
-                goto free_and_set_false;
+            {
+                /* TimeTravelJS: the nullish probe (??, ?., ??=, the
+                   iterator-return protocol) reads a tagged operand's
+                   PAYLOAD (nested tagged payloads recurse). Nullishness
+                   is identity of the payload, not truthiness, so the
+                   cond hook never fires here. */
+                JSValueConst npv = sp[-1];
+                while (unlikely(tt_value_is_tagged(npv)))
+                    npv = JS_VALUE_GET_OBJ(npv)->u.tt_tagged.payload;
+                if (JS_VALUE_GET_TAG(npv) == JS_TAG_UNDEFINED ||
+                    JS_VALUE_GET_TAG(npv) == JS_TAG_NULL) {
+                    /* free the wrapper (a no-op for a concrete
+                       null/undefined operand) */
+                    JS_FreeValue(ctx, sp[-1]);
+                    goto set_true;
+                } else {
+                    goto free_and_set_false;
+                }
             }
 #if SHORT_OPCODES
         CASE(OP_is_undefined):
@@ -30913,6 +31168,27 @@ fail:
     return JS_ATOM_NULL;
 }
 
+/* TimeTravelJS: the exact-undefined probe of the default-value protocols
+   (parameter defaults, destructuring defaults). This is NOT a user
+   comparison and must stay a concrete tag test: a tagged value is a
+   wrapper -- never `undefined`, whatever its payload -- so it must not
+   trigger a default (routing it through js_strict_eq_slow would make a
+   tagged-undefined ARGUMENT compare payload-equal to `undefined` and
+   take the default), and no Combine or cond observation derives from
+   the probe. Emitting the probe opcode directly keeps these sites out
+   of js_strict_eq_slow, whose tagged operands unwrap like loose eq. */
+static void emit_undefined_probe(JSParseState *s)
+{
+#if SHORT_OPCODES
+    emit_op(s, OP_is_undefined);
+#else
+    /* no probe opcode in this configuration: the raw compare (which
+       predates tagged-value propagation here) */
+    emit_op(s, OP_undefined);
+    emit_op(s, OP_strict_eq);
+#endif
+}
+
 /* Return -1 if error, 0 if no initializer, 1 if an initializer is
    present at the top level. */
 static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
@@ -30938,8 +31214,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
     if (hasval) {
         /* consume value from the stack */
         emit_op(s, OP_dup);
-        emit_op(s, OP_undefined);
-        emit_op(s, OP_strict_eq);
+        emit_undefined_probe(s);
         emit_goto(s, OP_if_true, label_parse);
         emit_label(s, label_assign);
     } else {
@@ -31201,8 +31476,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
             if (s->token.val == '=') {  /* handle optional default value */
                 int label_hasval;
                 emit_op(s, OP_dup);
-                emit_op(s, OP_undefined);
-                emit_op(s, OP_strict_eq);
+                emit_undefined_probe(s);
                 label_hasval = emit_goto(s, OP_if_false, -1);
                 if (next_token(s))
                     goto var_error;
@@ -31315,8 +31589,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
                     /* handle optional default value */
                     int label_hasval;
                     emit_op(s, OP_dup);
-                    emit_op(s, OP_undefined);
-                    emit_op(s, OP_strict_eq);
+                    emit_undefined_probe(s);
                     label_hasval = emit_goto(s, OP_if_false, -1);
                     if (next_token(s))
                         goto var_error;
@@ -39726,28 +39999,12 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             goto no_change;
 
         case OP_null:
-#if SHORT_OPCODES
-            if (OPTIMIZE) {
-                /* transform null strict_eq into is_null */
-                if (code_match(&cc, pos_next, OP_strict_eq, -1)) {
-                    if (cc.line_num >= 0) line_num = cc.line_num;
-                    add_pc2line_info(s, bc_out.size, line_num);
-                    dbuf_putc(&bc_out, OP_is_null);
-                    pos_next = cc.pos;
-                    break;
-                }
-                /* transform null strict_neq if_false/if_true -> is_null if_true/if_false */
-                if (code_match(&cc, pos_next, OP_strict_neq, M2(OP_if_false, OP_if_true), -1)) {
-                    if (cc.line_num >= 0) line_num = cc.line_num;
-                    add_pc2line_info(s, bc_out.size, line_num);
-                    dbuf_putc(&bc_out, OP_is_null);
-                    pos_next = cc.pos;
-                    label = cc.label;
-                    op = cc.op ^ OP_if_false ^ OP_if_true;
-                    goto has_label;
-                }
-            }
-#endif
+            /* TimeTravelJS: the null strict_eq/strict_neq -> is_null
+               fusions are gone. A tagged operand must reach
+               js_strict_eq_slow's unwrap path: is_null is a plain tag
+               test that would neither unwrap nor Combine, and it hands
+               the branch a concrete boolean where the unfused compare
+               hands it the tagged result the cond hook observes. */
             /* fall thru */
         case OP_push_false:
         case OP_push_true:
@@ -39908,26 +40165,11 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     val = 0;
                     goto has_constant_test;
                 }
-#if SHORT_OPCODES
-                /* transform undefined strict_eq -> is_undefined */
-                if (code_match(&cc, pos_next, OP_strict_eq, -1)) {
-                    if (cc.line_num >= 0) line_num = cc.line_num;
-                    add_pc2line_info(s, bc_out.size, line_num);
-                    dbuf_putc(&bc_out, OP_is_undefined);
-                    pos_next = cc.pos;
-                    break;
-                }
-                /* transform undefined strict_neq if_false/if_true -> is_undefined if_true/if_false */
-                if (code_match(&cc, pos_next, OP_strict_neq, M2(OP_if_false, OP_if_true), -1)) {
-                    if (cc.line_num >= 0) line_num = cc.line_num;
-                    add_pc2line_info(s, bc_out.size, line_num);
-                    dbuf_putc(&bc_out, OP_is_undefined);
-                    pos_next = cc.pos;
-                    label = cc.label;
-                    op = cc.op ^ OP_if_false ^ OP_if_true;
-                    goto has_label;
-                }
-#endif
+                /* TimeTravelJS: the undefined strict_eq/strict_neq ->
+                   is_undefined fusions are gone for the same reason as
+                   the null ones above; the default-value protocols that
+                   relied on the fused probe now emit OP_is_undefined
+                   directly (emit_undefined_probe). */
             }
             goto no_change;
 
@@ -41369,8 +41611,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                     emit_op(s, OP_get_arg);
                     emit_u16(s, idx);
                     emit_op(s, OP_dup);
-                    emit_op(s, OP_undefined);
-                    emit_op(s, OP_strict_eq);
+                    emit_undefined_probe(s);
                     emit_goto(s, OP_if_false, label);
                     emit_op(s, OP_drop);
                     if (js_parse_assign_expr(s))
@@ -48868,6 +49109,11 @@ void JS_TTSetCombineHook(JSRuntime *rt, JSTTCombineFn *combine)
     rt->tt_combine = combine;
 }
 
+void JS_TTSetCondHook(JSRuntime *rt, JSTTCondFn *cond)
+{
+    rt->tt_cond = cond;
+}
+
 /* Make a tagged value. Takes ownership of 'payload' and of 'note' (the
    value owns the note from birth: NoteFree releases it at finalization,
    whether the value ever traveled or not). */
@@ -48902,6 +49148,31 @@ void *JS_TTNote(JSValueConst v)
     if (!JS_TTIsTagged(v))
         return NULL;
     return JS_VALUE_GET_OBJ(v)->u.tt_tagged.note;
+}
+
+/* the UNFORWARDED own-property count of v itself (shape-level; deleted
+   slots excluded, fast-array elements not counted; -1 for non-objects).
+   For a tagged value this is the WRAPPER's own view -- the JS-visible
+   view forwards to the payload, so this raw probe is the oracle that
+   get/set/enumerate forwarding never lands anything on the wrapper. */
+int JS_TTOwnPropCount(JSContext *ctx, JSValueConst v)
+{
+    JSObject *p;
+    JSShape *sh;
+    JSShapeProperty *prs;
+    int i, n;
+
+    (void)ctx;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return -1;
+    p = JS_VALUE_GET_OBJ(v);
+    sh = p->shape;
+    n = 0;
+    for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
+        if (prs->atom != JS_ATOM_NULL)
+            n++;
+    }
+    return n;
 }
 
 JS_BOOL JS_TTIsTagged(JSValueConst v)
@@ -51783,17 +52054,38 @@ exception:
 static JSValue JS_GetOwnPropertyNames2(JSContext *ctx, JSValueConst obj1,
                                        int flags, int kind)
 {
-    JSValue obj, r, val, key, value;
+    JSValue obj, r, val, key, value, pobj;
     JSObject *p;
     JSPropertyEnum *atoms;
     uint32_t len, i, j;
 
     r = JS_UNDEFINED;
     val = JS_UNDEFINED;
+    pobj = JS_UNDEFINED;
     obj = JS_ToObject(ctx, obj1);
     if (JS_IsException(obj))
         return JS_EXCEPTION;
     p = JS_VALUE_GET_OBJ(obj);
+    /* TimeTravelJS: enumerating a tagged value reflects the PAYLOAD --
+       Object.keys/values/entries, getOwnPropertyNames/Symbols and
+       Reflect.ownKeys all land here. Names and the enumerability
+       re-check run against the payload (keys stay concrete property
+       names), while VALUES below are fetched through `obj` -- still
+       the wrapper -- so they ride the get-forward and stay tracked.
+       ToObject on the payload gives a primitive payload (a tagged
+       string) its exotic index keys, and gives a null payload the
+       operation's real TypeError. */
+    if (unlikely(p->class_id == JS_CLASS_TT_TAGGED)) {
+        JSValueConst pay = p->u.tt_tagged.payload;
+        while (tt_value_is_tagged(pay))
+            pay = JS_VALUE_GET_OBJ(pay)->u.tt_tagged.payload;
+        pobj = JS_ToObject(ctx, pay);
+        if (JS_IsException(pobj)) {
+            JS_FreeValue(ctx, obj);
+            return JS_EXCEPTION;
+        }
+        p = JS_VALUE_GET_OBJ(pobj);
+    }
     if (JS_GetOwnPropertyNamesInternal(ctx, &atoms, &len, p, flags & ~JS_GPN_ENUM_ONLY))
         goto exception;
     r = JS_NewArray(ctx);
@@ -51855,6 +52147,7 @@ exception:
     r = JS_EXCEPTION;
 done:
     JS_FreePropertyEnum(ctx, atoms, len);
+    JS_FreeValue(ctx, pobj);
     JS_FreeValue(ctx, obj);
     return r;
 }
@@ -57131,6 +57424,67 @@ static JSValue js_string_toWellFormed(JSContext *ctx, JSValueConst this_val,
 }
 
 static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv, int lastIndexOf);
+static JSValue js_string_includes(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv, int magic);
+
+/* String.prototype.{indexOf,lastIndexOf} / {includes,startsWith,endsWith}
+   with a tagged receiver, needle, or position: unwrap each tagged operand
+   to its payload (borrowed), re-enter the SAME builtin on the concretes
+   -- the existing C search, and the existing journal call now recording
+   the PAYLOAD strings -- with the primary operand's note staged so the
+   journal entry ties the token to the tracked value it probed (receiver's
+   note first, else the needle's; a tagged position alone names nothing).
+   The concrete result (indexOf's integer, includes' boolean) re-wraps
+   with a Combine-derived note, exactly like the parse pipelines. A
+   nested tagged payload re-intercepts one level per pass (the journal
+   entry then carries the note nearest the concrete string); a throwing
+   concrete call propagates untouched. */
+static JSValue tt_tagged_str_search(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv,
+                                    int magic, int is_index_of)
+{
+    JSValueConst orig[3];
+    JSValueConst args2[3];
+    void *notes[3], *note, *prev_pending;
+    JSValue ret, wrapped;
+    int i, n, argc2, tt_op;
+
+    argc2 = argc > 2 ? 2 : argc;
+    n = 1 + (argc2 > 1 ? 2 : 1);      /* this + needle (+ position) */
+    orig[0] = this_val;
+    orig[1] = argv[0];                /* padded to arity 1 */
+    orig[2] = argc2 > 1 ? argv[1] : JS_UNDEFINED;
+    for (i = 0; i < 3; i++) {
+        if (i < n && tt_value_is_tagged(orig[i])) {
+            JSObject *p = JS_VALUE_GET_OBJ(orig[i]);
+            args2[i] = p->u.tt_tagged.payload;   /* borrowed */
+            notes[i] = p->u.tt_tagged.note;
+        } else {
+            args2[i] = orig[i];
+            notes[i] = NULL;
+        }
+    }
+    prev_pending = ctx->rt->tt_cmp_note_pending;
+    if (notes[0] || notes[1])
+        ctx->rt->tt_cmp_note_pending = notes[0] ? notes[0] : notes[1];
+    if (is_index_of)
+        ret = js_string_indexOf(ctx, args2[0], argc2, args2 + 1, magic);
+    else
+        ret = js_string_includes(ctx, args2[0], argc2, args2 + 1, magic);
+    ctx->rt->tt_cmp_note_pending = prev_pending;
+    if (JS_IsException(ret))
+        return ret;
+    if (is_index_of)
+        tt_op = magic ? JS_TT_OP_LAST_INDEX_OF : JS_TT_OP_INDEX_OF;
+    else
+        tt_op = JS_TT_OP_INCLUDES + magic;
+    note = tt_combine_note(ctx, tt_op, orig, notes, n);
+    wrapped = JS_TTMakeTagged(ctx, ret, note);
+    return wrapped;
+}
+
+static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv, int lastIndexOf)
 {
     JSValue str, v;
@@ -57138,6 +57492,11 @@ static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     JSString *p1;
 
+    if (unlikely(tt_value_is_tagged(this_val) ||
+                 tt_value_is_tagged(argv[0]) ||
+                 (argc >= 2 && tt_value_is_tagged(argv[1]))))
+        return tt_tagged_str_search(ctx, this_val, argc, argv,
+                                    lastIndexOf, TRUE);
     /* concolic journal: user code probing an external string's content */
     if (JS_VALUE_GET_TAG(this_val) == JS_TAG_STRING && argc >= 1 &&
         JS_VALUE_GET_TAG(argv[0]) == JS_TAG_STRING &&
@@ -57211,6 +57570,11 @@ static JSValue js_string_includes(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     JSString *p1;
 
+    if (unlikely(tt_value_is_tagged(this_val) ||
+                 tt_value_is_tagged(argv[0]) ||
+                 (argc >= 2 && tt_value_is_tagged(argv[1]))))
+        return tt_tagged_str_search(ctx, this_val, argc, argv,
+                                    magic, FALSE);
     /* concolic journal: format checks — includes/startsWith/endsWith.
        op: magic 0 → 1 (includes), 1 → 2 (startsWith), 2 → 3 (endsWith) */
     if (JS_VALUE_GET_TAG(this_val) == JS_TAG_STRING && argc >= 1 &&
@@ -61481,7 +61845,13 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
 
     /* check for object.toJSON method */
     /* ECMA specifies this is done only for Object and BigInt */
-    if (JS_IsObject(val) || JS_IsBigInt(ctx, val)) {
+    /* TimeTravelJS: skip the probe for a tagged value -- v1 pins that a
+       payload's toJSON is NOT consulted (property-get forwarding would
+       otherwise resolve it here and silently de-tag through it); the
+       final switch below still refuses, and a replacer still gets its
+       chance to swap the tagged value for a concrete one first. */
+    if ((JS_IsObject(val) && !tt_value_is_tagged(val)) ||
+        JS_IsBigInt(ctx, val)) {
         JSValue f = JS_GetProperty(ctx, val, JS_ATOM_toJSON);
         if (JS_IsException(f))
             goto exception;
@@ -61510,6 +61880,24 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
     case JS_TAG_OBJECT:
         if (JS_IsFunction(ctx, val))
             break;
+        /* TimeTravelJS: the serializer walk reached a tagged value (the
+           value at `key`, post-toJSON and post-replacer). Refuse loudly,
+           naming the field -- the COW/coercion discipline: a precise
+           worklist entry, never silent de-tagging into "{}"/"null". The
+           wrapper has a null proto, so the toJSON probe above never saw
+           a method and nothing ran twice. Forwarding is the documented
+           follow-up: serialize with the payload substituted and wrap
+           the result string with a Combine-derived note. A replacer
+           that swaps the tagged value for a concrete one never gets
+           here. Untagged values pay one class_id compare. */
+        if (unlikely(tt_value_is_tagged(val))) {
+            const char *k = JS_ToCString(ctx, key);
+            JS_ThrowTypeError(ctx,
+                              "JSON.stringify reached a tagged value at '%s'",
+                              k ? k : "?");
+            JS_FreeCString(ctx, k);
+            goto exception;
+        }
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
     case JS_TAG_INT:
@@ -61555,6 +61943,12 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
     if (JS_IsObject(val)) {
         p = JS_VALUE_GET_OBJ(val);
         cl = p->class_id;
+        if (unlikely(cl == JS_CLASS_TT_TAGGED)) {
+            /* backstop only: every real path refuses in js_json_check
+               first, naming the field. Nothing may silently de-tag. */
+            JS_ThrowTypeError(ctx, "JSON.stringify reached a tagged value");
+            goto exception;
+        }
         if (cl == JS_CLASS_STRING) {
             val = JS_ToStringFree(ctx, val);
             if (JS_IsException(val))
@@ -73525,14 +73919,20 @@ int JS_TTCmpCount(JSRuntime *rt)
 }
 
 /* op: 0 eq, 1 includes, 2 startsWith, 3 endsWith, 4 indexOf. The returned
-   strings point into the runtime journal (NUL-terminated, ASCII). */
-int JS_TTCmpGet(JSRuntime *rt, int i, int *op, const char **a, const char **b)
+   strings point into the runtime journal (NUL-terminated, ASCII). *note
+   (out param optional: pass NULL if uninterested) receives the host note
+   of the tagged value the token probed -- BORROWED from that value,
+   valid while it lives; NULL for a compare of concretes. */
+int JS_TTCmpGet(JSRuntime *rt, int i, int *op, const char **a, const char **b,
+                void **note)
 {
     if (i < 0 || i >= rt->tt_cmp_len)
         return -1;
     *op = rt->tt_cmp[i].op;
     *a = rt->tt_cmp[i].a;
     *b = rt->tt_cmp[i].b;
+    if (note)
+        *note = rt->tt_cmp[i].note;
     return 0;
 }
 
@@ -76904,7 +77304,7 @@ EXPORT("tt_cmp_json") char *tt_cmp_json(void)
     w = out;
     *w++ = '[';
     for (i = 0; i < n; i++) {
-        if (JS_TTCmpGet(g_rt, i, &op, &a, &b))
+        if (JS_TTCmpGet(g_rt, i, &op, &a, &b, NULL))
             break;
         if (i)
             *w++ = ',';

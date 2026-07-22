@@ -493,8 +493,9 @@ opcodes.** Every fast guard in the dispatch loop is tag-exact
 object — always misses them and falls into `js_add_slow`,
 `js_binary_arith_slow`, `js_unary_arith_slow`, `js_post_inc_slow`,
 `js_not_slow`, `js_binary_logic_slow`, `js_shr_slow`,
-`js_relational_slow`, or `js_eq_slow`, each of which now opens with a
-tagged intercept that recurses into itself on the unwrapped payloads.
+`js_relational_slow`, `js_eq_slow`, or `js_strict_eq_slow`, each of
+which now opens with a tagged intercept that recurses into itself on the
+unwrapped payloads.
 `JS_ConcatString` carries the same intercept, which is what makes the
 template-literal engine propagate: evaluated templates compile to
 `"str".concat(part, …)`, and the pristine `js_string_concat` builtin
@@ -510,13 +511,197 @@ primitives **before** the slow helpers (`TT_COERCE_SLOT`, so bytecode
 skips tagged values — at operator sites the helper unwraps them, and at
 property-KEY sites the C path throws exactly the TypeError the in-loop
 coercion would have thrown, which keeps key coercion pinned to today's
-behavior. Two more deliberate boundaries: strict equality never unwraps
-(identity semantics, `tagged(5) === 5` is `false` as today), and
-truthiness/branching on a tagged value is untouched (a tagged boolean is
-an object and stays truthy — conditional behavior is the next problem).
-Relational and loose-equality results are therefore tagged *values*
-(`tagged(true)`), faithful to the rule but only meaningful to hosts
-until branches learn about them.
+behavior.
+
+Strict equality (`===`/`!==` and the `switch` case-compare, which
+compiles to the same `strict_eq` opcode) takes the **same unwrap path**
+as loose equality: `tagged("a") === "a"` is `tagged(true)`,
+`tagged(5) === tagged(5)` (distinct wrappers, equal payloads) is
+`tagged(true)`, and `Combine` sees `JS_TT_OP_STRICT_EQ`/`_STRICT_NEQ`
+with the original operands. One carve-out: the reflexive compare of a
+tagged value against **itself** (`x === x`, the same object) keeps its
+concrete identity answer — `true`, no hook call. Two compile-time
+consequences keep every spelling of the operator on that one path: the
+peephole fusions of `=== null`/`=== undefined` into the `is_null`/
+`is_undefined` short opcodes are gone (they would skip the unwrap and
+hand the branch a concrete boolean where the unfused compare hands it
+the tagged result the cond hook observes), and the parameter/
+destructuring **default-value probes** — which are exact-`undefined`
+tag tests, not comparisons — now emit `OP_is_undefined` directly, so a
+tagged argument (even one whose payload *is* `undefined`) never
+triggers a default and never fires a hook.
+
+## Tagged truthiness and conditionals
+
+A tagged value reports its **payload's truthiness** everywhere `ToBool`
+runs (nested tagged payloads recurse): `!tagged(0)` is `true`,
+`Boolean(tagged(""))` is `false`, and an `if`/`while` branch takes the
+payload's side. Value coercion and observation are strictly separate:
+
+```c
+typedef void JSTTCondFn(JSContext*, void *note, int taken_true);
+void JS_TTSetCondHook(JSRuntime *rt, JSTTCondFn *cond);
+```
+
+Only the **control-flow branch opcodes** fire the hook — `if_true`/
+`if_false` and their 8-bit shrunk forms, which is where every branching
+spelling lands: `if`/`else`, `?:`, `&&`/`||` (and `&&=`/`||=`), and the
+`for`/`while`/`do` condition tests, plus a `switch` whose case-compare
+produced a tagged boolean (the observed note is then the Combine-derived
+note of that compare). One conditional evaluated = one observation, with
+the tested value's outer note and the payload-truthiness branch taken;
+an untagged operand never calls the hook, and plain coercions (`!`,
+`Boolean()`, internal protocol checks like an iterator's `done`) stay
+silent. The `??`/`?.` nullish probe is **identity of the payload**, not
+truthiness: `tagged(null) ?? z` evaluates `z`, but no cond observation
+fires. The hook is per-runtime state, so an observation stream is
+deterministic across fork and serialize→hydrate — the note travels with
+the value.
+
+## Builtin forwarding, first class: `JSON.stringify`
+
+A structure containing a tagged value used to serialize the wrapper as
+a null-proto object — `{"k":{}}` — silently discarding the tag. The
+serializer walk now **refuses loudly** instead: reaching a tagged value
+(post-`toJSON`, post-replacer) throws
+`TypeError: JSON.stringify reached a tagged value at 'k'`, naming the
+field (array index or property key; the top level is the spec's `''`
+key). The wrapper's null proto means the `toJSON` probe never finds a
+method — the payload's own `toJSON` is *not* consulted, so nothing runs
+twice and nothing de-tags through the payload's serializer. A replacer
+that swaps the tagged value for a concrete one serializes normally; the
+untagged path is byte-identical and allocation-free (one class_id
+compare on values the walk already classifies). The refusal is the
+COW/coercion discipline: a precise worklist entry, not silent
+corruption. **Forwarding is the documented follow-up**: a tagged field
+makes the whole result tagged — serialize with the payload substituted
+for the wrapper, then wrap the result string with a Combine-derived
+note (a `JS_TT_OP_JSON` code), because a string derived from a tracked
+value stays tracked.
+
+## Builtin forwarding: the string-search five
+
+`String.prototype.indexOf` / `lastIndexOf` / `includes` / `startsWith` /
+`endsWith` — the concolic journal's native probes — now **forward**. A
+tagged receiver, needle, or position argument unwraps to its payload and
+the engine's own C search re-runs on the concretes (one intercept at the
+top of each builtin, re-entering itself — no re-implementation). Three
+things happen at once:
+
+- **Search on payloads**: `includes.call(tagged("abc"), "b")` searches
+  `"abc"`, a tagged needle searches for its payload, and a tagged
+  position unwraps to its numeric payload for the offset. (Reaching the
+  builtin through a tagged receiver still needs `Function.prototype.call`
+  — method *lookup* on the wrapper is the property-forwarding follow-up.)
+- **Journal correctly**: the entry records the payload token (never a
+  wrapper stringification) **with the tagged operand's note** — the
+  receiver's, else the needle's — in a new `TTCmpEnt.note` field
+  surfaced by `JS_TTCmpGet` (borrowed from the value; NULL for concrete
+  compares; dedup keeps one entry per token and a tagged occurrence
+  ties its note to it). One entry per call, exactly as concretely.
+- **Forward the result**: the concrete integer/boolean re-wraps via the
+  Combine hook (`JS_TT_OP_INDEX_OF` / `_LAST_INDEX_OF` / `_INCLUDES` /
+  `_STARTS_WITH` / `_ENDS_WITH` with the original operands), so a
+  search over a tracked string yields a tracked result that branches
+  through the cond hook and rides fork + serialize→hydrate intact.
+
+The all-concrete path is byte-identical and allocation-free — the
+intercept is a tag test per operand already in hand.
+
+## Property get forwards to the payload
+
+Reading a property of a tagged value used to hit the wrapper's null
+prototype (`tagged("abc").length` → `undefined`, `.includes` →
+TypeError). A get on a tagged **receiver** now forwards to the payload
+at the property-get chokepoint — one `JS_CLASS_TT_TAGGED` compare in
+the interpreter's inline field walk (routing to the generic path, since
+the inline walk would complete the null-proto miss itself) and one in
+`JS_GetPropertyInternal`, the `TT_COW_HIT` fast-miss shape; untagged
+receivers pay a single predictable class-id test and are otherwise
+byte-identical. The forward runs **the engine's own get against the
+payload** (string length/index exotics, own/inherited props, getters
+with the payload as `this`; a nested tagged payload reads off the
+deepest payload), and the result stays tracked:
+`JS_TTMakeTagged(v, Combine(JS_TT_OP_GET_FIELD, {receiver, key},
+{note, NULL}))` — a missing key yields a *tracked* `undefined` with
+provenance. Three sharp edges, by design:
+
+- **A FUNCTION result returns unwrapped** — method lookup is
+  resolution, not a data derivation. The receiver stays `this` (the
+  compiler's `get_field2` keeps it), so `taggedString.includes("y")`
+  now works as a *plain call*: lookup resolves `String.prototype.
+  includes` off the payload, and the tagged `this` flows into the
+  forwarded search builtins — journal, note, and tagged result intact.
+  This closes the `.call`-only caveat.
+- **A stored tagged value flattens**: `tagged({v: taggedFive}).v` is a
+  single wrapper over `5`, the stored value joining the hook args with
+  its note — never wrapper-in-wrapper.
+- **Tagged keys stay pinned and cannot cross with receivers**:
+  `obj[taggedKey]` (and `taggedReceiver[taggedKey]` — the key coerces
+  first) still refuses. `JS_ToPrimitiveFree` now refuses tagged values
+  explicitly with the same `TypeError` the empty wrapper produced
+  before, so get-forwarding can never leak the payload's `toString`/
+  `valueOf`/`Symbol.toPrimitive` into a coercion pipeline and silently
+  de-tag — unsupported pipelines stay loud worklist entries. The
+  `JSON.stringify` `toJSON` probe likewise skips tagged values,
+  keeping the v1 "payload `toJSON` not consulted" pin.
+
+A throwing forwarded get (payload `null`/`undefined`, a throwing
+getter) propagates unwrapped. Payload getters run as plain C calls
+(defer slots disarmed) so their results flow back through the wrap
+rather than a parked frame.
+
+## Property set forwards to the payload
+
+The write side mirrors the read side, making get and set exact
+inverses on the payload. A set on a tagged **receiver** forwards at
+`JS_SetPropertyInternal`'s receiver branch (one class-id compare, the
+`TT_COW_HIT` fast-miss shape) plus a defensive test on the interpreter's
+inline fast-set path — that path is own-property-gated and a wrapper
+never owns properties, but the test keeps "nothing ever writes the
+wrapper" structural. The forward re-enters **the engine's own set on
+the payload**: own/inherited setters run with the payload as `this`,
+string/array exotic behavior applies (`tagged("abc")[0] = "x"` is the
+payload's silent sloppy no-op / real strict TypeError, never a wrapper
+property), a throwing set propagates unwrapped, and — the load-bearing
+property — **automatic COW capture composes**: a forwarded write to a
+baseline payload inside a checked-in flow records the same first-write
+delta a direct write records (asserted via the delta count, deduped on
+the second write, isolated after checkout), because the real set path
+runs, nothing re-implemented. A tagged **value** being stored is stored
+as-is — no unwrap, no extra wrap; the get forward flattens it with a
+combined note on read-back. Tagged **keys** still refuse on any
+receiver (the key coerces before the receiver forwards).
+
+## Has/enumerate forward to the payload
+
+The remaining reflection reads complete get/set. `k in t` answers over
+the **payload's** chain (own + inherited) as a **concrete** boolean —
+existence is not derived data, so no wrap and no hook, the
+reflexive-identity discipline; a non-object payload gets the operator's
+real TypeError. `for (k in t)` swaps the payload in at
+`build_for_in_iterator`, so the walk is *literally* a for-in over the
+payload — enumerability, shadowing, prototype order, string index keys
+(`"0","1","2"` for `tagged("abc")`), and the empty loop for a nullish
+payload all come from the engine's own iterator. `Object.keys` /
+`values` / `entries`, `getOwnPropertyNames`/`Symbols`, and
+`Reflect.ownKeys` forward at `JS_GetOwnPropertyNames2`: names and the
+enumerability re-check run against the payload (**keys stay concrete
+strings** — a tagged key string would poison joins via the coercion
+pin), while `values`/`entries` fetch each value **through the
+wrapper**, so they ride the get-forward and stay tracked
+(`Object.values(tagged({a:5}))` → `[tagged 5]`; a stored tagged value
+arrives flattened). Three one-compare class tests; untagged paths
+byte-identical and allocation-free.
+
+The wrapper's own raw view is no longer JS-visible, so the suite's
+wrapper-inertness proofs moved to a new C probe:
+`JS_TTOwnPropCount(ctx, v)` counts v's **unforwarded** shape-level own
+properties — 0 for a wrapper before and after forwarded writes and
+enumeration, while the payload's count grows. `seal`/`freeze`,
+descriptors, `defineProperty`/`deleteProperty`, spread-copy internals,
+and `Reflect.set` receiver-mixing keep that raw wrapper view and stay
+named follow-ups.
 
 The combinetest harness drives the oracle: exact payloads for
 arithmetic/bitwise/shift (`tagged(5)+1 → 6`, `tagged(6)&3 → 2`), concat
@@ -526,10 +711,44 @@ coercions (`+tagged("5")` is the *number* 5; `String(tagged(9)) → "9"`;
 `parseInt(tagged("42")) → 42`; nothing collapses to NaN or de-tags),
 `Combine` seeing the right op / notes / arity for one- and two-tagged
 operand cases, a faithful `TypeError` from `tagged(Symbol()) * 1` with
-zero Combine calls, unchanged out-of-scope behavior (strict eq, typeof,
-truthiness, tagged property keys, `new String(tagged)`), and a
-propagated result riding problem 1's fork and serialize→hydrate paths
-with its combined note intact.
+zero Combine calls, strict equality unwrapping in every spelling
+(`tagged(5) === 5` → `tagged(true)`, strict-vs-loose payload semantics
+kept distinct, `=== null`/`=== undefined` literal forms, the `switch`
+case-compare, reflexive `x === x` staying concrete and hook-free),
+default-value probes never unwrapping (a tagged argument — even
+`tagged(undefined)` — rides through with zero Combine and zero cond
+calls), payload truthiness with the cond hook firing at exactly the
+branch sites (`?:`, `if`, `&&`/`||`/`||=`, loop conditions once per
+evaluation, switch case-compares payload-selecting their case) and
+nowhere else (`!`, `Boolean()`, `??`/`?.` all silent, `??` unwrapping
+the payload for its nullish test), `JSON.stringify` refusing loudly at
+the named field (`at 'k'`, `at '0'`, nested; payload `toJSON` not
+consulted; a replacer swap serializes; untagged structures
+byte-identical, pretty-printing included), the search five unwrapping
+each operand (receiver via `.call` or plain method call, needle,
+position), journaling the payload token with the right note and exactly
+one entry per call, and re-wrapping results that branch and round-trip,
+property gets forwarding (string length/index, object own/getter/
+inherited/missing, nested payloads with the outer note, stored tagged
+values flattening with mask 5 arity 3, functions passing through
+unwrapped into working plain method calls, throwing gets unwrapped,
+tagged keys still refusing on any receiver, untagged gets
+byte-identical), property sets forwarding (a second get and the raw
+payload both see the write while the wrapper owns nothing — asserted
+through the raw `JS_TTOwnPropCount` probe, tagged values stored as-is
+and flattened on read-back, payload setters with payload `this`,
+string exotic sloppy/strict semantics, throwing and tagged-key sets
+refusing, and a baseline-payload write recording exactly one deduped
+COW delta that checkout isolates), has/enumerate forwarding (`in` over
+own+inherited payload props concrete and hook-free with the real
+TypeError for primitive payloads, keys/getOwnPropertyNames/ownKeys as
+concrete payload names, values/entries tracked through the wrapper,
+for-in over object/proto/string payloads, and the wrapper's raw count
+pinned at zero throughout), unchanged out-of-scope behavior (typeof,
+tagged property keys, `new String(tagged)`), and
+propagated results riding problem 1's fork and serialize→hydrate paths
+with their notes intact — including a cond observation stream that is
+byte-identical across the original, a forked arm, and a hydrated copy.
 
 ## Wire format (`TTFL05`)
 

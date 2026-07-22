@@ -978,7 +978,11 @@ void JS_TTSetStepFilename(JSContext *ctx, const char *filename);
    the machine. op: 0 eq, 1 includes, 2 startsWith, 3 endsWith, 4 indexOf. */
 void JS_TTCmpClear(JSRuntime *rt);
 int JS_TTCmpCount(JSRuntime *rt);
-int JS_TTCmpGet(JSRuntime *rt, int i, int *op, const char **a, const char **b);
+/* note (optional out param, pass NULL if uninterested): the host note of
+   the tagged value the recorded token probed -- BORROWED from that value
+   (valid while it lives), NULL for a compare of concretes. */
+int JS_TTCmpGet(JSRuntime *rt, int i, int *op, const char **a, const char **b,
+                void **note);
 /* Script-level let/const/class bindings (global lexical environment). */
 JSValue JS_TTGlobalLexicals(JSContext *ctx);
 /* Clear the runtime's stack-frame chain (fresh session over a rewound heap). */
@@ -1106,17 +1110,72 @@ JSValue JS_TTPayload(JSContext *ctx, JSValueConst v);
 /* the note pointer (borrowed; NULL if v is not tagged) */
 void *JS_TTNote(JSValueConst v);
 JS_BOOL JS_TTIsTagged(JSValueConst v);
+/* the UNFORWARDED own-property count of v ITSELF (shape-level; fast-array
+   elements not included; -1 if v is not an object). For a tagged value
+   this is the WRAPPER's own view -- has/enumerate forwarding makes the
+   JS-visible view the payload's, so this is the oracle that forwarding
+   never lands anything on the wrapper. */
+int JS_TTOwnPropCount(JSContext *ctx, JSValueConst v);
 
 /* Tagged-value propagation through value-producing operations: when any
-   operand of an arithmetic / bitwise / shift / relational / loose-equality
-   op, a string concatenation, or one of the covered coercion pipelines
+   operand of an arithmetic / bitwise / shift / relational / equality
+   op (loose AND strict, including the switch case-compare), a string
+   concatenation, or one of the covered coercion pipelines
    (unary +, String(x), parseInt/parseFloat) is tagged, the engine unwraps
    each operand's payload, runs ITS OWN operation on the concretes, and
    re-wraps the real result as a fresh tagged value whose note derives
    from the operand notes through the combine hook. A throwing concrete
-   op propagates faithfully. Strict equality keeps identity semantics
-   (never unwraps), and property-KEY coercion is untouched: a tagged key
-   throws exactly as an unknown object key does today.
+   op propagates faithfully. One strict-equality carve-out: the reflexive
+   compare of a tagged value against ITSELF (the same object) keeps its
+   concrete identity answer (true for ===) with no hook call. The
+   compiler-internal exact-undefined probes (parameter and destructuring
+   defaults) are NOT comparisons and never unwrap: a tagged value -- even
+   one whose payload is undefined -- does not trigger a default.
+   Property GET on a tagged RECEIVER forwards to the payload -- the
+   engine's own get, so a string payload's length/index exotics and an
+   object payload's own/inherited/getter lookups resolve against the
+   payload -- and the result stays tracked (JS_TT_OP_GET_FIELD with the
+   receiver and the key; a nested tagged payload reads off the deepest
+   payload with ONE outer-note wrap; a stored tagged value flattens to
+   a single wrapper joining the hook args with its note). A FUNCTION
+   result returns unwrapped: method lookup is resolution, not a data
+   derivation -- the tagged receiver stays `this`, which is how a plain
+   taggedString.includes("y") call reaches the forwarded search
+   builtins. Property SET forwards symmetrically: the write lands on
+   the payload through the engine's own set path -- setters run with
+   the payload as `this`, string/array exotics apply, and the
+   automatic-COW capture fires for a baseline payload exactly as for a
+   direct write (flow isolation composes). A tagged VALUE being stored
+   is stored as-is (the get forward flattens on read-back), and a
+   throwing set propagates unwrapped. Has/enumerate forward too:
+   `k in t` answers over the payload's chain as a CONCRETE boolean
+   (existence is not derived data; a non-object payload gets the
+   operator's real TypeError), for-in walks the payload's enumerable
+   chain exactly as a direct for-in on the payload (string payloads
+   enumerate their indices), and Object.keys/values/entries/
+   getOwnPropertyNames/getOwnPropertySymbols/Reflect.ownKeys enumerate
+   the payload's names -- keys stay concrete strings while values/
+   entries fetch each value THROUGH the wrapper, so they ride the
+   get-forward and stay tracked. seal/freeze, descriptors,
+   defineProperty/deleteProperty, spread-copy internals, and
+   Reflect.set receiver-mixing keep the wrapper's raw view and stay
+   named follow-ups (JS_TTOwnPropCount surfaces that raw view). Property-KEY coercion is
+   untouched: a tagged key still refuses (ToPrimitive on a tagged value
+   throws the same TypeError the empty wrapper produced before
+   forwarding -- unsupported coercion pipelines stay loud worklist
+   entries and never leak the payload's toString/valueOf into a silent
+   de-tag). JSON.stringify REFUSES loudly (a named
+   TypeError at the field) when its walk reaches a tagged value, rather
+   than silently de-tagging it into "{}"; forwarding -- serialize with
+   the payload substituted, wrap the result string with a combined
+   note -- is the documented follow-up. The string-search builtins
+   (indexOf/lastIndexOf/includes/startsWith/endsWith) forward: a tagged
+   receiver, needle, or position unwraps to its payload, the engine's
+   own search runs on the concretes, the comparison journal records the
+   payload token WITH the tagged operand's note (JS_TTCmpGet), and the
+   result (integer / boolean) re-wraps with a combined note. Reaching
+   them through a tagged receiver still requires Function.prototype.call
+   -- method lookup on the wrapper is the property-forwarding follow-up.
    The 'op' the hook receives: */
 enum {
     JS_TT_OP_ADD = 1,         /* also string concatenation via + */
@@ -1146,6 +1205,14 @@ enum {
     JS_TT_OP_TO_STRING,       /* String(x) */
     JS_TT_OP_PARSE_INT,
     JS_TT_OP_PARSE_FLOAT,
+    JS_TT_OP_STRICT_EQ,       /* === (also the switch case-compare) */
+    JS_TT_OP_STRICT_NEQ,      /* !== */
+    JS_TT_OP_INDEX_OF,        /* String.prototype.indexOf */
+    JS_TT_OP_LAST_INDEX_OF,   /* String.prototype.lastIndexOf */
+    JS_TT_OP_INCLUDES,        /* String.prototype.includes */
+    JS_TT_OP_STARTS_WITH,     /* String.prototype.startsWith */
+    JS_TT_OP_ENDS_WITH,       /* String.prototype.endsWith */
+    JS_TT_OP_GET_FIELD,       /* property get on a tagged receiver */
 };
 /* Derive the RESULT note from the operand notes (NULL entries = untagged
    operands). args are the ORIGINAL operand values (tagged wrappers
@@ -1157,6 +1224,21 @@ enum {
 typedef void *JSTTCombineFn(JSContext *ctx, int op, JSValueConst *args,
                             void **notes, int n);
 void JS_TTSetCombineHook(JSRuntime *rt, JSTTCombineFn *combine);
+
+/* Tagged-value truthiness and conditionals. A tagged value reports its
+   PAYLOAD's truthiness everywhere ToBool runs (nested tagged payloads
+   recurse): !tagged(0) is true, Boolean(tagged("")) is false. Internal
+   coercions never fire a hook. Separately, when a CONTROL-FLOW branch
+   tests a tagged value -- if / while / for / do conditions, ?:, the
+   &&, || (and &&=, ||=) short-circuits -- the cond hook observes it:
+   taken_true is the payload-truthiness branch about to be taken, note
+   is the tested value's note (borrowed; the OUTER note of a nested
+   tagged value). One conditional evaluated = one call; an untagged
+   operand never calls it. The ?? / ?. nullish probe is identity of the
+   payload (null-or-undefined), NOT truthiness: it unwraps but never
+   fires the cond hook. The hook must not call back into JS. */
+typedef void JSTTCondFn(JSContext *ctx, void *note, int taken_true);
+void JS_TTSetCondHook(JSRuntime *rt, JSTTCondFn *cond);
 /* select which debug info is stripped from the compiled code */
 #define JS_STRIP_SOURCE (1 << 0) /* strip source code */
 #define JS_STRIP_DEBUG  (1 << 1) /* strip all debug info including source code */

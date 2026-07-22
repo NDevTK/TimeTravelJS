@@ -135,11 +135,60 @@
  *                               Asserts exact payloads ("x"+t("y") is
  *                               "xy", +t("5") is the number 5 -- the real
  *                               op ran), faithful concrete throws and
- *                               NaNs, two-tagged combines, strict-eq /
- *                               typeof / truthiness / property-key
- *                               coercion staying exactly as today, and a
- *                               propagated result round-tripping through
- *                               problem 1's fork + serialize paths.
+ *                               NaNs, two-tagged combines, strict-eq
+ *                               (===/!==, the switch case-compare, and
+ *                               the null/undefined literal forms)
+ *                               unwrapping exactly like loose-eq with
+ *                               reflexive x === x staying concrete and
+ *                               hook-free, the parameter/destructuring
+ *                               default probes never unwrapping, payload
+ *                               truthiness everywhere ToBool runs (with
+ *                               the cond hook observing exactly the
+ *                               control-flow branches -- if / ?: / && /
+ *                               || / ||= / loops / switch -- while ?? and
+ *                               ?. stay payload-nullish and silent, and
+ *                               ! / Boolean() coerce silently), typeof /
+ *                               property-key coercion staying exactly as
+ *                               today, JSON.stringify refusing loudly at
+ *                               the named field instead of silently
+ *                               de-tagging (payload toJSON not consulted;
+ *                               untagged structures byte-identical), the
+ *                               string search builtins (indexOf/
+ *                               lastIndexOf/includes/startsWith/endsWith)
+ *                               searching the PAYLOAD, journaling the
+ *                               payload token with the tagged operand's
+ *                               note (JS_TTCmpGet), and re-wrapping the
+ *                               result (tagged receiver via .call, tagged
+ *                               needle, tagged position for the offset;
+ *                               concretes byte-identical with a NULL
+ *                               journal note), property gets forwarding
+ *                               to the payload (length/index exotics,
+ *                               own/getter/inherited/missing props,
+ *                               nested payloads wrapping once with the
+ *                               outer note, stored tagged values
+ *                               flattening, functions passing through
+ *                               unwrapped so plain method calls reach
+ *                               the forwarded builtins, tagged keys
+ *                               still refusing, untagged gets
+ *                               byte-identical), property sets
+ *                               forwarding as the get's inverse (writes
+ *                               land on the payload -- never the
+ *                               wrapper, per the raw JS_TTOwnPropCount
+ *                               probe -- through setters/exotics with
+ *                               tagged values stored as-is, and a write
+ *                               to a BASELINE payload routing through
+ *                               automatic COW: one deduped delta,
+ *                               isolated at checkout), has/enumerate
+ *                               forwarding (`in` concrete over the
+ *                               payload chain with the real TypeError
+ *                               for primitive payloads, keys concrete,
+ *                               values/entries tracked via the wrapper,
+ *                               for-in over object/proto/string
+ *                               payloads), and propagated results (a
+ *                               strict-eq boolean, a search integer, a
+ *                               get result, a cond observation stream)
+ *                               riding problem 1's fork + serialize
+ *                               paths.
  */
 #include "quickjs.h"
 #include "cutils.h"     /* DynBuf, for the tagged-value note hooks */
@@ -250,7 +299,7 @@ static const char *BASELINE_SRC =
 "  var t = null;\n"
 "  var u = null;\n"
 "  var fed = yield \"t0\";\n"
-"  yield \"t1:\" + (t === null ? \"null\" : typeof t) + \":\" + fed;\n"
+"  yield \"t1:\" + (t ? typeof t : \"null\") + \":\" + fed;\n"
 "  return \"t-end\";\n"
 "}\n";
 
@@ -2543,6 +2592,58 @@ static void *tg_combine(JSContext *ctx, int op, JSValueConst *args,
     return out;
 }
 
+/* the Cond hook: record each control-flow observation of a tagged value
+   (note string + payload-truthiness branch), and append to a log so two
+   timelines' observation streams can be compared byte-for-byte */
+static int cnd_calls, cnd_last_taken;
+static char cnd_last_note[128];
+static char cnd_log[1024];
+
+static void tg_cond(JSContext *ctx, void *note, int taken_true)
+{
+    size_t off;
+    (void)ctx;
+    cnd_calls++;
+    cnd_last_taken = taken_true;
+    snprintf(cnd_last_note, sizeof(cnd_last_note), "%s",
+             note ? (char *)note : "-");
+    off = strlen(cnd_log);
+    if (off + strlen(cnd_last_note) + 8 < sizeof(cnd_log))
+        snprintf(cnd_log + off, sizeof(cnd_log) - off, "%s:%d;",
+                 cnd_last_note, taken_true);
+}
+
+/* a no-op step handler: opens the comparison-journal gate (which requires
+   a handler installed) without enabling stepping */
+static int tg_step_noop(JSContext *ctx, int line, int col, int depth,
+                        int parkable, void *opaque)
+{
+    (void)ctx; (void)line; (void)col; (void)depth; (void)parkable;
+    (void)opaque;
+    return 0;
+}
+
+/* find a journal entry (op, a, b); nonnegative index if present, with the
+   entry's note (borrowed) in *note_out */
+static int ct_journal_find(JSRuntime *rt, int want_op, const char *wa,
+                           const char *wb, void **note_out)
+{
+    int i, op;
+    const char *a, *b;
+    void *nt;
+
+    for (i = 0; i < JS_TTCmpCount(rt); i++) {
+        if (JS_TTCmpGet(rt, i, &op, &a, &b, &nt))
+            break;
+        if (op == want_op && !strcmp(a, wa) && !strcmp(b, wb)) {
+            if (note_out)
+                *note_out = nt;
+            return i;
+        }
+    }
+    return -1;
+}
+
 /* install tagged(payload, strdup(note_str)) as a global */
 static void ct_set_tagged(JSContext *ctx, const char *name, JSValue payload,
                           const char *note_str)
@@ -2734,12 +2835,60 @@ static int cmd_combinetest(void)
 
     tg_clones = tg_serializes = tg_deserializes = tg_frees = tg_live = 0;
     cb_calls = 0;
+    cnd_calls = 0;
+    cnd_log[0] = 0;
     tg_set_hooks(rt);
     JS_TTSetCombineHook(rt, tg_combine);
+    JS_TTSetCondHook(rt, tg_cond);
     at_t = JS_NewAtom(ctx, "t");
 
     ct_set_tagged(ctx, "T5", JS_NewInt32(ctx, 5), "H5");
+    ct_set_tagged(ctx, "T5B", JS_NewInt32(ctx, 5), "H5B");
+    ct_set_tagged(ctx, "TNULL", JS_NULL, "HN");
+    ct_set_tagged(ctx, "TUND", JS_UNDEFINED, "HU");
     ct_set_tagged(ctx, "T6", JS_NewInt32(ctx, 6), "H6");
+    ct_set_tagged(ctx, "T0", JS_NewInt32(ctx, 0), "H0");
+    ct_set_tagged(ctx, "TES", eval_val(ctx, "''"), "HES");
+    ct_set_tagged(ctx, "TJ", eval_val(ctx, "({toJSON(){ return 'tj'; }})"),
+                  "HJ");
+    ct_set_tagged(ctx, "TSTR", eval_val(ctx, "'abc'"), "HS");
+    ct_set_tagged(ctx, "TB", eval_val(ctx, "'b'"), "HB");
+    ct_set_tagged(ctx, "TGO", eval_val(ctx, "({a: 5})"), "HG");
+    ct_set_tagged(ctx, "TGG",
+                  eval_val(ctx, "({a: 21, get g() { return this.a * 2; }})"),
+                  "HGG");
+    ct_set_tagged(ctx, "TCH",
+                  eval_val(ctx, "Object.create({ip: 11})"), "HCH");
+    ct_set_tagged(ctx, "TSV", eval_val(ctx, "({v: T5})"), "HSV");
+    {
+        /* TNN = tagged(tagged({z: 9})): nested payload with a data prop */
+        char *n_in = strdup("HNI"), *n_out = strdup("HNO");
+        JSValue t_in, glob;
+        assert(n_in && n_out);
+        tg_live += 2;
+        t_in = JS_TTMakeTagged(ctx, eval_val(ctx, "({z: 9})"), n_in);
+        assert(!JS_IsException(t_in));
+        glob = JS_GetGlobalObject(ctx);
+        if (JS_SetPropertyStr(ctx, glob, "TNN",
+                              JS_TTMakeTagged(ctx, t_in, n_out)) < 0)
+            die(ctx, "set TNN");
+        JS_FreeValue(ctx, glob);
+    }
+    {
+        /* TNEST = tagged(tagged(0)): nested payloads recurse for
+           truthiness; a conditional observes only the OUTER note */
+        char *n_in = strdup("HIN"), *n_out = strdup("HOUT");
+        JSValue t_in, glob;
+        assert(n_in && n_out);
+        tg_live += 2;
+        t_in = JS_TTMakeTagged(ctx, JS_NewInt32(ctx, 0), n_in);
+        assert(!JS_IsException(t_in));
+        glob = JS_GetGlobalObject(ctx);
+        if (JS_SetPropertyStr(ctx, glob, "TNEST",
+                              JS_TTMakeTagged(ctx, t_in, n_out)) < 0)
+            die(ctx, "set TNEST");
+        JS_FreeValue(ctx, glob);
+    }
     ct_set_tagged(ctx, "T2", JS_NewInt32(ctx, 2), "H2");
     ct_set_tagged(ctx, "T3", JS_NewInt32(ctx, 3), "H3");
     ct_set_tagged(ctx, "T9", JS_NewInt32(ctx, 9), "H9");
@@ -2833,6 +2982,594 @@ static int cmd_combinetest(void)
     ct_expect_bool(ctx, "T2 != 2", 0, JS_TT_OP_NEQ, 1);
     printf("COMBINE:relational/loose-eq ok\n");
 
+    /* --- strict equality: the same unwrap -> compare -> re-wrap -------- */
+    ct_expect_bool(ctx, "TY === 'y'", 1, JS_TT_OP_STRICT_EQ, 1);
+    ct_expect_bool(ctx, "TY === 'b'", 0, JS_TT_OP_STRICT_EQ, 1);
+    ct_expect_bool(ctx, "T5 === 5", 1, JS_TT_OP_STRICT_EQ, 1);
+    ct_expect_bool(ctx, "5 === T5", 1, JS_TT_OP_STRICT_EQ, 2);
+    ct_expect_bool(ctx, "T5 !== 6", 1, JS_TT_OP_STRICT_NEQ, 1);
+    /* the payload comparison is the REAL strict one: no coercion... */
+    ct_expect_bool(ctx, "T5 === '5'", 0, JS_TT_OP_STRICT_EQ, 1);
+    /* ...while loose on the same operands still coerces */
+    ct_expect_bool(ctx, "T5 == '5'", 1, JS_TT_OP_EQ, 1);
+    /* two tagged: distinct objects with equal payloads compare equal */
+    ct_expect_bool(ctx, "T5 === T5B", 1, JS_TT_OP_STRICT_EQ, 3);
+    ct_expect_bool(ctx, "T5 === T6", 0, JS_TT_OP_STRICT_EQ, 3);
+    printf("COMBINE:strict-eq unwraps ok\n");
+
+    /* --- strict equality against the null/undefined literals -----------
+       (these forms used to compile to the is_null/is_undefined short
+       opcodes; they now reach the same tagged strict-eq path) */
+    ct_expect_bool(ctx, "T5 === null", 0, JS_TT_OP_STRICT_EQ, 1);
+    ct_expect_bool(ctx, "T5 === undefined", 0, JS_TT_OP_STRICT_EQ, 1);
+    ct_expect_bool(ctx, "TNULL === null", 1, JS_TT_OP_STRICT_EQ, 1);
+    ct_expect_bool(ctx, "TUND === undefined", 1, JS_TT_OP_STRICT_EQ, 1);
+    ct_expect_bool(ctx, "T5 !== null", 1, JS_TT_OP_STRICT_NEQ, 1);
+    /* with a branch: identical control flow to != -- the compare yields
+       a tagged boolean, the branch takes its payload's side and the
+       cond hook observes it (combined note, taken=1) */
+    cb_calls = 0;
+    cnd_calls = 0;
+    ct_expect_concrete(ctx,
+        "(function(){ if (T5 !== null) return 'A'; return 'B'; })()", "A");
+    assert(cb_calls == 1 && cb_last_op == JS_TT_OP_STRICT_NEQ);
+    assert(cnd_calls == 1 && cnd_last_taken == 1);
+    cb_calls = 0;
+    cnd_calls = 0;
+    ct_expect_concrete(ctx,
+        "(function(){ if (T5 != null) return 'A'; return 'B'; })()", "A");
+    assert(cb_calls == 1 && cb_last_op == JS_TT_OP_NEQ);
+    assert(cnd_calls == 1 && cnd_last_taken == 1);
+    printf("COMBINE:strict-eq null/undefined literals ok\n");
+
+    /* --- reflexive: the same tagged object stays concrete, no hook ----- */
+    cb_calls = 0;
+    ct_expect_concrete(ctx, "T5 === T5", "true");
+    ct_expect_concrete(ctx, "T5 !== T5", "false");
+    ct_expect_concrete(ctx, "(function(x){ return x === x; })(T5)", "true");
+    assert(cb_calls == 0);
+    printf("COMBINE:strict-eq reflexive concrete ok\n");
+
+    /* --- switch: each case-compare is the same tagged strict-eq, and
+       the branch takes the compare PAYLOAD's side (one cond observation
+       per case-compare) --- */
+    cb_calls = 0;
+    cnd_calls = 0;
+    ct_expect_concrete(ctx,
+        "(function(){ switch (TY) { case 'y': return 'hit'; "
+        "case 'z': return 'z'; default: return 'd'; } })()", "hit");
+    assert(cb_calls == 1 && cb_last_op == JS_TT_OP_STRICT_EQ);
+    assert(cnd_calls == 1 && cnd_last_taken == 1);
+    /* a false-payload compare now correctly falls through to the next
+       case: the switch selects by PAYLOAD, exactly like concrete code */
+    cb_calls = 0;
+    cnd_calls = 0;
+    ct_expect_concrete(ctx,
+        "(function(){ switch (TY) { case 'z': return 'first'; "
+        "case 'y': return 'second'; default: return 'd'; } })()", "second");
+    assert(cb_calls == 2 && cb_last_op == JS_TT_OP_STRICT_EQ);
+    assert(cnd_calls == 2 && cnd_last_taken == 1);
+    printf("COMBINE:switch case-compare ok\n");
+
+    /* --- the default-value probes never unwrap ------------------------- */
+    {
+        JSValue p;
+        cb_calls = 0;
+        cnd_calls = 0;
+        /* a tagged argument is not `undefined`: the default must not
+           fire, the tagged value must ride through, no Combine */
+        p = ct_eval_payload(ctx, "(function(a = 99){ return a; })(T5)");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 5);
+        JS_FreeValue(ctx, p);
+        /* even a tagged UNDEFINED payload is not `undefined` */
+        p = ct_eval_payload(ctx, "(function(a = 99){ return a; })(TUND)");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_UNDEFINED);
+        JS_FreeValue(ctx, p);
+        /* destructuring defaults use the same probe */
+        p = ct_eval_payload(ctx,
+            "(function(){ var [dv = 7] = [T5]; return dv; })()");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 5);
+        JS_FreeValue(ctx, p);
+        p = ct_eval_payload(ctx,
+            "(function(){ var {q: qv = 7} = {q: T5}; return qv; })()");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 5);
+        JS_FreeValue(ctx, p);
+        assert(cb_calls == 0);
+        assert(cnd_calls == 0);   /* the probe branch is concrete: no
+                                     cond observation from a tagged arg */
+        /* an absent argument still takes the default */
+        ct_expect_concrete(ctx, "(function(a = 99){ return a; })()", "99");
+    }
+    printf("COMBINE:default probes stay exact ok\n");
+
+    /* --- truthiness is the payload's, everywhere ToBool runs (and only
+       branches observe it: ! and Boolean() fire no hook) --- */
+    cnd_calls = 0;
+    ct_expect_concrete(ctx, "!T0", "true");
+    ct_expect_concrete(ctx, "!T5", "false");
+    ct_expect_concrete(ctx, "Boolean(TES)", "false");
+    ct_expect_concrete(ctx, "Boolean(T5)", "true");
+    ct_expect_concrete(ctx, "!!TNULL", "false");
+    ct_expect_concrete(ctx, "!!TUND", "false");
+    assert(cnd_calls == 0);
+    printf("COMBINE:payload truthiness (no hook) ok\n");
+
+    /* --- the cond hook observes control-flow branches ------------------ */
+    {
+        char want[64];
+        /* ?: is a branch */
+        cnd_calls = 0;
+        ct_expect_concrete(ctx, "T5 ? 'y' : 'n'", "y");
+        assert(cnd_calls == 1 && cnd_last_taken == 1 &&
+               strcmp(cnd_last_note, "H5") == 0);
+        cnd_calls = 0;
+        ct_expect_concrete(ctx, "T0 ? 'y' : 'n'", "n");
+        assert(cnd_calls == 1 && cnd_last_taken == 0 &&
+               strcmp(cnd_last_note, "H0") == 0);
+        /* if/else over a plain tagged value */
+        cnd_calls = 0;
+        ct_expect_concrete(ctx,
+            "(function(){ if (T0) return 'A'; return 'B'; })()", "B");
+        assert(cnd_calls == 1 && cnd_last_taken == 0);
+        /* if over a compare result: the branch observes the COMBINED
+           note of the tagged boolean the compare produced */
+        cnd_calls = 0;
+        cb_calls = 0;
+        snprintf(want, sizeof(want), "C%d(HY,-)", JS_TT_OP_STRICT_EQ);
+        ct_expect_concrete(ctx,
+            "(function(){ if (TY === 'y') return 'A'; return 'B'; })()",
+            "A");
+        assert(cb_calls == 1);
+        assert(cnd_calls == 1 && cnd_last_taken == 1 &&
+               strcmp(cnd_last_note, want) == 0);
+        /* nested tagged: truthiness recurses, ONE observation, OUTER
+           note */
+        cnd_calls = 0;
+        ct_expect_concrete(ctx, "TNEST ? 'y' : 'n'", "n");
+        assert(cnd_calls == 1 && cnd_last_taken == 0 &&
+               strcmp(cnd_last_note, "HOUT") == 0);
+        /* untagged conditionals never fire */
+        cnd_calls = 0;
+        ct_expect_concrete(ctx,
+            "(function(){ if (5 > 3) return 'A'; return 'B'; })()", "A");
+        ct_expect_concrete(ctx, "1 ? 'y' : 'n'", "y");
+        assert(cnd_calls == 0);
+    }
+    printf("COMBINE:cond hook at branches ok\n");
+
+    /* --- short-circuits + the nullish probe ---------------------------- */
+    {
+        JSValue p;
+        /* && short-circuits on the falsy tagged lhs: the RESULT is the
+           tagged value itself, and the test was one observation */
+        cnd_calls = 0;
+        p = ct_eval_payload(ctx, "T0 && 'x'");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT &&
+               JS_VALUE_GET_INT(p) == 0);
+        JS_FreeValue(ctx, p);
+        assert(cnd_calls == 1 && cnd_last_taken == 0 &&
+               strcmp(cnd_last_note, "H0") == 0);
+        cnd_calls = 0;
+        ct_expect_concrete(ctx, "T5 && 'x'", "x");
+        assert(cnd_calls == 1 && cnd_last_taken == 1);
+        /* || falls through to the rhs on a falsy payload */
+        cnd_calls = 0;
+        ct_expect_concrete(ctx, "TES || 'y'", "y");
+        assert(cnd_calls == 1 && cnd_last_taken == 0 &&
+               strcmp(cnd_last_note, "HES") == 0);
+        /* ||= branches on the tagged current value too */
+        cnd_calls = 0;
+        ct_expect_concrete(ctx,
+            "(function(){ var v = T0; v ||= 9; return v; })()", "9");
+        assert(cnd_calls == 1 && cnd_last_taken == 0);
+        /* ?? / ?. are the nullish probe: identity of the PAYLOAD, not
+           truthiness -- unwrapped, but never a cond observation */
+        cnd_calls = 0;
+        ct_expect_concrete(ctx, "TNULL ?? 'z'", "z");
+        ct_expect_concrete(ctx, "TUND ?? 'z'", "z");
+        p = ct_eval_payload(ctx, "T0 ?? 'z'");   /* 0 is not nullish */
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT &&
+               JS_VALUE_GET_INT(p) == 0);
+        JS_FreeValue(ctx, p);
+        ct_expect_concrete(ctx, "TNULL?.x ?? 'm'", "m");
+        assert(cnd_calls == 0);
+    }
+    printf("COMBINE:short-circuits + nullish ok\n");
+
+    /* --- loops: one observation per condition evaluation --------------- */
+    cnd_calls = 0;
+    ct_expect_concrete(ctx,
+        "(function(){ var i = 0; while (T5) { if (++i >= 3) break; } "
+        "return i; })()", "3");
+    assert(cnd_calls == 3 && cnd_last_taken == 1);
+    cnd_calls = 0;
+    ct_expect_concrete(ctx,
+        "(function(){ for (; T0 ;) return 'body'; return 'skip'; })()",
+        "skip");
+    assert(cnd_calls == 1 && cnd_last_taken == 0);
+    cnd_calls = 0;
+    ct_expect_concrete(ctx,
+        "(function(){ var i = 0; do { i++; } while (TES); return i; })()",
+        "1");
+    assert(cnd_calls == 1 && cnd_last_taken == 0);
+    printf("COMBINE:loop conditions ok\n");
+
+    /* --- JSON.stringify refuses a tagged value loudly (v1) --------------
+       never a silent {"k":{}} de-tag; forwarding (payload-substituted
+       serialize, result wrapped with a Combine'd note) is the documented
+       follow-up */
+    cb_calls = 0;
+    cnd_calls = 0;
+    ct_expect_throws(ctx, "JSON.stringify({k: TY})",
+                     "reached a tagged value");
+    ct_expect_throws(ctx, "JSON.stringify([T5])",
+                     "reached a tagged value");
+    ct_expect_throws(ctx, "JSON.stringify(T5)",
+                     "reached a tagged value");
+    /* the refusal names the field the tagged value sits in */
+    ct_expect_throws(ctx, "JSON.stringify({k: TY})", "at 'k'");
+    ct_expect_throws(ctx, "JSON.stringify([T5])", "at '0'");
+    ct_expect_throws(ctx, "JSON.stringify({a:1, deep:{q:[0, T5]}})",
+                     "at '1'");
+    /* a payload toJSON is NOT consulted in v1 (no re-entry, no silent
+       de-tag through the payload's serializer) */
+    ct_expect_throws(ctx, "JSON.stringify({k: TJ})",
+                     "reached a tagged value");
+    assert(cb_calls == 0 && cnd_calls == 0);  /* refusals combine/observe
+                                                 nothing */
+    /* a replacer that swaps the tagged value out serializes concretely */
+    ct_expect_concrete(ctx,
+        "JSON.stringify({k: TY}, (kk, vv) => kk === 'k' ? 'safe' : vv)",
+        "{\"k\":\"safe\"}");
+    /* the untagged path is byte-identical */
+    ct_expect_concrete(ctx,
+        "JSON.stringify({a:[1,'x',null,true],b:{}})",
+        "{\"a\":[1,\"x\",null,true],\"b\":{}}");
+    ct_expect_concrete(ctx,
+        "JSON.stringify({a:[1,{z:2}]}, null, 1)",
+        "{\n \"a\": [\n  1,\n  {\n   \"z\": 2\n  }\n ]\n}");
+    printf("COMBINE:JSON.stringify refusal ok\n");
+
+    /* --- string search builtins: unwrap, journal payload+note, forward - */
+    {
+        JSValue p;
+        void *jn;
+        char want[64];
+
+        /* the journal gates on a step handler being installed; a no-op
+           handler opens it without enabling stepping */
+        JS_TTSetStepHandler(rt, tg_step_noop, NULL);
+        JS_TTCmpClear(rt);
+
+        /* tagged receiver, via .call (method lookup on the wrapper is
+           the property-forwarding follow-up): payload search, payload
+           token in the journal WITH the receiver's note, tagged result */
+        cb_calls = 0;
+        p = ct_eval_payload(ctx,
+                            "String.prototype.includes.call(TSTR, 'b')");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_BOOL && JS_ToBool(ctx, p) == 1);
+        JS_FreeValue(ctx, p);
+        ct_check_combine("includes(TSTR)", JS_TT_OP_INCLUDES, 1, 2);
+        assert(ct_journal_find(rt, 1, "abc", "b", &jn) >= 0);
+        assert(jn && strcmp((char *)jn, "HS") == 0);
+
+        cb_calls = 0;
+        p = ct_eval_payload(ctx,
+                            "String.prototype.startsWith.call(TSTR, 'ab')");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_BOOL && JS_ToBool(ctx, p) == 1);
+        JS_FreeValue(ctx, p);
+        ct_check_combine("startsWith(TSTR)", JS_TT_OP_STARTS_WITH, 1, 2);
+        assert(ct_journal_find(rt, 2, "abc", "ab", &jn) >= 0);
+        assert(jn && strcmp((char *)jn, "HS") == 0);
+
+        cb_calls = 0;
+        p = ct_eval_payload(ctx,
+                            "String.prototype.endsWith.call(TSTR, 'bc')");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_BOOL && JS_ToBool(ctx, p) == 1);
+        JS_FreeValue(ctx, p);
+        ct_check_combine("endsWith(TSTR)", JS_TT_OP_ENDS_WITH, 1, 2);
+        assert(ct_journal_find(rt, 3, "abc", "bc", &jn) >= 0);
+        assert(jn && strcmp((char *)jn, "HS") == 0);
+
+        /* indexOf / lastIndexOf forward the integer */
+        ct_expect_int(ctx, "String.prototype.indexOf.call(TSTR, 'c')", 2,
+                      JS_TT_OP_INDEX_OF, 1, 2);
+        assert(ct_journal_find(rt, 4, "abc", "c", &jn) >= 0);
+        assert(jn && strcmp((char *)jn, "HS") == 0);
+        ct_expect_int(ctx, "String.prototype.lastIndexOf.call(TSTR, 'b')",
+                      1, JS_TT_OP_LAST_INDEX_OF, 1, 2);
+
+        /* tagged needle on a concrete receiver: the argument's note */
+        JS_TTCmpClear(rt);
+        ct_expect_bool(ctx, "'xbx'.includes(TB)", 1, JS_TT_OP_INCLUDES, 2);
+        assert(ct_journal_find(rt, 1, "xbx", "b", &jn) >= 0);
+        assert(jn && strcmp((char *)jn, "HB") == 0);
+        assert(JS_TTCmpCount(rt) == 1);   /* one entry per call, never
+                                             double-journaled */
+
+        /* a tagged position unwraps for the offset; it names no token */
+        ct_expect_int(ctx, "'abcabc'.indexOf('c', T2)", 2,
+                      JS_TT_OP_INDEX_OF, 4, 3);
+        assert(ct_journal_find(rt, 4, "abcabc", "c", &jn) >= 0);
+        assert(jn == NULL);
+
+        /* both concrete: plain result, entry note NULL */
+        cb_calls = 0;
+        ct_expect_concrete(ctx, "'xy'.includes('y')", "true");
+        assert(cb_calls == 0);
+        assert(ct_journal_find(rt, 1, "xy", "y", &jn) >= 0 && jn == NULL);
+
+        /* the tagged result branches once through the cond hook */
+        cnd_calls = 0;
+        snprintf(want, sizeof(want), "C%d(HS,-)", JS_TT_OP_INCLUDES);
+        ct_expect_concrete(ctx,
+            "String.prototype.includes.call(TSTR, 'b') ? 'y' : 'n'", "y");
+        assert(cnd_calls == 1 && cnd_last_taken == 1 &&
+               strcmp(cnd_last_note, want) == 0);
+
+        JS_TTSetStepHandler(rt, NULL, NULL);
+    }
+    printf("COMBINE:string search builtins ok\n");
+
+    /* --- property get forwards to the payload and stays tracked -------- */
+    {
+        JSValue p;
+        const char *s;
+        char want[64];
+
+        /* string payload: length + index via the payload's exotic
+           string behavior */
+        ct_expect_int(ctx, "TSTR.length", 3, JS_TT_OP_GET_FIELD, 1, 2);
+        cb_calls = 0;
+        p = ct_eval_payload(ctx, "TSTR[0]");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_STRING);
+        s = JS_ToCString(ctx, p);
+        assert(s && strcmp(s, "a") == 0);
+        JS_FreeCString(ctx, s);
+        JS_FreeValue(ctx, p);
+        ct_check_combine("TSTR[0]", JS_TT_OP_GET_FIELD, 1, 2);
+
+        /* object payload: own, getter (payload `this`), inherited, and
+           a missing key (tracked undefined with provenance) */
+        ct_expect_int(ctx, "TGO.a", 5, JS_TT_OP_GET_FIELD, 1, 2);
+        ct_expect_int(ctx, "TGG.g", 42, JS_TT_OP_GET_FIELD, 1, 2);
+        ct_expect_int(ctx, "TCH.ip", 11, JS_TT_OP_GET_FIELD, 1, 2);
+        cb_calls = 0;
+        p = ct_eval_payload(ctx, "TGO.missing");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_UNDEFINED);
+        JS_FreeValue(ctx, p);
+        ct_check_combine("TGO.missing", JS_TT_OP_GET_FIELD, 1, 2);
+
+        /* a FUNCTION result returns unwrapped (method lookup is
+           resolution, not a data read: no Combine) */
+        cb_calls = 0;
+        ct_expect_concrete(ctx, "typeof TGO.hasOwnProperty", "function");
+        assert(cb_calls == 0);
+
+        /* ...which makes a PLAIN method call work: lookup resolves off
+           the payload's prototype, the wrapper stays `this`, and the
+           search-builtin intercept takes over -- journal included */
+        JS_TTSetStepHandler(rt, tg_step_noop, NULL);
+        JS_TTCmpClear(rt);
+        cb_calls = 0;
+        p = ct_eval_payload(ctx, "TSTR.includes('b')");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_BOOL && JS_ToBool(ctx, p) == 1);
+        JS_FreeValue(ctx, p);
+        assert(cb_calls == 1 && cb_last_op == JS_TT_OP_INCLUDES);
+        {
+            void *jn;
+            assert(ct_journal_find(rt, 1, "abc", "b", &jn) >= 0);
+            assert(jn && strcmp((char *)jn, "HS") == 0);
+        }
+        JS_TTSetStepHandler(rt, NULL, NULL);
+
+        /* nested tagged payload: reads off the deepest payload, ONE
+           wrap with the OUTER note (observed through the cond hook) */
+        cnd_calls = 0;
+        snprintf(want, sizeof(want), "C%d(HNO,-)", JS_TT_OP_GET_FIELD);
+        ct_expect_concrete(ctx, "TNN.z ? 'y' : 'n'", "y");
+        assert(cnd_calls == 1 && cnd_last_taken == 1 &&
+               strcmp(cnd_last_note, want) == 0);
+
+        /* a stored tagged value flattens: the result is a SINGLE
+           wrapper over the stored payload, and the stored value joins
+           the hook args with its note (mask 1|4, arity 3) */
+        cb_calls = 0;
+        p = ct_eval_payload(ctx, "TSV.v");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT &&
+               JS_VALUE_GET_INT(p) == 5);
+        JS_FreeValue(ctx, p);
+        ct_check_combine("TSV.v", JS_TT_OP_GET_FIELD, 5, 3);
+
+        /* a throwing forwarded get propagates unwrapped */
+        ct_expect_throws(ctx, "TNULL.x", "null");
+
+        /* tagged KEYS stay pinned -- on concrete and tagged receivers
+           alike the key refuses before any forwarding */
+        ct_expect_throws(ctx, "({a:1})[TKEY]", NULL);
+        ct_expect_throws(ctx, "TGO[TKEY]", NULL);
+
+        /* untagged gets are byte-identical */
+        ct_expect_concrete(ctx, "({a:7}).a", "7");
+        ct_expect_concrete(ctx, "'xyz'.length", "3");
+        ct_expect_concrete(ctx, "[4,5,6][1]", "5");
+    }
+    printf("COMBINE:property get forwards ok\n");
+
+    /* --- property set forwards to the payload (get/set inverses) ------- */
+    {
+        JSValue p, tg, pay, f;
+
+        /* the write hits the payload: a second tagged get reads it
+           back, the raw payload holds it, the wrapper owns nothing */
+        cb_calls = 0;
+        p = ct_eval_payload(ctx,
+            "(function(){ TGO.foo = 5; return TGO.foo; })()");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 5);
+        JS_FreeValue(ctx, p);
+        ct_check_combine("TGO.foo readback", JS_TT_OP_GET_FIELD, 1, 2);
+        p = ct_eval_payload(ctx, "TGO.foo");   /* second get agrees */
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 5);
+        JS_FreeValue(ctx, p);
+        tg = eval_val(ctx, "TGO");
+        pay = JS_TTPayload(ctx, tg);
+        f = JS_GetPropertyStr(ctx, pay, "foo");
+        assert(JS_VALUE_GET_TAG(f) == JS_TAG_INT && JS_VALUE_GET_INT(f) == 5);
+        JS_FreeValue(ctx, f);
+        JS_FreeValue(ctx, pay);
+        JS_FreeValue(ctx, tg);
+        /* the wrapper stays inert: the RAW own-prop probe (enumeration
+           forwards to the payload now, so Object.keys shows the
+           payload's view -- only this probe sees the wrapper itself) */
+        tg = eval_val(ctx, "TGO");
+        assert(JS_TTOwnPropCount(ctx, tg) == 0);       /* wrapper: nothing */
+        pay = JS_TTPayload(ctx, tg);
+        assert(JS_TTOwnPropCount(ctx, pay) == 2);      /* payload: a + foo */
+        JS_FreeValue(ctx, pay);
+        JS_FreeValue(ctx, tg);
+
+        /* a tagged value stores AS-IS; read-back flattens with the
+           combined note (receiver + stored value, mask 5, arity 3) */
+        cb_calls = 0;
+        p = ct_eval_payload(ctx,
+            "(function(){ TGO.bar = T9; return TGO.bar; })()");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 9);
+        JS_FreeValue(ctx, p);
+        ct_check_combine("TGO.bar", JS_TT_OP_GET_FIELD, 5, 3);
+
+        /* a payload setter runs with the payload as `this` */
+        ct_set_tagged(ctx, "TSET",
+                      eval_val(ctx, "({v: 0, set s(x) { this.v = x * 2; }})"),
+                      "HSET");
+        ct_expect_int(ctx, "TSET.s = 4, TSET.v", 8, JS_TT_OP_GET_FIELD, 1, 2);
+
+        /* string payload: the payload's exotic set semantics -- silent
+           no-op in sloppy code, the REAL TypeError in strict, and no
+           wrapper property ever appears */
+        p = ct_eval_payload(ctx,
+            "(function(){ TSTR[0] = 'x'; return TSTR[0]; })()");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_STRING);
+        {
+            const char *s0 = JS_ToCString(ctx, p);
+            assert(s0 && strcmp(s0, "a") == 0);
+            JS_FreeCString(ctx, s0);
+        }
+        JS_FreeValue(ctx, p);
+        ct_expect_throws(ctx,
+            "(function(){ 'use strict'; TSTR[0] = 'x'; })()", NULL);
+        tg = eval_val(ctx, "TSTR");
+        assert(JS_TTOwnPropCount(ctx, tg) == 0);   /* wrapper still inert */
+        JS_FreeValue(ctx, tg);
+
+        /* a throwing set propagates unwrapped */
+        ct_expect_throws(ctx, "TNULL.x = 1", "null");
+
+        /* tagged KEYS still refuse -- on tagged receivers too */
+        ct_expect_throws(ctx, "TGO[TKEY] = 1", NULL);
+
+        /* untagged writes byte-identical */
+        ct_expect_concrete(ctx,
+            "(function(){ var o = {}; o.w = 3; o.w = 4; return o.w; })()",
+            "4");
+    }
+    printf("COMBINE:property set forwards ok\n");
+
+    /* --- a forwarded write to a BASELINE payload routes through COW ---- */
+    {
+        JSValue p, gcw;
+        int n0;
+
+        /* TCFG wraps the baseline CONFIG object itself (created before
+           checkin so the global-set is not captured) */
+        ct_set_tagged(ctx, "TCFG", eval_val(ctx, "CONFIG"), "HC");
+        gcw = tg_start_tflow(ctx);
+        if (JS_TTFlowCheckin(ctx, gcw))
+            die(ctx, "checkin for cow set");
+        n0 = JS_TTFlowDeltaCount(ctx, gcw);
+        ct_expect_concrete(ctx, "TCFG.limit = 99", "99");
+        /* the forwarded write recorded a first-write delta on CONFIG */
+        assert(JS_TTFlowDeltaCount(ctx, gcw) == n0 + 1);
+        p = ct_eval_payload(ctx, "TCFG.limit");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 99);
+        JS_FreeValue(ctx, p);
+        ct_expect_concrete(ctx, "CONFIG.limit", "99");  /* live in-timeline */
+        /* dedup: a second write to the captured prop adds no delta */
+        ct_expect_concrete(ctx, "TCFG.limit = 100", "100");
+        assert(JS_TTFlowDeltaCount(ctx, gcw) == n0 + 1);
+        if (JS_TTFlowCheckout(ctx, gcw))
+            die(ctx, "checkout for cow set");
+        /* outside the timeline the baseline is pristine: isolation */
+        ct_expect_concrete(ctx, "CONFIG.limit", "3");
+        p = ct_eval_payload(ctx, "TCFG.limit");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 3);
+        JS_FreeValue(ctx, p);
+        JS_FreeValue(ctx, gcw);
+    }
+    printf("COMBINE:set-forwarding routes through COW ok\n");
+
+    /* --- has/enumerate forward to the payload --------------------------- */
+    {
+        JSValue p, tgv, pay;
+
+        /* `in` answers over the payload's chain: concrete, hook-free */
+        cb_calls = 0;
+        cnd_calls = 0;
+        ct_expect_concrete(ctx, "'a' in TGO", "true");
+        ct_expect_concrete(ctx, "'nope' in TGO", "false");
+        ct_expect_concrete(ctx, "'toString' in TGO", "true"); /* inherited */
+        ct_expect_concrete(ctx, "'ip' in TCH", "true");  /* payload proto */
+        assert(cb_calls == 0 && cnd_calls == 0);
+        /* a primitive payload gets the operator's real TypeError */
+        ct_expect_throws(ctx, "'x' in T5", "operand");
+
+        /* keys are the payload's CONCRETE names (join would refuse a
+           tagged element via the coercion pin, so joining proves it) */
+        ct_expect_concrete(ctx, "Object.keys(TGO).join(',')", "a,foo,bar");
+        ct_expect_concrete(ctx,
+            "Object.getOwnPropertyNames(TGO).join(',')", "a,foo,bar");
+        ct_expect_concrete(ctx, "Reflect.ownKeys(TGO).length", "3");
+        ct_expect_concrete(ctx, "Object.keys(TCH).length", "0"); /* own only */
+
+        /* values/entries fetch THROUGH the wrapper: tracked values,
+           concrete keys */
+        p = ct_eval_payload(ctx, "Object.values(TGO)[0]");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 5);
+        JS_FreeValue(ctx, p);
+        ct_expect_concrete(ctx, "Object.entries(TGO)[0][0]", "a");
+        p = ct_eval_payload(ctx, "Object.entries(TGO)[2][1]");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 9);
+        JS_FreeValue(ctx, p);   /* the stored tagged T9, flattened by 4c */
+
+        /* for-in walks the payload's enumerable chain, proto included */
+        ct_expect_concrete(ctx,
+            "(function(){ var ks = []; for (var k in TGO) ks.push(k); "
+            "return ks.join(','); })()", "a,foo,bar");
+        ct_expect_concrete(ctx,
+            "(function(){ var ks = []; for (var k in TCH) ks.push(k); "
+            "return ks.join(','); })()", "ip");
+        /* a string payload enumerates its indices */
+        ct_expect_concrete(ctx,
+            "(function(){ var ks = []; for (var k in TSTR) ks.push(k); "
+            "return ks.join(','); })()", "0,1,2");
+        ct_expect_concrete(ctx, "Object.keys(TSTR).join(',')", "0,1,2");
+
+        /* the wrapper itself owns nothing through all of this */
+        tgv = eval_val(ctx, "TGO");
+        assert(JS_TTOwnPropCount(ctx, tgv) == 0);
+        pay = JS_TTPayload(ctx, tgv);
+        assert(JS_TTOwnPropCount(ctx, pay) == 3);   /* a, foo, bar */
+        JS_FreeValue(ctx, pay);
+        JS_FreeValue(ctx, tgv);
+
+        /* untagged paths byte-identical */
+        ct_expect_concrete(ctx, "Object.keys({x:1,y:2}).join(',')", "x,y");
+        ct_expect_concrete(ctx, "'x' in ({x:1})", "true");
+        ct_expect_concrete(ctx,
+            "(function(){ var ks = []; for (var k in {q:1}) ks.push(k); "
+            "return ks.join(','); })()", "q");
+    }
+    printf("COMBINE:has/enumerate forward ok\n");
+
     /* --- a throwing concrete op propagates the real error -------------- */
     cb_calls = 0;
     ct_expect_throws(ctx, "TSYM * 1", "symbol");
@@ -2840,10 +3577,7 @@ static int cmd_combinetest(void)
     printf("COMBINE:faithful throw ok\n");
 
     /* --- out-of-scope behavior is EXACTLY today's ----------------------- */
-    ct_expect_concrete(ctx, "T5 === 5", "false");   /* identity, no unwrap */
-    ct_expect_concrete(ctx, "T5 === T5", "true");
     ct_expect_concrete(ctx, "typeof T5", "object");
-    ct_expect_concrete(ctx, "T5 ? 1 : 2", "1");     /* truthiness: problem 3 */
     ct_expect_throws(ctx, "({})[TKEY]", NULL);      /* key coercion throws */
     ct_expect_throws(ctx, "var ko = {}; ko[TKEY] = 1", NULL);
     ct_expect_throws(ctx, "String.prototype.charAt.call(TAB, 0)", NULL);
@@ -2899,6 +3633,219 @@ static int cmd_combinetest(void)
         JS_FreeValue(ctx, arm);
     }
     printf("COMBINE:propagated result round-trips ok\n");
+
+    /* --- a strict-eq boolean rides the same graph paths ------------------ */
+    {
+        JSValue R, g, arm, tA, g2, t2;
+        uint8_t *bytes;
+        size_t blen;
+        char want_note[64];
+        int clones0;
+        snprintf(want_note, sizeof(want_note), "C%d(H5,-)",
+                 JS_TT_OP_STRICT_EQ);
+        R = eval_val(ctx, "T5 === 5");
+        assert(JS_TTIsTagged(R));
+        assert(JS_TTNote(R) && strcmp((char *)JS_TTNote(R), want_note) == 0);
+        g = tg_start_tflow(ctx);
+        if (!JS_TTFlowSetLocal(ctx, g, 0, at_t, R)) {
+            fprintf(stderr, "FAIL: inject strict-eq result\n");
+            return 1;
+        }
+        clones0 = tg_clones;
+        arm = JS_TTFlowFork(ctx, g);
+        if (JS_IsException(arm))
+            die(ctx, "fork with strict-eq result");
+        assert(tg_clones == clones0 + 1);
+        tA = JS_TTFlowGetLocal(ctx, arm, 0, at_t);
+        assert(JS_TTIsTagged(tA));
+        assert(JS_TTNote(tA) != JS_TTNote(R));
+        assert(strcmp((char *)JS_TTNote(tA), want_note) == 0);
+        bytes = JS_TTFlowSerialize(ctx, g, &blen);
+        if (!bytes)
+            die(ctx, "serialize strict-eq result");
+        g2 = JS_TTFlowDeserialize(ctx, bytes, blen);
+        if (JS_IsException(g2))
+            die(ctx, "hydrate strict-eq result");
+        js_free(ctx, bytes);
+        t2 = JS_TTFlowGetLocal(ctx, g2, 0, at_t);
+        assert(JS_TTIsTagged(t2));
+        assert(strcmp((char *)JS_TTNote(t2), want_note) == 0);
+        {
+            JSValue p = JS_TTPayload(ctx, t2);
+            assert(JS_VALUE_GET_TAG(p) == JS_TAG_BOOL &&
+                   JS_ToBool(ctx, p) == 1);
+            JS_FreeValue(ctx, p);
+        }
+        JS_FreeValue(ctx, tA);
+        JS_FreeValue(ctx, t2);
+        JS_FreeValue(ctx, R);
+        JS_FreeValue(ctx, g);
+        JS_FreeValue(ctx, g2);
+        JS_FreeValue(ctx, arm);
+    }
+    printf("COMBINE:strict-eq result round-trips ok\n");
+
+    /* --- a cond observation is deterministic across fork + hydrate ------
+       tflow's t1 probe (t ? typeof t : "null") is one conditional over
+       the injected tagged local; resume the original, a forked arm and
+       a serialize->hydrate copy, and the three observation streams must
+       be byte-identical (the note travels with the value) */
+    {
+        JSValue R, g, arm, g2;
+        uint8_t *bytes;
+        size_t blen;
+        char obs_direct[sizeof(cnd_log)], obs_arm[sizeof(cnd_log)];
+        char obs_hydrated[sizeof(cnd_log)], tr[512];
+
+        R = eval_val(ctx, "T5");
+        g = tg_start_tflow(ctx);
+        if (!JS_TTFlowSetLocal(ctx, g, 0, at_t, R)) {
+            fprintf(stderr, "FAIL: inject tagged local for cond\n");
+            return 1;
+        }
+        arm = JS_TTFlowFork(ctx, g);
+        if (JS_IsException(arm))
+            die(ctx, "fork for cond determinism");
+        bytes = JS_TTFlowSerialize(ctx, g, &blen);
+        if (!bytes)
+            die(ctx, "serialize for cond determinism");
+        g2 = JS_TTFlowDeserialize(ctx, bytes, blen);
+        if (JS_IsException(g2))
+            die(ctx, "hydrate for cond determinism");
+        js_free(ctx, bytes);
+
+        cnd_calls = 0;
+        cnd_log[0] = 0;
+        collect_flow(ctx, g, 0, tr, sizeof(tr));
+        assert(strstr(tr, "t1:object:0"));
+        assert(cnd_calls == 1 && cnd_last_taken == 1);
+        snprintf(obs_direct, sizeof(obs_direct), "%s", cnd_log);
+
+        cnd_calls = 0;
+        cnd_log[0] = 0;
+        collect_flow(ctx, arm, 0, tr, sizeof(tr));
+        assert(strstr(tr, "t1:object:0"));
+        assert(cnd_calls == 1);
+        snprintf(obs_arm, sizeof(obs_arm), "%s", cnd_log);
+
+        cnd_calls = 0;
+        cnd_log[0] = 0;
+        collect_flow(ctx, g2, 0, tr, sizeof(tr));
+        assert(strstr(tr, "t1:object:0"));
+        assert(cnd_calls == 1);
+        snprintf(obs_hydrated, sizeof(obs_hydrated), "%s", cnd_log);
+
+        assert(strcmp(obs_direct, "H5:1;") == 0);
+        assert(strcmp(obs_direct, obs_arm) == 0);
+        assert(strcmp(obs_direct, obs_hydrated) == 0);
+
+        JS_FreeValue(ctx, R);
+        JS_FreeValue(ctx, g);
+        JS_FreeValue(ctx, arm);
+        JS_FreeValue(ctx, g2);
+    }
+    printf("COMBINE:cond observation rides fork/hydrate ok\n");
+
+    /* --- a forwarded search result rides the same graph paths ----------- */
+    {
+        JSValue R, g, arm, tA, g2, t2, pp;
+        uint8_t *bytes;
+        size_t blen;
+        char want_note[64];
+
+        snprintf(want_note, sizeof(want_note), "C%d(HS,-)",
+                 JS_TT_OP_INDEX_OF);
+        R = eval_val(ctx, "String.prototype.indexOf.call(TSTR, 'c')");
+        assert(JS_TTIsTagged(R));
+        assert(JS_TTNote(R) && strcmp((char *)JS_TTNote(R), want_note) == 0);
+        pp = JS_TTPayload(ctx, R);
+        assert(JS_VALUE_GET_TAG(pp) == JS_TAG_INT &&
+               JS_VALUE_GET_INT(pp) == 2);
+        JS_FreeValue(ctx, pp);
+        g = tg_start_tflow(ctx);
+        if (!JS_TTFlowSetLocal(ctx, g, 0, at_t, R)) {
+            fprintf(stderr, "FAIL: inject search result\n");
+            return 1;
+        }
+        arm = JS_TTFlowFork(ctx, g);
+        if (JS_IsException(arm))
+            die(ctx, "fork with search result");
+        tA = JS_TTFlowGetLocal(ctx, arm, 0, at_t);
+        assert(JS_TTIsTagged(tA));
+        assert(JS_TTNote(tA) != JS_TTNote(R));
+        assert(strcmp((char *)JS_TTNote(tA), want_note) == 0);
+        bytes = JS_TTFlowSerialize(ctx, g, &blen);
+        if (!bytes)
+            die(ctx, "serialize search result");
+        g2 = JS_TTFlowDeserialize(ctx, bytes, blen);
+        if (JS_IsException(g2))
+            die(ctx, "hydrate search result");
+        js_free(ctx, bytes);
+        t2 = JS_TTFlowGetLocal(ctx, g2, 0, at_t);
+        assert(JS_TTIsTagged(t2));
+        assert(strcmp((char *)JS_TTNote(t2), want_note) == 0);
+        pp = JS_TTPayload(ctx, t2);
+        assert(JS_VALUE_GET_TAG(pp) == JS_TAG_INT &&
+               JS_VALUE_GET_INT(pp) == 2);
+        JS_FreeValue(ctx, pp);
+        JS_FreeValue(ctx, tA);
+        JS_FreeValue(ctx, t2);
+        JS_FreeValue(ctx, R);
+        JS_FreeValue(ctx, g);
+        JS_FreeValue(ctx, arm);
+        JS_FreeValue(ctx, g2);
+    }
+    printf("COMBINE:search result round-trips ok\n");
+
+    /* --- a forwarded property read rides the same graph paths ----------- */
+    {
+        JSValue R, g, arm, tA, g2, t2, pp;
+        uint8_t *bytes;
+        size_t blen;
+        char want_note[64];
+
+        snprintf(want_note, sizeof(want_note), "C%d(HS,-)",
+                 JS_TT_OP_GET_FIELD);
+        R = eval_val(ctx, "TSTR.length");
+        assert(JS_TTIsTagged(R));
+        assert(JS_TTNote(R) && strcmp((char *)JS_TTNote(R), want_note) == 0);
+        pp = JS_TTPayload(ctx, R);
+        assert(JS_VALUE_GET_TAG(pp) == JS_TAG_INT &&
+               JS_VALUE_GET_INT(pp) == 3);
+        JS_FreeValue(ctx, pp);
+        g = tg_start_tflow(ctx);
+        if (!JS_TTFlowSetLocal(ctx, g, 0, at_t, R)) {
+            fprintf(stderr, "FAIL: inject get result\n");
+            return 1;
+        }
+        arm = JS_TTFlowFork(ctx, g);
+        if (JS_IsException(arm))
+            die(ctx, "fork with get result");
+        tA = JS_TTFlowGetLocal(ctx, arm, 0, at_t);
+        assert(JS_TTIsTagged(tA));
+        assert(strcmp((char *)JS_TTNote(tA), want_note) == 0);
+        bytes = JS_TTFlowSerialize(ctx, g, &blen);
+        if (!bytes)
+            die(ctx, "serialize get result");
+        g2 = JS_TTFlowDeserialize(ctx, bytes, blen);
+        if (JS_IsException(g2))
+            die(ctx, "hydrate get result");
+        js_free(ctx, bytes);
+        t2 = JS_TTFlowGetLocal(ctx, g2, 0, at_t);
+        assert(JS_TTIsTagged(t2));
+        assert(strcmp((char *)JS_TTNote(t2), want_note) == 0);
+        pp = JS_TTPayload(ctx, t2);
+        assert(JS_VALUE_GET_TAG(pp) == JS_TAG_INT &&
+               JS_VALUE_GET_INT(pp) == 3);
+        JS_FreeValue(ctx, pp);
+        JS_FreeValue(ctx, tA);
+        JS_FreeValue(ctx, t2);
+        JS_FreeValue(ctx, R);
+        JS_FreeValue(ctx, g);
+        JS_FreeValue(ctx, arm);
+        JS_FreeValue(ctx, g2);
+    }
+    printf("COMBINE:get result round-trips ok\n");
 
     /* --- teardown -------------------------------------------------------- */
     JS_FreeAtom(ctx, at_t);
