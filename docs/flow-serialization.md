@@ -558,6 +558,27 @@ fires. The hook is per-runtime state, so an observation stream is
 deterministic across fork and serialize→hydrate — the note travels with
 the value.
 
+## Builtin forwarding, first class: `JSON.stringify`
+
+A structure containing a tagged value used to serialize the wrapper as
+a null-proto object — `{"k":{}}` — silently discarding the tag. The
+serializer walk now **refuses loudly** instead: reaching a tagged value
+(post-`toJSON`, post-replacer) throws
+`TypeError: JSON.stringify reached a tagged value at 'k'`, naming the
+field (array index or property key; the top level is the spec's `''`
+key). The wrapper's null proto means the `toJSON` probe never finds a
+method — the payload's own `toJSON` is *not* consulted, so nothing runs
+twice and nothing de-tags through the payload's serializer. A replacer
+that swaps the tagged value for a concrete one serializes normally; the
+untagged path is byte-identical and allocation-free (one class_id
+compare on values the walk already classifies). The refusal is the
+COW/coercion discipline: a precise worklist entry, not silent
+corruption. **Forwarding is the documented follow-up**: a tagged field
+makes the whole result tagged — serialize with the payload substituted
+for the wrapper, then wrap the result string with a Combine-derived
+note (a `JS_TT_OP_JSON` code), because a string derived from a tracked
+value stays tracked.
+
 The combinetest harness drives the oracle: exact payloads for
 arithmetic/bitwise/shift (`tagged(5)+1 → 6`, `tagged(6)&3 → 2`), concat
 in every form (`"x"+tagged("y") → "xy"`, templates via
@@ -576,10 +597,13 @@ calls), payload truthiness with the cond hook firing at exactly the
 branch sites (`?:`, `if`, `&&`/`||`/`||=`, loop conditions once per
 evaluation, switch case-compares payload-selecting their case) and
 nowhere else (`!`, `Boolean()`, `??`/`?.` all silent, `??` unwrapping
-the payload for its nullish test), unchanged out-of-scope behavior
-(typeof, tagged property keys, `new String(tagged)`), and propagated
-results riding problem 1's fork and serialize→hydrate paths with their
-notes intact — including a cond observation stream that is
+the payload for its nullish test), `JSON.stringify` refusing loudly at
+the named field (`at 'k'`, `at '0'`, nested; payload `toJSON` not
+consulted; a replacer swap serializes; untagged structures
+byte-identical, pretty-printing included), unchanged out-of-scope
+behavior (typeof, tagged property keys, `new String(tagged)`), and
+propagated results riding problem 1's fork and serialize→hydrate paths
+with their notes intact — including a cond observation stream that is
 byte-identical across the original, a forked arm, and a hydrated copy.
 
 ## Wire format (`TTFL05`)

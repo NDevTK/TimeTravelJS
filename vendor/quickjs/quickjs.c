@@ -61574,6 +61574,24 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
     case JS_TAG_OBJECT:
         if (JS_IsFunction(ctx, val))
             break;
+        /* TimeTravelJS: the serializer walk reached a tagged value (the
+           value at `key`, post-toJSON and post-replacer). Refuse loudly,
+           naming the field -- the COW/coercion discipline: a precise
+           worklist entry, never silent de-tagging into "{}"/"null". The
+           wrapper has a null proto, so the toJSON probe above never saw
+           a method and nothing ran twice. Forwarding is the documented
+           follow-up: serialize with the payload substituted and wrap
+           the result string with a Combine-derived note. A replacer
+           that swaps the tagged value for a concrete one never gets
+           here. Untagged values pay one class_id compare. */
+        if (unlikely(tt_value_is_tagged(val))) {
+            const char *k = JS_ToCString(ctx, key);
+            JS_ThrowTypeError(ctx,
+                              "JSON.stringify reached a tagged value at '%s'",
+                              k ? k : "?");
+            JS_FreeCString(ctx, k);
+            goto exception;
+        }
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
     case JS_TAG_INT:
@@ -61619,6 +61637,12 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
     if (JS_IsObject(val)) {
         p = JS_VALUE_GET_OBJ(val);
         cl = p->class_id;
+        if (unlikely(cl == JS_CLASS_TT_TAGGED)) {
+            /* backstop only: every real path refuses in js_json_check
+               first, naming the field. Nothing may silently de-tag. */
+            JS_ThrowTypeError(ctx, "JSON.stringify reached a tagged value");
+            goto exception;
+        }
         if (cl == JS_CLASS_STRING) {
             val = JS_ToStringFree(ctx, val);
             if (JS_IsException(val))

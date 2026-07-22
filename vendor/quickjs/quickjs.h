@@ -1122,7 +1122,11 @@ JS_BOOL JS_TTIsTagged(JSValueConst v);
    defaults) are NOT comparisons and never unwrap: a tagged value -- even
    one whose payload is undefined -- does not trigger a default.
    Property-KEY coercion is untouched: a tagged key throws exactly as an
-   unknown object key does today.
+   unknown object key does today. JSON.stringify REFUSES loudly (a named
+   TypeError at the field) when its walk reaches a tagged value, rather
+   than silently de-tagging it into "{}"; forwarding -- serialize with
+   the payload substituted, wrap the result string with a combined
+   note -- is the documented follow-up.
    The 'op' the hook receives: */
 enum {
     JS_TT_OP_ADD = 1,         /* also string concatenation via + */

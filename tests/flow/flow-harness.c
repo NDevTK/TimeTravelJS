@@ -149,10 +149,14 @@
  *                               ?. stay payload-nullish and silent, and
  *                               ! / Boolean() coerce silently), typeof /
  *                               property-key coercion staying exactly as
- *                               today, and propagated results (including
- *                               a strict-eq boolean and a cond
- *                               observation stream) riding problem 1's
- *                               fork + serialize paths.
+ *                               today, JSON.stringify refusing loudly at
+ *                               the named field instead of silently
+ *                               de-tagging (payload toJSON not consulted;
+ *                               untagged structures byte-identical), and
+ *                               propagated results (including a strict-eq
+ *                               boolean and a cond observation stream)
+ *                               riding problem 1's fork + serialize
+ *                               paths.
  */
 #include "quickjs.h"
 #include "cutils.h"     /* DynBuf, for the tagged-value note hooks */
@@ -2782,6 +2786,8 @@ static int cmd_combinetest(void)
     ct_set_tagged(ctx, "T6", JS_NewInt32(ctx, 6), "H6");
     ct_set_tagged(ctx, "T0", JS_NewInt32(ctx, 0), "H0");
     ct_set_tagged(ctx, "TES", eval_val(ctx, "''"), "HES");
+    ct_set_tagged(ctx, "TJ", eval_val(ctx, "({toJSON(){ return 'tj'; }})"),
+                  "HJ");
     {
         /* TNEST = tagged(tagged(0)): nested payloads recurse for
            truthiness; a conditional observes only the OUTER note */
@@ -3101,6 +3107,42 @@ static int cmd_combinetest(void)
         "1");
     assert(cnd_calls == 1 && cnd_last_taken == 0);
     printf("COMBINE:loop conditions ok\n");
+
+    /* --- JSON.stringify refuses a tagged value loudly (v1) --------------
+       never a silent {"k":{}} de-tag; forwarding (payload-substituted
+       serialize, result wrapped with a Combine'd note) is the documented
+       follow-up */
+    cb_calls = 0;
+    cnd_calls = 0;
+    ct_expect_throws(ctx, "JSON.stringify({k: TY})",
+                     "reached a tagged value");
+    ct_expect_throws(ctx, "JSON.stringify([T5])",
+                     "reached a tagged value");
+    ct_expect_throws(ctx, "JSON.stringify(T5)",
+                     "reached a tagged value");
+    /* the refusal names the field the tagged value sits in */
+    ct_expect_throws(ctx, "JSON.stringify({k: TY})", "at 'k'");
+    ct_expect_throws(ctx, "JSON.stringify([T5])", "at '0'");
+    ct_expect_throws(ctx, "JSON.stringify({a:1, deep:{q:[0, T5]}})",
+                     "at '1'");
+    /* a payload toJSON is NOT consulted in v1 (no re-entry, no silent
+       de-tag through the payload's serializer) */
+    ct_expect_throws(ctx, "JSON.stringify({k: TJ})",
+                     "reached a tagged value");
+    assert(cb_calls == 0 && cnd_calls == 0);  /* refusals combine/observe
+                                                 nothing */
+    /* a replacer that swaps the tagged value out serializes concretely */
+    ct_expect_concrete(ctx,
+        "JSON.stringify({k: TY}, (kk, vv) => kk === 'k' ? 'safe' : vv)",
+        "{\"k\":\"safe\"}");
+    /* the untagged path is byte-identical */
+    ct_expect_concrete(ctx,
+        "JSON.stringify({a:[1,'x',null,true],b:{}})",
+        "{\"a\":[1,\"x\",null,true],\"b\":{}}");
+    ct_expect_concrete(ctx,
+        "JSON.stringify({a:[1,{z:2}]}, null, 1)",
+        "{\n \"a\": [\n  1,\n  {\n   \"z\": 2\n  }\n ]\n}");
+    printf("COMBINE:JSON.stringify refusal ok\n");
 
     /* --- a throwing concrete op propagates the real error -------------- */
     cb_calls = 0;
