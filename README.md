@@ -483,6 +483,18 @@ sh tools/test262/run.sh preempt    # park at every step + engagement metric
 sh tools/test262/run.sh opcode     # park between every two VM instructions
 ```
 
+**Sanitizer- and aliasing-clean over the same corpus.** The full suite —
+both the classic drive and the forced-preemption drive — runs under
+AddressSanitizer + UndefinedBehaviorSanitizer with **zero reports** (the
+sweep flushed out three latent upstream UBs, all fixed: `ToInt32`/
+`ToInt64` negating `INT_MIN`, `memcpy(NULL, 0)` on zero-length
+typed-array slices, and `size * 3 / 2` growth arithmetic overflowing
+`int` on gigabyte strings), and the native flow-serialization suite is
+sanitizer-clean too. A strict-aliasing differential — the corpus at
+`-O2` under default aliasing vs `-fno-strict-aliasing`, per-test reports
+compared — is outcome-identical, so no behavior anywhere depends on
+type-punning the optimizer is entitled to break.
+
 On top of that, `tools/test262-stepped.mjs` runs a corpus sample through
 the ENGINE with per-step snapshotting enabled and lets each test's own
 assertions judge: stepping does not alter semantics. Current samples:
