@@ -458,15 +458,78 @@ Graph integration follows the existing rules exactly:
   never needs any hook. Payload-less mutation of the pair is impossible
   by construction (the API has no setter).
 
-A tagged value passing through an arithmetic/coerce/concat op behaves
-however the engine already treats an unknown object operand (its class
-has no exotic handlers and a NULL prototype); operator propagation is a
-follow-up. The taggedtest harness drives the oracle: accessor API, a
+The taggedtest harness drives the oracle: accessor API, a
 payload↔tagged GC cycle, two forked arms with independent payload copies
 and cloned notes (a mutation in one arm touches nobody), wire and evict
 round trips through the note hooks, hookless refusals, `NoteFree` exactly
 once for an abandoned arm, and a note-liveness counter beside the runtime
 leak oracle.
+
+## Tagged propagation through value-producing operations
+
+A tagged operand of a value-producing operation yields a **tagged
+result**: the concrete payload of the real operation plus a note derived
+from the operand notes through one host hook:
+
+```c
+typedef void *JSTTCombineFn(JSContext*, int op, JSValueConst *args,
+                            void **notes, int n);
+void JS_TTSetCombineHook(JSRuntime *rt, JSTTCombineFn *combine);
+```
+
+`args` are the original operand values (wrappers included), `notes[i]`
+is `args[i]`'s note (NULL = untagged operand), `op` is a public
+`JS_TT_OP_*` code. Without a hook, results are still tagged — their note
+is NULL. The rule is uniform at every chokepoint: unwrap each operand's
+payload, **re-enter the engine's own operation on the concretes** —
+never a re-implementation of `+`, coercion, or concat — then re-wrap the
+real result with `JS_TTMakeTagged`. A throwing concrete op propagates
+faithfully (and a concretely-NaN op stays NaN: `tagged({}) * 1` is
+`tagged(NaN)`, not an error).
+
+**The chokepoints are the existing slow-path helpers, never the
+opcodes.** Every fast guard in the dispatch loop is tag-exact
+(INT/FLOAT64/STRING/SHORT_BIG_INT pairs), so a tagged value — a heap
+object — always misses them and falls into `js_add_slow`,
+`js_binary_arith_slow`, `js_unary_arith_slow`, `js_post_inc_slow`,
+`js_not_slow`, `js_binary_logic_slow`, `js_shr_slow`,
+`js_relational_slow`, or `js_eq_slow`, each of which now opens with a
+tagged intercept that recurses into itself on the unwrapped payloads.
+`JS_ConcatString` carries the same intercept, which is what makes the
+template-literal engine propagate: evaluated templates compile to
+`"str".concat(part, …)`, and the pristine `js_string_concat` builtin
+funnels every step through `JS_ConcatString`. Three coercion pipelines
+whose results surface directly as script values re-wrap as well: unary
+`+` (through the unary helper), `String(x)` (non-`new` only), and
+`parseInt`/`parseFloat` (ToString→StringToNumber pipelines; generic
+builtin forwarding stays a follow-up).
+
+One in-loop wrinkle: the stepping machinery coerces object operands to
+primitives **before** the slow helpers (`TT_COERCE_SLOT`, so bytecode
+`valueOf`/`toString` run as parkable in-loop frames). That macro now
+skips tagged values — at operator sites the helper unwraps them, and at
+property-KEY sites the C path throws exactly the TypeError the in-loop
+coercion would have thrown, which keeps key coercion pinned to today's
+behavior. Two more deliberate boundaries: strict equality never unwraps
+(identity semantics, `tagged(5) === 5` is `false` as today), and
+truthiness/branching on a tagged value is untouched (a tagged boolean is
+an object and stays truthy — conditional behavior is the next problem).
+Relational and loose-equality results are therefore tagged *values*
+(`tagged(true)`), faithful to the rule but only meaningful to hosts
+until branches learn about them.
+
+The combinetest harness drives the oracle: exact payloads for
+arithmetic/bitwise/shift (`tagged(5)+1 → 6`, `tagged(6)&3 → 2`), concat
+in every form (`"x"+tagged("y") → "xy"`, templates via
+`"p".concat(tagged("q"),"r") → "pqr"`, `+=` through a local), real
+coercions (`+tagged("5")` is the *number* 5; `String(tagged(9)) → "9"`;
+`parseInt(tagged("42")) → 42`; nothing collapses to NaN or de-tags),
+`Combine` seeing the right op / notes / arity for one- and two-tagged
+operand cases, a faithful `TypeError` from `tagged(Symbol()) * 1` with
+zero Combine calls, unchanged out-of-scope behavior (strict eq, typeof,
+truthiness, tagged property keys, `new String(tagged)`), and a
+propagated result riding problem 1's fork and serialize→hydrate paths
+with its combined note intact.
 
 ## Wire format (`TTFL05`)
 

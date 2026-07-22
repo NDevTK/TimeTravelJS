@@ -67,4 +67,6 @@ echo "== cowtest (automatic transparent COW capture) =="
 "$BUILD/flow-harness" cowtest
 echo "== taggedtest (tagged values: payload + host note round-trips) =="
 "$BUILD/flow-harness" taggedtest
+echo "== combinetest (tagged propagation through value-producing ops) =="
+"$BUILD/flow-harness" combinetest
 echo "PASS: flow serialization suite"

@@ -1106,6 +1106,57 @@ JSValue JS_TTPayload(JSContext *ctx, JSValueConst v);
 /* the note pointer (borrowed; NULL if v is not tagged) */
 void *JS_TTNote(JSValueConst v);
 JS_BOOL JS_TTIsTagged(JSValueConst v);
+
+/* Tagged-value propagation through value-producing operations: when any
+   operand of an arithmetic / bitwise / shift / relational / loose-equality
+   op, a string concatenation, or one of the covered coercion pipelines
+   (unary +, String(x), parseInt/parseFloat) is tagged, the engine unwraps
+   each operand's payload, runs ITS OWN operation on the concretes, and
+   re-wraps the real result as a fresh tagged value whose note derives
+   from the operand notes through the combine hook. A throwing concrete
+   op propagates faithfully. Strict equality keeps identity semantics
+   (never unwraps), and property-KEY coercion is untouched: a tagged key
+   throws exactly as an unknown object key does today.
+   The 'op' the hook receives: */
+enum {
+    JS_TT_OP_ADD = 1,         /* also string concatenation via + */
+    JS_TT_OP_SUB,
+    JS_TT_OP_MUL,
+    JS_TT_OP_DIV,
+    JS_TT_OP_MOD,
+    JS_TT_OP_POW,
+    JS_TT_OP_PLUS,            /* unary + (ToNumber) */
+    JS_TT_OP_NEG,
+    JS_TT_OP_INC,             /* ++ (pre and post) */
+    JS_TT_OP_DEC,             /* -- (pre and post) */
+    JS_TT_OP_SHL,
+    JS_TT_OP_SAR,             /* >> */
+    JS_TT_OP_SHR,             /* >>> */
+    JS_TT_OP_AND,
+    JS_TT_OP_OR,
+    JS_TT_OP_XOR,
+    JS_TT_OP_NOT,             /* bitwise ~ */
+    JS_TT_OP_LT,
+    JS_TT_OP_LTE,
+    JS_TT_OP_GT,
+    JS_TT_OP_GTE,
+    JS_TT_OP_EQ,              /* loose == */
+    JS_TT_OP_NEQ,             /* loose != */
+    JS_TT_OP_CONCAT,          /* JS_ConcatString (templates, .concat) */
+    JS_TT_OP_TO_STRING,       /* String(x) */
+    JS_TT_OP_PARSE_INT,
+    JS_TT_OP_PARSE_FLOAT,
+};
+/* Derive the RESULT note from the operand notes (NULL entries = untagged
+   operands). args are the ORIGINAL operand values (tagged wrappers
+   included), borrowed for the duration of the call; notes[i] is
+   args[i]'s note, borrowed. Return the new result's note (owned by the
+   result value, released through NoteFree) or NULL for no note. The
+   hook must not call back into JS. With no hook set, results are still
+   tagged -- their note is NULL. */
+typedef void *JSTTCombineFn(JSContext *ctx, int op, JSValueConst *args,
+                            void **notes, int n);
+void JS_TTSetCombineHook(JSRuntime *rt, JSTTCombineFn *combine);
 /* select which debug info is stripped from the compiled code */
 #define JS_STRIP_SOURCE (1 << 0) /* strip source code */
 #define JS_STRIP_DEBUG  (1 << 1) /* strip all debug info including source code */
