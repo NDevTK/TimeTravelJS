@@ -20238,7 +20238,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         JSValue *vals;
         JSStackFrame *nsf;
 
-        if (unlikely(pf_argc < fb->arg_count || (pf_flags & JS_CALL_FLAG_COPY_ARGV)))
+        if (unlikely(pf_flags & JS_CALL_FLAG_COPY_ARGV))
+            /* copy EVERY argument, not just the declared ones: the caller's
+               argv may be C stack that dies when the machine parks by
+               return, and tt_orig_argv (the `arguments` view) must stay
+               valid for the frame's whole life */
+            arg_allocated_size = max_int(fb->arg_count, pf_argc);
+        else if (unlikely(pf_argc < fb->arg_count))
             arg_allocated_size = fb->arg_count;
         else
             arg_allocated_size = 0;
@@ -20273,13 +20279,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         nsf->arg_buf = pf_argv;
         nsf->arg_count = pf_argc;
         if (unlikely(arg_allocated_size)) {
-            int n = min_int(pf_argc, fb->arg_count);
+            int n = min_int(pf_argc, arg_allocated_size);
             nsf->arg_buf = vals;
             for(i = 0; i < n; i++)
                 nsf->arg_buf[i] = JS_DupValue(caller_ctx, pf_argv[i]);
-            for(; i < fb->arg_count; i++)
+            for(; i < arg_allocated_size; i++)
                 nsf->arg_buf[i] = JS_UNDEFINED;
-            nsf->arg_count = fb->arg_count;
+            nsf->arg_count = arg_allocated_size;
+            if (pf_flags & JS_CALL_FLAG_COPY_ARGV)
+                nsf->tt_orig_argv = nsf->arg_buf;
         }
         nsf->var_buf = vals + arg_allocated_size;
         for(i = 0; i < fb->var_count; i++)
@@ -44314,8 +44322,10 @@ static size_t tt_chain_frame_size(JSStackFrame *f)
 {
     JSObject *fo = JS_VALUE_GET_OBJ(f->cur_func);
     JSFunctionBytecode *fb = fo->u.func.function_bytecode;
+    /* copied-arg frames own f->arg_count slots (>= fb->arg_count when a
+       COPY_ARGV caller passed extra arguments) */
     size_t val_count =
-        (f->arg_buf == f->tt_frame_base ? (size_t)fb->arg_count : 0) +
+        (f->arg_buf == f->tt_frame_base ? (size_t)f->arg_count : 0) +
         fb->var_count + fb->stack_size;
     size_t size = sizeof(JSStackFrame) + sizeof(JSValue) * val_count +
         sizeof(JSVarRef *) * fb->var_ref_count;
@@ -48116,7 +48126,7 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
             JSValue *vals;
             JSValue *pstart, *cstart;
             size_t val_count =
-                (size_t)(src->arg_buf == src->tt_frame_base ? b->arg_count
+                (size_t)(src->arg_buf == src->tt_frame_base ? src->arg_count
                                                             : 0) +
                 b->var_count + b->stack_size;
             uint32_t k;
