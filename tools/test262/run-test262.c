@@ -241,6 +241,7 @@ int tt_preempt;                /* -P */
 int tt_granularity;            /* -G: 0 = line steps, 1 = opcode steps */
 int tt_timeout_sec = 300;     /* per-test wall clock abort (true hangs) */
 char *tt_metrics_filename;     /* -M: per-test engagement CSV */
+int tt_debug_suppressed;       /* TT_DEBUG_SUPP env: log unparkable steps */
 FILE *tt_metrics_file;
 pthread_mutex_t tt_metrics_mutex = PTHREAD_MUTEX_INITIALIZER;
 _Atomic long long tt_total_requested, tt_total_fired, tt_total_suppressed;
@@ -1498,6 +1499,9 @@ static int tt_preempt_step_handler(JSContext *ctx, int line, int col,
         return 2;
     }
     tls->tt_supp++;
+    if (unlikely(tt_debug_suppressed))
+        fprintf(stderr, "[suppressed step line=%d col=%d depth=%d]\n",
+                line, col, depth);
     if (unlikely((tls->tt_supp & 0x3ff) == 0) &&
         tt_now_ms() > tls->tt_deadline_ms) {
         tls->tt_timed_out = 1;
@@ -2616,6 +2620,7 @@ int main(int argc, char **argv)
     if (optind >= argc && !test_list.count)
         help();
 
+    tt_debug_suppressed = (getenv("TT_DEBUG_SUPP") != NULL);
     if (tt_metrics_filename) {
         tt_metrics_file = fopen(tt_metrics_filename, "w");
         if (!tt_metrics_file)
