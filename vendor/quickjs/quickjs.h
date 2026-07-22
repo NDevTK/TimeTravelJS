@@ -1110,6 +1110,12 @@ JSValue JS_TTPayload(JSContext *ctx, JSValueConst v);
 /* the note pointer (borrowed; NULL if v is not tagged) */
 void *JS_TTNote(JSValueConst v);
 JS_BOOL JS_TTIsTagged(JSValueConst v);
+/* the UNFORWARDED own-property count of v ITSELF (shape-level; fast-array
+   elements not included; -1 if v is not an object). For a tagged value
+   this is the WRAPPER's own view -- has/enumerate forwarding makes the
+   JS-visible view the payload's, so this is the oracle that forwarding
+   never lands anything on the wrapper. */
+int JS_TTOwnPropCount(JSContext *ctx, JSValueConst v);
 
 /* Tagged-value propagation through value-producing operations: when any
    operand of an arithmetic / bitwise / shift / relational / equality
@@ -1141,9 +1147,19 @@ JS_BOOL JS_TTIsTagged(JSValueConst v);
    automatic-COW capture fires for a baseline payload exactly as for a
    direct write (flow isolation composes). A tagged VALUE being stored
    is stored as-is (the get forward flattens on read-back), and a
-   throwing set propagates unwrapped. delete / defineProperty /
-   Reflect.set receiver-mixing, method-receiver semantics beyond the
-   above, and enumeration/has stay named follow-ups. Property-KEY coercion is
+   throwing set propagates unwrapped. Has/enumerate forward too:
+   `k in t` answers over the payload's chain as a CONCRETE boolean
+   (existence is not derived data; a non-object payload gets the
+   operator's real TypeError), for-in walks the payload's enumerable
+   chain exactly as a direct for-in on the payload (string payloads
+   enumerate their indices), and Object.keys/values/entries/
+   getOwnPropertyNames/getOwnPropertySymbols/Reflect.ownKeys enumerate
+   the payload's names -- keys stay concrete strings while values/
+   entries fetch each value THROUGH the wrapper, so they ride the
+   get-forward and stay tracked. seal/freeze, descriptors,
+   defineProperty/deleteProperty, spread-copy internals, and
+   Reflect.set receiver-mixing keep the wrapper's raw view and stay
+   named follow-ups (JS_TTOwnPropCount surfaces that raw view). Property-KEY coercion is
    untouched: a tagged key still refuses (ToPrimitive on a tagged value
    throws the same TypeError the empty wrapper produced before
    forwarding -- unsupported coercion pipelines stay loud worklist

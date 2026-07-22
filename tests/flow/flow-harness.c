@@ -173,15 +173,22 @@
  *                               byte-identical), property sets
  *                               forwarding as the get's inverse (writes
  *                               land on the payload -- never the
- *                               wrapper -- through setters/exotics with
+ *                               wrapper, per the raw JS_TTOwnPropCount
+ *                               probe -- through setters/exotics with
  *                               tagged values stored as-is, and a write
  *                               to a BASELINE payload routing through
  *                               automatic COW: one deduped delta,
- *                               isolated at checkout), and propagated
- *                               results (a strict-eq boolean, a search
- *                               integer, a get result, a cond
- *                               observation stream) riding problem 1's
- *                               fork + serialize paths.
+ *                               isolated at checkout), has/enumerate
+ *                               forwarding (`in` concrete over the
+ *                               payload chain with the real TypeError
+ *                               for primitive payloads, keys concrete,
+ *                               values/entries tracked via the wrapper,
+ *                               for-in over object/proto/string
+ *                               payloads), and propagated results (a
+ *                               strict-eq boolean, a search integer, a
+ *                               get result, a cond observation stream)
+ *                               riding problem 1's fork + serialize
+ *                               paths.
  */
 #include "quickjs.h"
 #include "cutils.h"     /* DynBuf, for the tagged-value note hooks */
@@ -3411,9 +3418,15 @@ static int cmd_combinetest(void)
         JS_FreeValue(ctx, f);
         JS_FreeValue(ctx, pay);
         JS_FreeValue(ctx, tg);
-        /* enumeration is not forwarded, so keys of the WRAPPER prove
-           the write never landed there */
-        ct_expect_concrete(ctx, "Object.keys(TGO).length", "0");
+        /* the wrapper stays inert: the RAW own-prop probe (enumeration
+           forwards to the payload now, so Object.keys shows the
+           payload's view -- only this probe sees the wrapper itself) */
+        tg = eval_val(ctx, "TGO");
+        assert(JS_TTOwnPropCount(ctx, tg) == 0);       /* wrapper: nothing */
+        pay = JS_TTPayload(ctx, tg);
+        assert(JS_TTOwnPropCount(ctx, pay) == 2);      /* payload: a + foo */
+        JS_FreeValue(ctx, pay);
+        JS_FreeValue(ctx, tg);
 
         /* a tagged value stores AS-IS; read-back flattens with the
            combined note (receiver + stored value, mask 5, arity 3) */
@@ -3444,7 +3457,9 @@ static int cmd_combinetest(void)
         JS_FreeValue(ctx, p);
         ct_expect_throws(ctx,
             "(function(){ 'use strict'; TSTR[0] = 'x'; })()", NULL);
-        ct_expect_concrete(ctx, "Object.keys(TSTR).length", "0");
+        tg = eval_val(ctx, "TSTR");
+        assert(JS_TTOwnPropCount(ctx, tg) == 0);   /* wrapper still inert */
+        JS_FreeValue(ctx, tg);
 
         /* a throwing set propagates unwrapped */
         ct_expect_throws(ctx, "TNULL.x = 1", "null");
@@ -3491,6 +3506,69 @@ static int cmd_combinetest(void)
         JS_FreeValue(ctx, gcw);
     }
     printf("COMBINE:set-forwarding routes through COW ok\n");
+
+    /* --- has/enumerate forward to the payload --------------------------- */
+    {
+        JSValue p, tgv, pay;
+
+        /* `in` answers over the payload's chain: concrete, hook-free */
+        cb_calls = 0;
+        cnd_calls = 0;
+        ct_expect_concrete(ctx, "'a' in TGO", "true");
+        ct_expect_concrete(ctx, "'nope' in TGO", "false");
+        ct_expect_concrete(ctx, "'toString' in TGO", "true"); /* inherited */
+        ct_expect_concrete(ctx, "'ip' in TCH", "true");  /* payload proto */
+        assert(cb_calls == 0 && cnd_calls == 0);
+        /* a primitive payload gets the operator's real TypeError */
+        ct_expect_throws(ctx, "'x' in T5", "operand");
+
+        /* keys are the payload's CONCRETE names (join would refuse a
+           tagged element via the coercion pin, so joining proves it) */
+        ct_expect_concrete(ctx, "Object.keys(TGO).join(',')", "a,foo,bar");
+        ct_expect_concrete(ctx,
+            "Object.getOwnPropertyNames(TGO).join(',')", "a,foo,bar");
+        ct_expect_concrete(ctx, "Reflect.ownKeys(TGO).length", "3");
+        ct_expect_concrete(ctx, "Object.keys(TCH).length", "0"); /* own only */
+
+        /* values/entries fetch THROUGH the wrapper: tracked values,
+           concrete keys */
+        p = ct_eval_payload(ctx, "Object.values(TGO)[0]");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 5);
+        JS_FreeValue(ctx, p);
+        ct_expect_concrete(ctx, "Object.entries(TGO)[0][0]", "a");
+        p = ct_eval_payload(ctx, "Object.entries(TGO)[2][1]");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 9);
+        JS_FreeValue(ctx, p);   /* the stored tagged T9, flattened by 4c */
+
+        /* for-in walks the payload's enumerable chain, proto included */
+        ct_expect_concrete(ctx,
+            "(function(){ var ks = []; for (var k in TGO) ks.push(k); "
+            "return ks.join(','); })()", "a,foo,bar");
+        ct_expect_concrete(ctx,
+            "(function(){ var ks = []; for (var k in TCH) ks.push(k); "
+            "return ks.join(','); })()", "ip");
+        /* a string payload enumerates its indices */
+        ct_expect_concrete(ctx,
+            "(function(){ var ks = []; for (var k in TSTR) ks.push(k); "
+            "return ks.join(','); })()", "0,1,2");
+        ct_expect_concrete(ctx, "Object.keys(TSTR).join(',')", "0,1,2");
+
+        /* the wrapper itself owns nothing through all of this */
+        tgv = eval_val(ctx, "TGO");
+        assert(JS_TTOwnPropCount(ctx, tgv) == 0);
+        pay = JS_TTPayload(ctx, tgv);
+        assert(JS_TTOwnPropCount(ctx, pay) == 3);   /* a, foo, bar */
+        JS_FreeValue(ctx, pay);
+        JS_FreeValue(ctx, tgv);
+
+        /* untagged paths byte-identical */
+        ct_expect_concrete(ctx, "Object.keys({x:1,y:2}).join(',')", "x,y");
+        ct_expect_concrete(ctx, "'x' in ({x:1})", "true");
+        ct_expect_concrete(ctx,
+            "(function(){ var ks = []; for (var k in {q:1}) ks.push(k); "
+            "return ks.join(','); })()", "q");
+    }
+    printf("COMBINE:has/enumerate forward ok\n");
 
     /* --- a throwing concrete op propagates the real error -------------- */
     cb_calls = 0;

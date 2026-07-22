@@ -671,10 +671,37 @@ the second write, isolated after checkout), because the real set path
 runs, nothing re-implemented. A tagged **value** being stored is stored
 as-is — no unwrap, no extra wrap; the get forward flattens it with a
 combined note on read-back. Tagged **keys** still refuse on any
-receiver (the key coerces before the receiver forwards). `delete`,
-`defineProperty`, `Reflect.set` receiver-mixing, and enumeration stay
-named follow-ups; `Object.keys(tagged)` remains the wrapper's own
-(empty) view, which the suite uses to prove writes never land there.
+receiver (the key coerces before the receiver forwards).
+
+## Has/enumerate forward to the payload
+
+The remaining reflection reads complete get/set. `k in t` answers over
+the **payload's** chain (own + inherited) as a **concrete** boolean —
+existence is not derived data, so no wrap and no hook, the
+reflexive-identity discipline; a non-object payload gets the operator's
+real TypeError. `for (k in t)` swaps the payload in at
+`build_for_in_iterator`, so the walk is *literally* a for-in over the
+payload — enumerability, shadowing, prototype order, string index keys
+(`"0","1","2"` for `tagged("abc")`), and the empty loop for a nullish
+payload all come from the engine's own iterator. `Object.keys` /
+`values` / `entries`, `getOwnPropertyNames`/`Symbols`, and
+`Reflect.ownKeys` forward at `JS_GetOwnPropertyNames2`: names and the
+enumerability re-check run against the payload (**keys stay concrete
+strings** — a tagged key string would poison joins via the coercion
+pin), while `values`/`entries` fetch each value **through the
+wrapper**, so they ride the get-forward and stay tracked
+(`Object.values(tagged({a:5}))` → `[tagged 5]`; a stored tagged value
+arrives flattened). Three one-compare class tests; untagged paths
+byte-identical and allocation-free.
+
+The wrapper's own raw view is no longer JS-visible, so the suite's
+wrapper-inertness proofs moved to a new C probe:
+`JS_TTOwnPropCount(ctx, v)` counts v's **unforwarded** shape-level own
+properties — 0 for a wrapper before and after forwarded writes and
+enumeration, while the payload's count grows. `seal`/`freeze`,
+descriptors, `defineProperty`/`deleteProperty`, spread-copy internals,
+and `Reflect.set` receiver-mixing keep that raw wrapper view and stay
+named follow-ups.
 
 The combinetest harness drives the oracle: exact payloads for
 arithmetic/bitwise/shift (`tagged(5)+1 → 6`, `tagged(6)&3 → 2`), concat
@@ -707,13 +734,18 @@ values flattening with mask 5 arity 3, functions passing through
 unwrapped into working plain method calls, throwing gets unwrapped,
 tagged keys still refusing on any receiver, untagged gets
 byte-identical), property sets forwarding (a second get and the raw
-payload both see the write while the wrapper owns nothing, tagged
-values stored as-is and flattened on read-back, payload setters with
-payload `this`, string exotic sloppy/strict semantics, throwing and
-tagged-key sets refusing, and a baseline-payload write recording
-exactly one deduped COW delta that checkout isolates), unchanged
-out-of-scope behavior (typeof, tagged property keys,
-`new String(tagged)`), and
+payload both see the write while the wrapper owns nothing — asserted
+through the raw `JS_TTOwnPropCount` probe, tagged values stored as-is
+and flattened on read-back, payload setters with payload `this`,
+string exotic sloppy/strict semantics, throwing and tagged-key sets
+refusing, and a baseline-payload write recording exactly one deduped
+COW delta that checkout isolates), has/enumerate forwarding (`in` over
+own+inherited payload props concrete and hook-free with the real
+TypeError for primitive payloads, keys/getOwnPropertyNames/ownKeys as
+concrete payload names, values/entries tracked through the wrapper,
+for-in over object/proto/string payloads, and the wrapper's raw count
+pinned at zero throughout), unchanged out-of-scope behavior (typeof,
+tagged property keys, `new String(tagged)`), and
 propagated results riding problem 1's fork and serialize→hydrate paths
 with their notes intact — including a cond observation stream that is
 byte-identical across the original, a forked arm, and a hydrated copy.

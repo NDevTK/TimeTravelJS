@@ -9733,6 +9733,20 @@ int JS_HasProperty(JSContext *ctx, JSValueConst obj, JSAtom prop)
     if (unlikely(JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT))
         return FALSE;
     p = JS_VALUE_GET_OBJ(obj);
+    /* TimeTravelJS: `k in t` asks about the PAYLOAD's chain. Existence
+       is not derived data -- a concrete boolean, no hooks (the
+       reflexive-identity discipline). A non-object payload gets the
+       operator's real TypeError, exactly as `k in payload` would. */
+    if (unlikely(p->class_id == JS_CLASS_TT_TAGGED)) {
+        JSValueConst pay = p->u.tt_tagged.payload;
+        while (tt_value_is_tagged(pay))
+            pay = JS_VALUE_GET_OBJ(pay)->u.tt_tagged.payload;
+        if (JS_VALUE_GET_TAG(pay) != JS_TAG_OBJECT) {
+            JS_ThrowTypeError(ctx, "invalid 'in' operand");
+            return -1;
+        }
+        return JS_HasProperty(ctx, pay, prop);
+    }
     for(;;) {
         if (p->is_exotic) {
             const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
@@ -17440,6 +17454,22 @@ static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
     uint32_t tag, tab_atom_count;
 
     tag = JS_VALUE_GET_TAG(obj);
+    if (unlikely(tag == JS_TAG_OBJECT &&
+                 JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_TT_TAGGED)) {
+        /* TimeTravelJS: for-in over a tagged value walks the PAYLOAD's
+           enumerable chain exactly as a direct for-in on the payload
+           would -- a string payload gets its index keys through the
+           ToObject below, a null/undefined payload the same empty
+           loop. Keys are payload property names: concrete. */
+        JSValueConst pay = JS_VALUE_GET_OBJ(obj)->u.tt_tagged.payload;
+        JSValue pv;
+        while (tt_value_is_tagged(pay))
+            pay = JS_VALUE_GET_OBJ(pay)->u.tt_tagged.payload;
+        pv = JS_DupValue(ctx, pay);
+        JS_FreeValue(ctx, obj);
+        obj = pv;
+        tag = JS_VALUE_GET_TAG(obj);
+    }
     if (tag != JS_TAG_OBJECT && tag != JS_TAG_NULL && tag != JS_TAG_UNDEFINED) {
         obj = JS_ToObjectFree(ctx, obj);
     }
@@ -49120,6 +49150,31 @@ void *JS_TTNote(JSValueConst v)
     return JS_VALUE_GET_OBJ(v)->u.tt_tagged.note;
 }
 
+/* the UNFORWARDED own-property count of v itself (shape-level; deleted
+   slots excluded, fast-array elements not counted; -1 for non-objects).
+   For a tagged value this is the WRAPPER's own view -- the JS-visible
+   view forwards to the payload, so this raw probe is the oracle that
+   get/set/enumerate forwarding never lands anything on the wrapper. */
+int JS_TTOwnPropCount(JSContext *ctx, JSValueConst v)
+{
+    JSObject *p;
+    JSShape *sh;
+    JSShapeProperty *prs;
+    int i, n;
+
+    (void)ctx;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return -1;
+    p = JS_VALUE_GET_OBJ(v);
+    sh = p->shape;
+    n = 0;
+    for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
+        if (prs->atom != JS_ATOM_NULL)
+            n++;
+    }
+    return n;
+}
+
 JS_BOOL JS_TTIsTagged(JSValueConst v)
 {
     return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT &&
@@ -51999,17 +52054,38 @@ exception:
 static JSValue JS_GetOwnPropertyNames2(JSContext *ctx, JSValueConst obj1,
                                        int flags, int kind)
 {
-    JSValue obj, r, val, key, value;
+    JSValue obj, r, val, key, value, pobj;
     JSObject *p;
     JSPropertyEnum *atoms;
     uint32_t len, i, j;
 
     r = JS_UNDEFINED;
     val = JS_UNDEFINED;
+    pobj = JS_UNDEFINED;
     obj = JS_ToObject(ctx, obj1);
     if (JS_IsException(obj))
         return JS_EXCEPTION;
     p = JS_VALUE_GET_OBJ(obj);
+    /* TimeTravelJS: enumerating a tagged value reflects the PAYLOAD --
+       Object.keys/values/entries, getOwnPropertyNames/Symbols and
+       Reflect.ownKeys all land here. Names and the enumerability
+       re-check run against the payload (keys stay concrete property
+       names), while VALUES below are fetched through `obj` -- still
+       the wrapper -- so they ride the get-forward and stay tracked.
+       ToObject on the payload gives a primitive payload (a tagged
+       string) its exotic index keys, and gives a null payload the
+       operation's real TypeError. */
+    if (unlikely(p->class_id == JS_CLASS_TT_TAGGED)) {
+        JSValueConst pay = p->u.tt_tagged.payload;
+        while (tt_value_is_tagged(pay))
+            pay = JS_VALUE_GET_OBJ(pay)->u.tt_tagged.payload;
+        pobj = JS_ToObject(ctx, pay);
+        if (JS_IsException(pobj)) {
+            JS_FreeValue(ctx, obj);
+            return JS_EXCEPTION;
+        }
+        p = JS_VALUE_GET_OBJ(pobj);
+    }
     if (JS_GetOwnPropertyNamesInternal(ctx, &atoms, &len, p, flags & ~JS_GPN_ENUM_ONLY))
         goto exception;
     r = JS_NewArray(ctx);
@@ -52071,6 +52147,7 @@ exception:
     r = JS_EXCEPTION;
 done:
     JS_FreePropertyEnum(ctx, atoms, len);
+    JS_FreeValue(ctx, pobj);
     JS_FreeValue(ctx, obj);
     return r;
 }
