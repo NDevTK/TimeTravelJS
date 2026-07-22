@@ -1108,15 +1108,21 @@ void *JS_TTNote(JSValueConst v);
 JS_BOOL JS_TTIsTagged(JSValueConst v);
 
 /* Tagged-value propagation through value-producing operations: when any
-   operand of an arithmetic / bitwise / shift / relational / loose-equality
-   op, a string concatenation, or one of the covered coercion pipelines
+   operand of an arithmetic / bitwise / shift / relational / equality
+   op (loose AND strict, including the switch case-compare), a string
+   concatenation, or one of the covered coercion pipelines
    (unary +, String(x), parseInt/parseFloat) is tagged, the engine unwraps
    each operand's payload, runs ITS OWN operation on the concretes, and
    re-wraps the real result as a fresh tagged value whose note derives
    from the operand notes through the combine hook. A throwing concrete
-   op propagates faithfully. Strict equality keeps identity semantics
-   (never unwraps), and property-KEY coercion is untouched: a tagged key
-   throws exactly as an unknown object key does today.
+   op propagates faithfully. One strict-equality carve-out: the reflexive
+   compare of a tagged value against ITSELF (the same object) keeps its
+   concrete identity answer (true for ===) with no hook call. The
+   compiler-internal exact-undefined probes (parameter and destructuring
+   defaults) are NOT comparisons and never unwrap: a tagged value -- even
+   one whose payload is undefined -- does not trigger a default.
+   Property-KEY coercion is untouched: a tagged key throws exactly as an
+   unknown object key does today.
    The 'op' the hook receives: */
 enum {
     JS_TT_OP_ADD = 1,         /* also string concatenation via + */
@@ -1146,6 +1152,8 @@ enum {
     JS_TT_OP_TO_STRING,       /* String(x) */
     JS_TT_OP_PARSE_INT,
     JS_TT_OP_PARSE_FLOAT,
+    JS_TT_OP_STRICT_EQ,       /* === (also the switch case-compare) */
+    JS_TT_OP_STRICT_NEQ,      /* !== */
 };
 /* Derive the RESULT note from the operand notes (NULL entries = untagged
    operands). args are the ORIGINAL operand values (tagged wrappers

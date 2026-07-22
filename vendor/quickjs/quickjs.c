@@ -15471,9 +15471,12 @@ enum {
     TT_TAGRUN_SHR,            /* js_shr_slow */
     TT_TAGRUN_REL,            /* js_relational_slow */
     TT_TAGRUN_EQ,             /* js_eq_slow */
+    TT_TAGRUN_STRICT_EQ,      /* js_strict_eq_slow */
 };
 static int tt_tagged_binary(JSContext *ctx, JSValue *sp, int kind, int arg,
                             int tt_op);
+static no_inline int js_strict_eq_slow(JSContext *ctx, JSValue *sp,
+                                       BOOL is_neq);
 static int tt_tagged_unary(JSContext *ctx, JSValue *sp, int is_not,
                            OPCodeEnum op);
 static int tt_tagged_post_inc(JSContext *ctx, JSValue *sp, OPCodeEnum op);
@@ -16625,6 +16628,9 @@ static int tt_tagged_binary(JSContext *ctx, JSValue *sp, int kind, int arg,
         ret = js_relational_slow(ctx, stk + 2, arg);
         tt_op = tt_tt_opcode(arg);
         break;
+    case TT_TAGRUN_STRICT_EQ:
+        ret = js_strict_eq_slow(ctx, stk + 2, arg);
+        break;
     default:
     case TT_TAGRUN_EQ:
         ret = js_eq_slow(ctx, stk + 2, arg);
@@ -16890,6 +16896,20 @@ static no_inline int js_strict_eq_slow(JSContext *ctx, JSValue *sp,
                                        BOOL is_neq)
 {
     BOOL res;
+
+    /* a tagged operand takes the same unwrap -> engine's own compare ->
+       re-wrap path as loose equality, with one carve-out: the reflexive
+       compare of a tagged value against ITSELF (the same object, e.g.
+       x === x) keeps its concrete identity answer and calls no hook.
+       Both operands must be checked tagged BEFORE the pointer compare:
+       only then are both pointer reads valid. */
+    if (unlikely(tt_value_is_tagged(sp[-2]) || tt_value_is_tagged(sp[-1]))) {
+        if (!(tt_value_is_tagged(sp[-2]) && tt_value_is_tagged(sp[-1]) &&
+              JS_VALUE_GET_OBJ(sp[-2]) == JS_VALUE_GET_OBJ(sp[-1])))
+            return tt_tagged_binary(ctx, sp, TT_TAGRUN_STRICT_EQ, is_neq,
+                                    is_neq ? JS_TT_OP_STRICT_NEQ
+                                           : JS_TT_OP_STRICT_EQ);
+    }
     res = js_strict_eq2(ctx, sp[-2], sp[-1], JS_EQ_STRICT);
     sp[-2] = JS_NewBool(ctx, res ^ is_neq);
     return 0;
@@ -30913,6 +30933,25 @@ fail:
     return JS_ATOM_NULL;
 }
 
+/* TimeTravelJS: the exact-undefined probe of the default-value protocols
+   (parameter defaults, destructuring defaults). This is NOT a user
+   comparison and must stay a concrete tag test: a tagged value is a
+   wrapper object -- never `undefined`, whatever its payload -- so it
+   must not trigger a default, and no Combine note derives from the
+   probe. Emitting the probe opcode directly keeps these sites out of
+   js_strict_eq_slow, whose tagged operands now unwrap like loose eq. */
+static void emit_undefined_probe(JSParseState *s)
+{
+#if SHORT_OPCODES
+    emit_op(s, OP_is_undefined);
+#else
+    /* no probe opcode in this configuration: the raw compare (which
+       predates tagged-value propagation here) */
+    emit_op(s, OP_undefined);
+    emit_op(s, OP_strict_eq);
+#endif
+}
+
 /* Return -1 if error, 0 if no initializer, 1 if an initializer is
    present at the top level. */
 static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
@@ -30938,8 +30977,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
     if (hasval) {
         /* consume value from the stack */
         emit_op(s, OP_dup);
-        emit_op(s, OP_undefined);
-        emit_op(s, OP_strict_eq);
+        emit_undefined_probe(s);
         emit_goto(s, OP_if_true, label_parse);
         emit_label(s, label_assign);
     } else {
@@ -31201,8 +31239,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
             if (s->token.val == '=') {  /* handle optional default value */
                 int label_hasval;
                 emit_op(s, OP_dup);
-                emit_op(s, OP_undefined);
-                emit_op(s, OP_strict_eq);
+                emit_undefined_probe(s);
                 label_hasval = emit_goto(s, OP_if_false, -1);
                 if (next_token(s))
                     goto var_error;
@@ -31315,8 +31352,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
                     /* handle optional default value */
                     int label_hasval;
                     emit_op(s, OP_dup);
-                    emit_op(s, OP_undefined);
-                    emit_op(s, OP_strict_eq);
+                    emit_undefined_probe(s);
                     label_hasval = emit_goto(s, OP_if_false, -1);
                     if (next_token(s))
                         goto var_error;
@@ -39726,28 +39762,14 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             goto no_change;
 
         case OP_null:
-#if SHORT_OPCODES
-            if (OPTIMIZE) {
-                /* transform null strict_eq into is_null */
-                if (code_match(&cc, pos_next, OP_strict_eq, -1)) {
-                    if (cc.line_num >= 0) line_num = cc.line_num;
-                    add_pc2line_info(s, bc_out.size, line_num);
-                    dbuf_putc(&bc_out, OP_is_null);
-                    pos_next = cc.pos;
-                    break;
-                }
-                /* transform null strict_neq if_false/if_true -> is_null if_true/if_false */
-                if (code_match(&cc, pos_next, OP_strict_neq, M2(OP_if_false, OP_if_true), -1)) {
-                    if (cc.line_num >= 0) line_num = cc.line_num;
-                    add_pc2line_info(s, bc_out.size, line_num);
-                    dbuf_putc(&bc_out, OP_is_null);
-                    pos_next = cc.pos;
-                    label = cc.label;
-                    op = cc.op ^ OP_if_false ^ OP_if_true;
-                    goto has_label;
-                }
-            }
-#endif
+            /* TimeTravelJS: the null strict_eq/strict_neq -> is_null
+               fusions are gone. A tagged operand must reach
+               js_strict_eq_slow's unwrap path (is_null is a plain tag
+               test that would neither unwrap nor Combine), and the
+               inverted strict_neq + branch form is unsound outright for
+               a result that is an always-truthy wrapper object: moving
+               the negation into the swapped branch flips the control
+               flow the unfused compare would take. */
             /* fall thru */
         case OP_push_false:
         case OP_push_true:
@@ -39908,26 +39930,11 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     val = 0;
                     goto has_constant_test;
                 }
-#if SHORT_OPCODES
-                /* transform undefined strict_eq -> is_undefined */
-                if (code_match(&cc, pos_next, OP_strict_eq, -1)) {
-                    if (cc.line_num >= 0) line_num = cc.line_num;
-                    add_pc2line_info(s, bc_out.size, line_num);
-                    dbuf_putc(&bc_out, OP_is_undefined);
-                    pos_next = cc.pos;
-                    break;
-                }
-                /* transform undefined strict_neq if_false/if_true -> is_undefined if_true/if_false */
-                if (code_match(&cc, pos_next, OP_strict_neq, M2(OP_if_false, OP_if_true), -1)) {
-                    if (cc.line_num >= 0) line_num = cc.line_num;
-                    add_pc2line_info(s, bc_out.size, line_num);
-                    dbuf_putc(&bc_out, OP_is_undefined);
-                    pos_next = cc.pos;
-                    label = cc.label;
-                    op = cc.op ^ OP_if_false ^ OP_if_true;
-                    goto has_label;
-                }
-#endif
+                /* TimeTravelJS: the undefined strict_eq/strict_neq ->
+                   is_undefined fusions are gone for the same reason as
+                   the null ones above; the default-value protocols that
+                   relied on the fused probe now emit OP_is_undefined
+                   directly (emit_undefined_probe). */
             }
             goto no_change;
 
@@ -41369,8 +41376,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                     emit_op(s, OP_get_arg);
                     emit_u16(s, idx);
                     emit_op(s, OP_dup);
-                    emit_op(s, OP_undefined);
-                    emit_op(s, OP_strict_eq);
+                    emit_undefined_probe(s);
                     emit_goto(s, OP_if_false, label);
                     emit_op(s, OP_drop);
                     if (js_parse_assign_expr(s))

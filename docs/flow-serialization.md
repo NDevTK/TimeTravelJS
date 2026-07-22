@@ -493,8 +493,9 @@ opcodes.** Every fast guard in the dispatch loop is tag-exact
 object — always misses them and falls into `js_add_slow`,
 `js_binary_arith_slow`, `js_unary_arith_slow`, `js_post_inc_slow`,
 `js_not_slow`, `js_binary_logic_slow`, `js_shr_slow`,
-`js_relational_slow`, or `js_eq_slow`, each of which now opens with a
-tagged intercept that recurses into itself on the unwrapped payloads.
+`js_relational_slow`, `js_eq_slow`, or `js_strict_eq_slow`, each of
+which now opens with a tagged intercept that recurses into itself on the
+unwrapped payloads.
 `JS_ConcatString` carries the same intercept, which is what makes the
 template-literal engine propagate: evaluated templates compile to
 `"str".concat(part, …)`, and the pristine `js_string_concat` builtin
@@ -510,13 +511,31 @@ primitives **before** the slow helpers (`TT_COERCE_SLOT`, so bytecode
 skips tagged values — at operator sites the helper unwraps them, and at
 property-KEY sites the C path throws exactly the TypeError the in-loop
 coercion would have thrown, which keeps key coercion pinned to today's
-behavior. Two more deliberate boundaries: strict equality never unwraps
-(identity semantics, `tagged(5) === 5` is `false` as today), and
-truthiness/branching on a tagged value is untouched (a tagged boolean is
-an object and stays truthy — conditional behavior is the next problem).
-Relational and loose-equality results are therefore tagged *values*
-(`tagged(true)`), faithful to the rule but only meaningful to hosts
-until branches learn about them.
+behavior.
+
+Strict equality (`===`/`!==` and the `switch` case-compare, which
+compiles to the same `strict_eq` opcode) takes the **same unwrap path**
+as loose equality: `tagged("a") === "a"` is `tagged(true)`,
+`tagged(5) === tagged(5)` (distinct wrappers, equal payloads) is
+`tagged(true)`, and `Combine` sees `JS_TT_OP_STRICT_EQ`/`_STRICT_NEQ`
+with the original operands. One carve-out: the reflexive compare of a
+tagged value against **itself** (`x === x`, the same object) keeps its
+concrete identity answer — `true`, no hook call. Two compile-time
+consequences keep every spelling of the operator on that one path: the
+peephole fusions of `=== null`/`=== undefined` into the `is_null`/
+`is_undefined` short opcodes are gone (the plain ones would skip the
+unwrap; the inverted `!==`-plus-branch ones are unsound outright for an
+always-truthy wrapper result), and the parameter/destructuring
+**default-value probes** — which are exact-`undefined` tag tests, not
+comparisons — now emit `OP_is_undefined` directly, so a tagged argument
+(even one whose payload *is* `undefined`) never triggers a default and
+never fires the hook.
+
+One deliberate boundary remains: truthiness/branching on a tagged value
+is untouched (a tagged boolean is an object and stays truthy —
+conditional behavior is the next problem). Relational and equality
+results are therefore tagged *values* (`tagged(true)`), faithful to the
+rule but only meaningful to hosts until branches learn about them.
 
 The combinetest harness drives the oracle: exact payloads for
 arithmetic/bitwise/shift (`tagged(5)+1 → 6`, `tagged(6)&3 → 2`), concat
@@ -526,10 +545,16 @@ coercions (`+tagged("5")` is the *number* 5; `String(tagged(9)) → "9"`;
 `parseInt(tagged("42")) → 42`; nothing collapses to NaN or de-tags),
 `Combine` seeing the right op / notes / arity for one- and two-tagged
 operand cases, a faithful `TypeError` from `tagged(Symbol()) * 1` with
-zero Combine calls, unchanged out-of-scope behavior (strict eq, typeof,
-truthiness, tagged property keys, `new String(tagged)`), and a
-propagated result riding problem 1's fork and serialize→hydrate paths
-with its combined note intact.
+zero Combine calls, strict equality unwrapping in every spelling
+(`tagged(5) === 5` → `tagged(true)`, strict-vs-loose payload semantics
+kept distinct, `=== null`/`=== undefined` literal forms, the `switch`
+case-compare, reflexive `x === x` staying concrete and hook-free),
+default-value probes never unwrapping (a tagged argument — even
+`tagged(undefined)` — rides through with zero Combine calls), unchanged
+out-of-scope behavior (typeof, truthiness, tagged property keys,
+`new String(tagged)`), and propagated results (an arithmetic int and a
+strict-eq boolean) riding problem 1's fork and serialize→hydrate paths
+with their combined notes intact.
 
 ## Wire format (`TTFL05`)
 

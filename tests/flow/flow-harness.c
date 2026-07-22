@@ -135,11 +135,18 @@
  *                               Asserts exact payloads ("x"+t("y") is
  *                               "xy", +t("5") is the number 5 -- the real
  *                               op ran), faithful concrete throws and
- *                               NaNs, two-tagged combines, strict-eq /
- *                               typeof / truthiness / property-key
- *                               coercion staying exactly as today, and a
- *                               propagated result round-tripping through
- *                               problem 1's fork + serialize paths.
+ *                               NaNs, two-tagged combines, strict-eq
+ *                               (===/!==, the switch case-compare, and
+ *                               the null/undefined literal forms)
+ *                               unwrapping exactly like loose-eq with
+ *                               reflexive x === x staying concrete and
+ *                               hook-free, the parameter/destructuring
+ *                               default probes never unwrapping, typeof /
+ *                               truthiness / property-key coercion
+ *                               staying exactly as today, and propagated
+ *                               results (including a strict-eq boolean)
+ *                               round-tripping through problem 1's fork +
+ *                               serialize paths.
  */
 #include "quickjs.h"
 #include "cutils.h"     /* DynBuf, for the tagged-value note hooks */
@@ -250,7 +257,7 @@ static const char *BASELINE_SRC =
 "  var t = null;\n"
 "  var u = null;\n"
 "  var fed = yield \"t0\";\n"
-"  yield \"t1:\" + (t === null ? \"null\" : typeof t) + \":\" + fed;\n"
+"  yield \"t1:\" + (t ? typeof t : \"null\") + \":\" + fed;\n"
 "  return \"t-end\";\n"
 "}\n";
 
@@ -2739,6 +2746,9 @@ static int cmd_combinetest(void)
     at_t = JS_NewAtom(ctx, "t");
 
     ct_set_tagged(ctx, "T5", JS_NewInt32(ctx, 5), "H5");
+    ct_set_tagged(ctx, "T5B", JS_NewInt32(ctx, 5), "H5B");
+    ct_set_tagged(ctx, "TNULL", JS_NULL, "HN");
+    ct_set_tagged(ctx, "TUND", JS_UNDEFINED, "HU");
     ct_set_tagged(ctx, "T6", JS_NewInt32(ctx, 6), "H6");
     ct_set_tagged(ctx, "T2", JS_NewInt32(ctx, 2), "H2");
     ct_set_tagged(ctx, "T3", JS_NewInt32(ctx, 3), "H3");
@@ -2833,6 +2843,93 @@ static int cmd_combinetest(void)
     ct_expect_bool(ctx, "T2 != 2", 0, JS_TT_OP_NEQ, 1);
     printf("COMBINE:relational/loose-eq ok\n");
 
+    /* --- strict equality: the same unwrap -> compare -> re-wrap -------- */
+    ct_expect_bool(ctx, "TY === 'y'", 1, JS_TT_OP_STRICT_EQ, 1);
+    ct_expect_bool(ctx, "TY === 'b'", 0, JS_TT_OP_STRICT_EQ, 1);
+    ct_expect_bool(ctx, "T5 === 5", 1, JS_TT_OP_STRICT_EQ, 1);
+    ct_expect_bool(ctx, "5 === T5", 1, JS_TT_OP_STRICT_EQ, 2);
+    ct_expect_bool(ctx, "T5 !== 6", 1, JS_TT_OP_STRICT_NEQ, 1);
+    /* the payload comparison is the REAL strict one: no coercion... */
+    ct_expect_bool(ctx, "T5 === '5'", 0, JS_TT_OP_STRICT_EQ, 1);
+    /* ...while loose on the same operands still coerces */
+    ct_expect_bool(ctx, "T5 == '5'", 1, JS_TT_OP_EQ, 1);
+    /* two tagged: distinct objects with equal payloads compare equal */
+    ct_expect_bool(ctx, "T5 === T5B", 1, JS_TT_OP_STRICT_EQ, 3);
+    ct_expect_bool(ctx, "T5 === T6", 0, JS_TT_OP_STRICT_EQ, 3);
+    printf("COMBINE:strict-eq unwraps ok\n");
+
+    /* --- strict equality against the null/undefined literals -----------
+       (these forms used to compile to the is_null/is_undefined short
+       opcodes; they now reach the same tagged strict-eq path) */
+    ct_expect_bool(ctx, "T5 === null", 0, JS_TT_OP_STRICT_EQ, 1);
+    ct_expect_bool(ctx, "T5 === undefined", 0, JS_TT_OP_STRICT_EQ, 1);
+    ct_expect_bool(ctx, "TNULL === null", 1, JS_TT_OP_STRICT_EQ, 1);
+    ct_expect_bool(ctx, "TUND === undefined", 1, JS_TT_OP_STRICT_EQ, 1);
+    ct_expect_bool(ctx, "T5 !== null", 1, JS_TT_OP_STRICT_NEQ, 1);
+    /* with a branch: identical control flow to != -- the inverted
+       is_null fusion is gone and the wrapper result is truthy */
+    cb_calls = 0;
+    ct_expect_concrete(ctx,
+        "(function(){ if (T5 !== null) return 'A'; return 'B'; })()", "A");
+    assert(cb_calls == 1 && cb_last_op == JS_TT_OP_STRICT_NEQ);
+    cb_calls = 0;
+    ct_expect_concrete(ctx,
+        "(function(){ if (T5 != null) return 'A'; return 'B'; })()", "A");
+    assert(cb_calls == 1 && cb_last_op == JS_TT_OP_NEQ);
+    printf("COMBINE:strict-eq null/undefined literals ok\n");
+
+    /* --- reflexive: the same tagged object stays concrete, no hook ----- */
+    cb_calls = 0;
+    ct_expect_concrete(ctx, "T5 === T5", "true");
+    ct_expect_concrete(ctx, "T5 !== T5", "false");
+    ct_expect_concrete(ctx, "(function(x){ return x === x; })(T5)", "true");
+    assert(cb_calls == 0);
+    printf("COMBINE:strict-eq reflexive concrete ok\n");
+
+    /* --- switch: each case-compare is the same tagged strict-eq -------- */
+    cb_calls = 0;
+    ct_expect_concrete(ctx,
+        "(function(){ switch (TY) { case 'y': return 'hit'; "
+        "case 'z': return 'z'; default: return 'd'; } })()", "hit");
+    assert(cb_calls == 1 && cb_last_op == JS_TT_OP_STRICT_EQ);
+    /* the compare result is a truthy WRAPPER (truthiness is problem 3),
+       so -- exactly like an if over == or === -- the first case-compare
+       selects even on a false payload */
+    cb_calls = 0;
+    ct_expect_concrete(ctx,
+        "(function(){ switch (TY) { case 'z': return 'first'; "
+        "case 'y': return 'second'; default: return 'd'; } })()", "first");
+    assert(cb_calls == 1 && cb_last_op == JS_TT_OP_STRICT_EQ);
+    printf("COMBINE:switch case-compare ok\n");
+
+    /* --- the default-value probes never unwrap ------------------------- */
+    {
+        JSValue p;
+        cb_calls = 0;
+        /* a tagged argument is not `undefined`: the default must not
+           fire, the tagged value must ride through, no Combine */
+        p = ct_eval_payload(ctx, "(function(a = 99){ return a; })(T5)");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 5);
+        JS_FreeValue(ctx, p);
+        /* even a tagged UNDEFINED payload is not `undefined` */
+        p = ct_eval_payload(ctx, "(function(a = 99){ return a; })(TUND)");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_UNDEFINED);
+        JS_FreeValue(ctx, p);
+        /* destructuring defaults use the same probe */
+        p = ct_eval_payload(ctx,
+            "(function(){ var [dv = 7] = [T5]; return dv; })()");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 5);
+        JS_FreeValue(ctx, p);
+        p = ct_eval_payload(ctx,
+            "(function(){ var {q: qv = 7} = {q: T5}; return qv; })()");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 5);
+        JS_FreeValue(ctx, p);
+        assert(cb_calls == 0);
+        /* an absent argument still takes the default */
+        ct_expect_concrete(ctx, "(function(a = 99){ return a; })()", "99");
+    }
+    printf("COMBINE:default probes stay exact ok\n");
+
     /* --- a throwing concrete op propagates the real error -------------- */
     cb_calls = 0;
     ct_expect_throws(ctx, "TSYM * 1", "symbol");
@@ -2840,8 +2937,6 @@ static int cmd_combinetest(void)
     printf("COMBINE:faithful throw ok\n");
 
     /* --- out-of-scope behavior is EXACTLY today's ----------------------- */
-    ct_expect_concrete(ctx, "T5 === 5", "false");   /* identity, no unwrap */
-    ct_expect_concrete(ctx, "T5 === T5", "true");
     ct_expect_concrete(ctx, "typeof T5", "object");
     ct_expect_concrete(ctx, "T5 ? 1 : 2", "1");     /* truthiness: problem 3 */
     ct_expect_throws(ctx, "({})[TKEY]", NULL);      /* key coercion throws */
@@ -2899,6 +2994,57 @@ static int cmd_combinetest(void)
         JS_FreeValue(ctx, arm);
     }
     printf("COMBINE:propagated result round-trips ok\n");
+
+    /* --- a strict-eq boolean rides the same graph paths ------------------ */
+    {
+        JSValue R, g, arm, tA, g2, t2;
+        uint8_t *bytes;
+        size_t blen;
+        char want_note[64];
+        int clones0;
+        snprintf(want_note, sizeof(want_note), "C%d(H5,-)",
+                 JS_TT_OP_STRICT_EQ);
+        R = eval_val(ctx, "T5 === 5");
+        assert(JS_TTIsTagged(R));
+        assert(JS_TTNote(R) && strcmp((char *)JS_TTNote(R), want_note) == 0);
+        g = tg_start_tflow(ctx);
+        if (!JS_TTFlowSetLocal(ctx, g, 0, at_t, R)) {
+            fprintf(stderr, "FAIL: inject strict-eq result\n");
+            return 1;
+        }
+        clones0 = tg_clones;
+        arm = JS_TTFlowFork(ctx, g);
+        if (JS_IsException(arm))
+            die(ctx, "fork with strict-eq result");
+        assert(tg_clones == clones0 + 1);
+        tA = JS_TTFlowGetLocal(ctx, arm, 0, at_t);
+        assert(JS_TTIsTagged(tA));
+        assert(JS_TTNote(tA) != JS_TTNote(R));
+        assert(strcmp((char *)JS_TTNote(tA), want_note) == 0);
+        bytes = JS_TTFlowSerialize(ctx, g, &blen);
+        if (!bytes)
+            die(ctx, "serialize strict-eq result");
+        g2 = JS_TTFlowDeserialize(ctx, bytes, blen);
+        if (JS_IsException(g2))
+            die(ctx, "hydrate strict-eq result");
+        js_free(ctx, bytes);
+        t2 = JS_TTFlowGetLocal(ctx, g2, 0, at_t);
+        assert(JS_TTIsTagged(t2));
+        assert(strcmp((char *)JS_TTNote(t2), want_note) == 0);
+        {
+            JSValue p = JS_TTPayload(ctx, t2);
+            assert(JS_VALUE_GET_TAG(p) == JS_TAG_BOOL &&
+                   JS_ToBool(ctx, p) == 1);
+            JS_FreeValue(ctx, p);
+        }
+        JS_FreeValue(ctx, tA);
+        JS_FreeValue(ctx, t2);
+        JS_FreeValue(ctx, R);
+        JS_FreeValue(ctx, g);
+        JS_FreeValue(ctx, g2);
+        JS_FreeValue(ctx, arm);
+    }
+    printf("COMBINE:strict-eq result round-trips ok\n");
 
     /* --- teardown -------------------------------------------------------- */
     JS_FreeAtom(ctx, at_t);
