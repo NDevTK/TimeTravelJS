@@ -400,8 +400,12 @@ site nor the tests require a C toolchain.
   recording as `suppressedSteps` (0 for the entire probe corpus and the
   engine test suite's full-surface gate program).
 - Inlined tail calls keep the caller's frame: proper-tail-call space
-  guarantees are traded for park-anywhere (depth is bounded by the 2 MB
-  frame arena, ~18 000 frames).
+  guarantees are traded for park-anywhere (execution depth is bounded by
+  the fixed 2 MB frame arena, ~18 000 frames — exact and
+  snapshot-stable). Suspended flow machines have no such cap: their
+  segmented arenas grow to the runtime memory limit, and the flow
+  harness proves a 46 000-frame machine (5× the old bound) serializing,
+  evicting and resuming byte-identically.
 - `eval`'d / `new Function` code steps only if its filename matches the user
   program (it doesn't), and `setInterval` is not provided (`setTimeout`
   chains are).
