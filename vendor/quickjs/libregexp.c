@@ -2751,7 +2751,7 @@ static no_inline int stack_realloc(REExecContext *s, size_t n)
 {
     StackElem *new_stack;
     size_t new_size;
-    new_size = s->stack_size * 3 / 2;
+    new_size = s->stack_size + s->stack_size / 2;
     if (new_size < n)
         new_size = n;
     if (s->stack_buf == s->static_stack_buf) {

@@ -2206,7 +2206,7 @@ static no_inline int js_realloc_array(JSContext *ctx, void **parray,
     size_t slack;
     void *new_array;
     /* XXX: potential arithmetic overflow */
-    new_size = max_int(req_size, *psize * 3 / 2);
+    new_size = max_int(req_size, *psize + *psize / 2);
     new_array = js_realloc2(ctx, *parray, new_size * elem_size, &slack);
     if (!new_array)
         return -1;
@@ -3548,7 +3548,7 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
            4 6 9 13 19 28 42 63 94 141 211 316 474 711 1066 1599 2398 3597 5395 8092
            preallocating space for predefined atoms (at least 504).
          */
-        new_size = max_int(711, rt->atom_size * 3 / 2);
+        new_size = max_int(711, rt->atom_size + rt->atom_size / 2);
         if (new_size > JS_ATOM_MAX)
             goto fail;
         /* XXX: should use realloc2 to use slack space */
@@ -4185,7 +4185,7 @@ static int JS_NewClass1(JSRuntime *rt, JSClassID class_id,
 
     if (class_id >= rt->class_count) {
         new_size = max_int(JS_CLASS_INIT_COUNT,
-                           max_int(class_id + 1, rt->class_count * 3 / 2));
+                           max_int(class_id + 1, rt->class_count + rt->class_count / 2));
 
         /* reallocate the context class prototype array, if any */
         list_for_each(el, &rt->context_list) {
@@ -4394,7 +4394,9 @@ static no_inline int string_buffer_realloc(StringBuffer *s, int new_len, int c)
         JS_ThrowInternalError(s->ctx, "string too long");
         return string_buffer_set_error(s);
     }
-    new_size = min_int(max_int(new_len, s->size * 3 / 2), JS_STRING_LEN_MAX);
+    /* s->size + s->size / 2 == s->size * 3 / 2 in floor arithmetic, but
+       cannot overflow int for sizes up to JS_STRING_LEN_MAX */
+    new_size = min_int(max_int(new_len, s->size + s->size / 2), JS_STRING_LEN_MAX);
     if (!s->is_wide_char && c >= 0x100) {
         return string_buffer_widen(s, new_size);
     }
@@ -5698,7 +5700,7 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
     JSShape *old_sh;
 
     sh = *psh;
-    new_size = max_int(count, sh->prop_size * 3 / 2);
+    new_size = max_int(count, sh->prop_size + sh->prop_size / 2);
     /* Reallocate prop array first to avoid crash or size inconsistency
        in case of memory allocation failure */
     if (p) {
@@ -10354,7 +10356,7 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
     size_t slack;
     JSValue *new_array_prop;
     /* XXX: potential arithmetic overflow */
-    new_size = max_int(new_len, p->u.array.u1.size * 3 / 2);
+    new_size = max_int(new_len, p->u.array.u1.size + p->u.array.u1.size / 2);
     new_array_prop = js_realloc2(ctx, p->u.array.u.values, sizeof(JSValue) * new_size, &slack);
     if (!new_array_prop)
         return -1;
@@ -28980,7 +28982,7 @@ static int push_scope(JSParseState *s) {
             size_t slack;
             JSVarScope *new_buf;
             /* XXX: potential arithmetic overflow */
-            new_size = max_int(fd->scope_count + 1, fd->scope_size * 3 / 2);
+            new_size = max_int(fd->scope_count + 1, fd->scope_size + fd->scope_size / 2);
             if (fd->scopes == fd->def_scope_array) {
                 new_buf = js_realloc2(s->ctx, NULL, new_size * sizeof(*fd->scopes), &slack);
                 if (!new_buf)
