@@ -21893,6 +21893,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     pf_kind = TT_FRAME_GETTER;
                     pf_ctor_this = tt_dfn;
                     pf_aux_i = 4; /* push value + catch offset */
+                    pf_cargc = 0;
+                    pf_aux = NULL;
                     if (unlikely(rt->tt_defer_aux != NULL)) {
                         pf_argv = (JSValue *)rt->tt_defer_aux;
                         pf_this = pf_argv[3];
@@ -22426,6 +22428,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pf_kind = TT_FRAME_GETTER;                      \
                         pf_ctor_this = tt_dfn;                          \
                         pf_aux_i = keep;                                \
+                        pf_cargc = 0;                                   \
+                        pf_aux = NULL;                                  \
                         if (unlikely(rt->tt_defer_aux != NULL)) {       \
                             pf_argv = (JSValue *)rt->tt_defer_aux;      \
                             pf_this = pf_argv[3];                       \
@@ -22519,6 +22523,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pf_kind = TT_FRAME_SETTER;
                         pf_ctor_this = tt_dfn;
                         pf_aux_i = 0;
+                        pf_cargc = 0;
+                        pf_aux = NULL;
                         if (unlikely(rt->tt_defer_aux != NULL)) {
                             /* proxy set trap: value consumed on -2 exit */
                             pf_argv = (JSValue *)rt->tt_defer_aux;
@@ -22793,6 +22799,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pf_kind = TT_FRAME_GETTER;                      \
                         pf_ctor_this = tt_dfn;                          \
                         pf_aux_i = 2 + keep;                            \
+                        pf_cargc = 0;                                   \
+                        pf_aux = NULL;                                  \
                         if (unlikely(rt->tt_defer_aux != NULL)) {       \
                             pf_argv = (JSValue *)rt->tt_defer_aux;      \
                             pf_this = pf_argv[3];                       \
@@ -22994,6 +23002,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pf_kind = TT_FRAME_SETTER;
                         pf_ctor_this = tt_dfn;
                         pf_aux_i = 1;
+                        pf_cargc = 0;
+                        pf_aux = NULL;
                         if (unlikely(rt->tt_defer_aux != NULL)) {
                             /* proxy set trap: value consumed on -2 exit */
                             pf_argv = (JSValue *)rt->tt_defer_aux;
@@ -23976,6 +23986,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 pf_kind = TT_FRAME_GETTER;
                                 pf_ctor_this = tt_dfn;
                                 pf_aux_i = 0; /* replace sp[-1] */
+                                pf_cargc = 0;
+                                pf_aux = NULL;
                                 if (unlikely(rt->tt_defer_aux != NULL)) {
                                     pf_argv = (JSValue *)rt->tt_defer_aux;
                                     pf_this = pf_argv[3];
@@ -24018,6 +24030,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             pf_kind = TT_FRAME_SETTER;
                             pf_ctor_this = tt_dfn;
                             pf_aux_i = 0; /* free both slots, pop 2 */
+                            pf_cargc = 0;
+                            pf_aux = NULL;
                             if (unlikely(rt->tt_defer_aux != NULL)) {
                                 /* proxy set trap: value consumed on -2 exit */
                                 pf_argv = (JSValue *)rt->tt_defer_aux;
@@ -24073,6 +24087,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 pf_kind = TT_FRAME_GETTER;
                                 pf_ctor_this = tt_dfn;
                                 pf_aux_i = 1; /* push the value */
+                                pf_cargc = 0;
+                                pf_aux = NULL;
                                 if (unlikely(rt->tt_defer_aux != NULL)) {
                                     pf_argv = (JSValue *)rt->tt_defer_aux;
                                     pf_this = pf_argv[3];
@@ -24599,6 +24615,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pf_kind = TT_FRAME_GETTER;
                 pf_ctor_this = tt_dfn;
                 pf_aux_i = 4; /* push value + catch offset */
+                pf_cargc = 0;
+                pf_aux = NULL;
                 if (unlikely(rt->tt_defer_aux != NULL)) {
                     pf_argv = (JSValue *)rt->tt_defer_aux;
                     pf_this = pf_argv[3];
