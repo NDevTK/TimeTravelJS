@@ -302,6 +302,50 @@ static const char *BASELINE_SRC =
 "  var fed = yield \"t0\";\n"
 "  yield \"t1:\" + (t ? typeof t : \"null\") + \":\" + fed;\n"
 "  return \"t-end\";\n"
+"}\n"
+"function* exoticflow() {\n"
+"  var m = new Map();\n"
+"  m.set(\"a\", 1);\n"
+"  m.set({ k: 2 }, \"obj\");\n"
+"  m.set(\"z\", 3);\n"
+"  var s = new Set([\"x\", \"y\"]);\n"
+"  var buf = new ArrayBuffer(16);\n"
+"  var ta = new Uint8Array(buf, 4, 8);\n"
+"  ta[0] = 42;\n"
+"  var ta2 = new Uint8Array(buf, 4, 8);\n"
+"  var dv = new DataView(buf, 2, 6);\n"
+"  dv.setUint16(0, 0xBEEF);\n"
+"  var re = /a(b+)c/g;\n"
+"  var target = { hidden: 7 };\n"
+"  var px = new Proxy(target, {\n"
+"    get: function (t, k, r) {\n"
+"      return k === \"magic\" ? \"trap:\" + t.hidden : Reflect.get(t, k, r);\n"
+"    }\n"
+"  });\n"
+"  var rv = Proxy.revocable({}, {});\n"
+"  rv.revoke();\n"
+"  var dead = rv.proxy;\n"
+"  var fed = yield \"ready\";\n"
+"  ta[1] = fed;\n"
+"  var mo = \"\";\n"
+"  m.forEach(function (v, k) { mo += typeof k + \":\" + String(v) + \",\"; });\n"
+"  var so = \"\";\n"
+"  s.forEach(function (v) { so += v; });\n"
+"  var hit = re.exec(\"xxabbbc\");\n"
+"  var deadmsg;\n"
+"  try { deadmsg = dead.x; } catch (e) { deadmsg = \"revoked\"; }\n"
+"  yield \"probe:\" + mo + \"|\" + so + \"|\" +\n"
+"    (hit ? hit[1] + \"@\" + re.lastIndex : \"miss\") + \"|\" +\n"
+"    (ta[0] + ta[1] + ta2[1]) + \"|\" + dv.getUint16(0).toString(16) +\n"
+"    \"|\" + px.magic + \"|\" + buf.byteLength + \"|\" + deadmsg;\n"
+"  return \"exotic-done:\" + ta[1];\n"
+"}\n"
+"function* weakflow() {\n"
+"  var wm = new WeakMap();\n"
+"  var kobj = {};\n"
+"  wm.set(kobj, 1);\n"
+"  yield \"weak-ready\";\n"
+"  return \"weak-done:\" + wm.get(kobj);\n"
 "}\n";
 
 static void die(JSContext *ctx, const char *what)
@@ -1624,6 +1668,147 @@ static int cmd_deep(void)
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     printf("DEEP:teardown ok\n");
+    return 0;
+}
+
+/* exotictest: exotic flow-private state travels faithfully. A flow parked
+   with a live Map (string + object keys), Set, ArrayBuffer with two
+   aliasing Uint8Array views and a DataView, a global-flagged RegExp, a
+   trapping Proxy and a revoked one serializes, hydrates and forks; each
+   copy then runs the SAME interrogation inside the flow — iteration
+   order, buffer aliasing (a write through one view read through its twin),
+   regexp exec with lastIndex, trap dispatch, revoked-proxy refusal — and
+   every trace must equal the statically known answer byte for byte.
+   Re-serialization is byte-stable, forked arms diverge independently, and
+   weak collections refuse serialization BY NAME without harming the flow. */
+static int cmd_exotictest(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    JSValue g, h, f2, f3;
+    uint8_t *s1, *s2;
+    size_t l1, l2;
+    char tg[2048], th[2048], tf[2048], tf3[2048], expect2[2048];
+    static const char EXPECT[] =
+        "probe:string:1,object:obj,string:3,|xy|bbb@7|52|beef|trap:7|16|"
+        "revoked|exotic-done:5|";
+
+    {
+        JSValue fn = get_global(ctx, "exoticflow");
+        g = JS_Call(ctx, fn, JS_UNDEFINED, 0, NULL);
+        JS_FreeValue(ctx, fn);
+        if (JS_IsException(g))
+            die(ctx, "exoticflow()");
+    }
+    {   /* advance to the yield: the exotic graph is now flow-private state */
+        JSValue r = JS_Invoke(ctx, g, JS_NewAtom(ctx, "next"), 0, NULL);
+        if (JS_IsException(r))
+            die(ctx, "exotic first next");
+        JS_FreeValue(ctx, r);
+    }
+
+    s1 = JS_TTFlowSerialize(ctx, g, &l1);
+    if (!s1)
+        die(ctx, "exotic serialize");
+    h = JS_TTFlowDeserialize(ctx, s1, l1);
+    if (JS_IsException(h))
+        die(ctx, "exotic deserialize");
+    s2 = JS_TTFlowSerialize(ctx, h, &l2);
+    if (!s2)
+        die(ctx, "exotic re-serialize");
+    if (l1 != l2 || memcmp(s1, s2, l1) != 0) {
+        FILE *fa = fopen("/tmp/exotic-s1.bin", "wb");
+        FILE *fb = fopen("/tmp/exotic-s2.bin", "wb");
+        if (fa) { fwrite(s1, 1, l1, fa); fclose(fa); }
+        if (fb) { fwrite(s2, 1, l2, fb); fclose(fb); }
+        fprintf(stderr, "FAIL exotic re-serialization differs "
+                "(%zu vs %zu bytes; dumped)\n", l1, l2);
+        return 1;
+    }
+    printf("EXOTIC:re-serialization byte-identical (%zu bytes)\n", l1);
+    js_free(ctx, s1);
+    js_free(ctx, s2);
+
+    f2 = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(f2))
+        die(ctx, "exotic fork");
+    f3 = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(f3))
+        die(ctx, "exotic fork 2");
+
+    collect_flow(ctx, g, 5, tg, sizeof(tg));
+    collect_flow(ctx, h, 5, th, sizeof(th));
+    collect_flow(ctx, f2, 5, tf, sizeof(tf));
+    printf("EXOTIC:trace=%s\n", tg);
+    if (strcmp(tg, EXPECT) || strcmp(th, EXPECT) || strcmp(tf, EXPECT)) {
+        fprintf(stderr, "FAIL exotic traces diverge:\n  g=%s\n  h=%s\n"
+                "  f=%s\n  want=%s\n", tg, th, tf, EXPECT);
+        return 1;
+    }
+    printf("EXOTIC:original/hydrated/forked identical ok\n");
+
+    /* the second fork was taken from the same parked moment: a different
+       feed diverges only where the fed value flows (view write + return),
+       proving the arms' buffers/maps/regexps are independent copies */
+    snprintf(expect2, sizeof(expect2),
+             "probe:string:1,object:obj,string:3,|xy|bbb@7|%d|beef|trap:7|"
+             "16|revoked|exotic-done:9|", 42 + 9 + 9);
+    collect_flow(ctx, f3, 9, tf3, sizeof(tf3));
+    if (strcmp(tf3, expect2)) {
+        fprintf(stderr, "FAIL exotic arm isolation:\n  got=%s\n  want=%s\n",
+                tf3, expect2);
+        return 1;
+    }
+    printf("EXOTIC:arm isolation ok\n");
+
+    {   /* weak collections refuse by name, without harming the flow */
+        JSValue wg, e;
+        uint8_t *wb;
+        size_t wl;
+        const char *msg;
+        char wt[256];
+        JSValue fn = get_global(ctx, "weakflow");
+        wg = JS_Call(ctx, fn, JS_UNDEFINED, 0, NULL);
+        JS_FreeValue(ctx, fn);
+        if (JS_IsException(wg))
+            die(ctx, "weakflow()");
+        {
+            JSValue r = JS_Invoke(ctx, wg, JS_NewAtom(ctx, "next"), 0, NULL);
+            if (JS_IsException(r))
+                die(ctx, "weak first next");
+            JS_FreeValue(ctx, r);
+        }
+        wb = JS_TTFlowSerialize(ctx, wg, &wl);
+        if (wb) {
+            fprintf(stderr, "FAIL WeakMap flow serialized\n");
+            return 1;
+        }
+        e = JS_GetException(ctx);
+        msg = JS_ToCString(ctx, e);
+        if (!msg || !strstr(msg, "WeakMap")) {
+            fprintf(stderr, "FAIL weak refusal not by name: %s\n",
+                    msg ? msg : "?");
+            return 1;
+        }
+        JS_FreeCString(ctx, msg);
+        JS_FreeValue(ctx, e);
+        collect_flow(ctx, wg, 0, wt, sizeof(wt));
+        if (strcmp(wt, "weak-done:1|")) {
+            fprintf(stderr, "FAIL weak flow damaged by refusal: %s\n", wt);
+            return 1;
+        }
+        JS_FreeValue(ctx, wg);
+        printf("EXOTIC:weak collections refuse by name, flow unharmed ok\n");
+    }
+
+    JS_FreeValue(ctx, g);
+    JS_FreeValue(ctx, h);
+    JS_FreeValue(ctx, f2);
+    JS_FreeValue(ctx, f3);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    printf("PASS: exotic flow-private state "
+           "(Map/Set/ArrayBuffer/TypedArray/DataView/RegExp/Proxy)\n");
     return 0;
 }
 
@@ -4098,6 +4283,8 @@ int main(int argc, char **argv)
         return cmd_mass();
     if (argc >= 2 && !strcmp(argv[1], "unbounded"))
         return cmd_unbounded();
+    if (argc >= 2 && !strcmp(argv[1], "exotictest"))
+        return cmd_exotictest();
     if (argc >= 2 && !strcmp(argv[1], "deep"))
         return cmd_deep();
     if (argc >= 2 && !strcmp(argv[1], "evict"))

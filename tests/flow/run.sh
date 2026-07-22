@@ -61,6 +61,8 @@ echo "== deep (chains across segment boundaries) =="
 "$BUILD/flow-harness" deep
 echo "== unbounded (a machine recursing far past the old 2 MB cap) =="
 "$BUILD/flow-harness" unbounded
+echo "== exotictest (Map/Set/buffers/views/RegExp/Proxy travel faithfully) =="
+"$BUILD/flow-harness" exotictest
 echo "== evict (cold machines to bytes and back) =="
 "$BUILD/flow-harness" evict
 echo "== asynctest (per-flow job queues, await fork, evict+microtask) =="

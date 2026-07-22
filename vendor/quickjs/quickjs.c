@@ -1614,6 +1614,13 @@ static no_inline int tt_cow_abuf(JSContext *ctx, JSObject *p);
 static no_inline int tt_cow_odata(JSContext *ctx, JSObject *p);
 static no_inline int tt_cow_ta(JSContext *ctx, JSObject *p);
 static uint32_t map_hash_key(JSValueConst key, int hash_bits);
+/* flow serialization rebuilds exotic flow-private state through the same
+   internal constructors the language uses */
+static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s,
+                                   JSValueConst key);
+static JSValue js_proxy_revoke(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv, int magic,
+                               JSValue *func_data);
 static void tt_flow_jobs_mark(JSRuntime *rt, struct TTFlowJobs *q,
                               JS_MarkFunc *mark_func);
 static void tt_async_flow_link(JSContext *ctx, JSValueConst promise,
@@ -43018,7 +43025,13 @@ enum {                        /* private record kinds */
     TT_REC_PRESOLVED,         /* the capability pair's shared resolved flag  */
     TT_REC_ASYNC_RESOLVE,     /* async-function await continuation handler   */
     TT_REC_TAGGED,            /* JS_CLASS_TT_TAGGED: payload + host note     */
-    TT_REC_LAST = TT_REC_TAGGED
+    TT_REC_MAP,               /* Map/Set: live records in insertion order    */
+    TT_REC_ARRAY_BUFFER,      /* ArrayBuffer: byte image (+resizable bound)  */
+    TT_REC_TYPED_ARRAY,       /* TypedArray/DataView: view over a buffer rec */
+    TT_REC_REGEXP,            /* RegExp: pattern + flags, recompiled         */
+    TT_REC_PROXY,             /* Proxy: target + handler + func/revoked bits */
+    TT_REC_PROXY_REVOKE,      /* the revocable pair's revoke closure         */
+    TT_REC_LAST = TT_REC_PROXY_REVOKE
 };
 
 enum {                        /* vref inline subtags */
@@ -45327,6 +45340,57 @@ static int wr_enum_object(TTFlowWr *w, JSObject *p)
         return wr_add_rec(w, TT_REC_ASYNC_RESOLVE, p, NULL);
     case JS_CLASS_TT_TAGGED:
         return wr_add_rec(w, TT_REC_TAGGED, p, NULL);
+    case JS_CLASS_MAP:
+    case JS_CLASS_SET:
+        return wr_add_rec(w, TT_REC_MAP, p, NULL);
+    case JS_CLASS_WEAKMAP:
+    case JS_CLASS_WEAKSET:
+        JS_ThrowTypeError(w->ctx, "flow serialization: weak collections "
+                          "hold liveness, not structure; a transplanted "
+                          "%s cannot preserve reachability semantics",
+                          p->class_id == JS_CLASS_WEAKMAP ? "WeakMap"
+                                                          : "WeakSet");
+        return -1;
+    case JS_CLASS_ARRAY_BUFFER:
+        return wr_add_rec(w, TT_REC_ARRAY_BUFFER, p, NULL);
+    case JS_CLASS_SHARED_ARRAY_BUFFER:
+        JS_ThrowTypeError(w->ctx, "flow serialization: SharedArrayBuffer "
+                          "memory is shared with other agents and cannot "
+                          "travel with one flow");
+        return -1;
+    case JS_CLASS_UINT8C_ARRAY:
+    case JS_CLASS_INT8_ARRAY:
+    case JS_CLASS_UINT8_ARRAY:
+    case JS_CLASS_INT16_ARRAY:
+    case JS_CLASS_UINT16_ARRAY:
+    case JS_CLASS_INT32_ARRAY:
+    case JS_CLASS_UINT32_ARRAY:
+    case JS_CLASS_BIG_INT64_ARRAY:
+    case JS_CLASS_BIG_UINT64_ARRAY:
+    case JS_CLASS_FLOAT16_ARRAY:
+    case JS_CLASS_FLOAT32_ARRAY:
+    case JS_CLASS_FLOAT64_ARRAY:
+    case JS_CLASS_DATAVIEW:
+        if (!p->u.typed_array)
+            return wr_unsupported(w, p); /* mid-construction shell */
+        return wr_add_rec(w, TT_REC_TYPED_ARRAY, p, NULL);
+    case JS_CLASS_REGEXP:
+        return wr_add_rec(w, TT_REC_REGEXP, p, NULL);
+    case JS_CLASS_PROXY: {
+        JSProxyData *s = p->u.opaque;
+        if (!s)
+            return wr_unsupported(w, p);
+        return wr_add_rec(w, TT_REC_PROXY, p, NULL);
+    }
+    case JS_CLASS_C_FUNCTION_DATA: {
+        /* C closures cannot travel in general (arbitrary function
+           pointers), but the revocable pair's revoke closure is pure
+           identified state: js_proxy_revoke over its proxy slot */
+        JSCFunctionDataRecord *fdr = p->u.c_function_data_record;
+        if (fdr && fdr->func == js_proxy_revoke && fdr->data_len == 1)
+            return wr_add_rec(w, TT_REC_PROXY_REVOKE, p, NULL);
+        return wr_unsupported(w, p);
+    }
     default:
         return wr_unsupported(w, p);
     }
@@ -45594,6 +45658,72 @@ static int wr_scan_children(TTFlowWr *w, TTFlowWrRec *rec)
             wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
             return -1;
         if (wr_enum_value(w, p->u.tt_tagged.payload))
+            return -1;
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_MAP: {
+        JSObject *p = rec->ptr;
+        JSMapState *ms = p->u.map_state;
+        struct list_head *el;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        list_for_each(el, &ms->records) {
+            JSMapRecord *mr = list_entry(el, JSMapRecord, link);
+            if (mr->empty)
+                continue;     /* iterator tombstone: not an entry */
+            if (wr_enum_value(w, mr->key))
+                return -1;
+            if (p->class_id == JS_CLASS_MAP && wr_enum_value(w, mr->value))
+                return -1;
+        }
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_ARRAY_BUFFER: {
+        JSObject *p = rec->ptr;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_TYPED_ARRAY: {
+        JSObject *p = rec->ptr;
+        JSTypedArray *ta = p->u.typed_array;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        if (wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, ta->buffer)))
+            return -1;
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_REGEXP: {
+        /* pattern and flags ride the shell; the compiled bytecode never
+           travels -- the reader recompiles, so the wire format does not
+           couple to the regexp engine's internals */
+        JSObject *p = rec->ptr;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_PROXY: {
+        /* target + handler only. A proxy has no own shape state, and its
+           proto/props go through traps -- rebuilding wires the SAME
+           target/handler pair, so every [[Get]]/[[Set]]/[[Define]]
+           invariant is enforced by the ordinary proxy machinery */
+        JSObject *p = rec->ptr;
+        JSProxyData *s = p->u.opaque;
+        if (wr_enum_value(w, s->target))
+            return -1;
+        return wr_enum_value(w, s->handler);
+    }
+    case TT_REC_PROXY_REVOKE: {
+        JSObject *p = rec->ptr;
+        JSCFunctionDataRecord *fdr = p->u.c_function_data_record;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        if (wr_enum_value(w, fdr->data[0]))
             return -1;
         return wr_scan_props(w, p, FALSE);
     }
@@ -46065,6 +46195,52 @@ static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
         case TT_REC_DATAOBJ:
             dbuf_put_leb128(&db, ((JSObject *)rec->ptr)->class_id);
             break;
+        case TT_REC_MAP: {
+            JSObject *p = rec->ptr;
+            JSMapState *ms = p->u.map_state;
+            struct list_head *el;
+            uint32_t live = 0;
+            list_for_each(el, &ms->records)
+                if (!list_entry(el, JSMapRecord, link)->empty)
+                    live++;
+            dbuf_putc(&db, (uint8_t)(p->class_id - JS_CLASS_MAP));
+            dbuf_put_leb128(&db, live);
+            break;
+        }
+        case TT_REC_ARRAY_BUFFER: {
+            JSObject *p = rec->ptr;
+            JSArrayBuffer *abuf = p->u.array_buffer;
+            uint8_t fl = (abuf->detached ? 1 : 0) |
+                         (abuf->max_byte_length >= 0 ? 2 : 0);
+            dbuf_putc(&db, fl);
+            dbuf_put_leb128(&db, (uint32_t)abuf->byte_length);
+            if (abuf->max_byte_length >= 0)
+                dbuf_put_leb128(&db, (uint32_t)abuf->max_byte_length);
+            if (!abuf->detached && abuf->byte_length)
+                dbuf_put(&db, abuf->data, (size_t)abuf->byte_length);
+            break;
+        }
+        case TT_REC_TYPED_ARRAY: {
+            JSObject *p = rec->ptr;
+            JSTypedArray *ta = p->u.typed_array;
+            dbuf_put_leb128(&db, p->class_id);
+            dbuf_put_leb128(&db, ta->offset);
+            dbuf_put_leb128(&db, ta->length);
+            dbuf_putc(&db, ta->track_rab ? 1 : 0);
+            break;
+        }
+        case TT_REC_REGEXP: {
+            JSObject *p = rec->ptr;
+            JSRegExp *re = &p->u.regexp;
+            wr_put_string(&db, re->pattern);
+            dbuf_putc(&db, (uint8_t)lre_get_flags(re->bytecode->u.str8));
+            break;
+        }
+        case TT_REC_PROXY: {
+            JSProxyData *s = ((JSObject *)rec->ptr)->u.opaque;
+            dbuf_putc(&db, (s->is_func ? 1 : 0) | (s->is_revoked ? 2 : 0));
+            break;
+        }
         case TT_REC_TAGGED: {
             /* the host note rides the shell as an opaque blob: present flag,
                then NoteSerialize's bytes (the read side hands them to
@@ -46358,6 +46534,82 @@ static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
                             : JS_NULL))
                 goto fail;
             if (wr_put_vref(w, &db, p->u.tt_tagged.payload))
+                goto fail;
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_MAP: {
+            JSObject *p = rec->ptr;
+            JSMapState *ms = p->u.map_state;
+            struct list_head *el;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            list_for_each(el, &ms->records) {
+                JSMapRecord *mr = list_entry(el, JSMapRecord, link);
+                if (mr->empty)
+                    continue;
+                if (wr_put_vref(w, &db, mr->key))
+                    goto fail;
+                if (p->class_id == JS_CLASS_MAP &&
+                    wr_put_vref(w, &db, mr->value))
+                    goto fail;
+            }
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_ARRAY_BUFFER: {
+            JSObject *p = rec->ptr;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_TYPED_ARRAY: {
+            JSObject *p = rec->ptr;
+            JSTypedArray *ta = p->u.typed_array;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            if (wr_put_vref(w, &db, JS_MKPTR(JS_TAG_OBJECT, ta->buffer)))
+                goto fail;
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_REGEXP: {
+            JSObject *p = rec->ptr;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_PROXY: {
+            JSProxyData *s = ((JSObject *)rec->ptr)->u.opaque;
+            if (wr_put_vref(w, &db, s->target))
+                goto fail;
+            if (wr_put_vref(w, &db, s->handler))
+                goto fail;
+            break;
+        }
+        case TT_REC_PROXY_REVOKE: {
+            JSObject *p = rec->ptr;
+            JSCFunctionDataRecord *fdr = p->u.c_function_data_record;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            if (wr_put_vref(w, &db, fdr->data[0]))
                 goto fail;
             if (wr_put_props(w, &db, p, FALSE))
                 goto fail;
@@ -47246,6 +47498,165 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
             }
             break;
         }
+        case TT_REC_MAP: {
+            uint32_t cls = tt_rd_u8(&r->rd);
+            uint32_t cnt = tt_rd_leb(&r->rd);
+            JSMapState *ms;
+            if (r->rd.err || cls > 1 || cnt > (uint32_t)len)
+                goto trunc;
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                            JS_CLASS_MAP + cls);
+            if (JS_IsException(rec->v))
+                goto fail;
+            ms = js_mallocz(ctx, sizeof(*ms));
+            if (!ms)
+                goto fail;
+            init_list_head(&ms->records);
+            ms->hash_bits = 1;
+            ms->hash_size = 1U << ms->hash_bits;
+            ms->hash_table = js_mallocz(ctx, sizeof(ms->hash_table[0]) *
+                                        ms->hash_size);
+            if (!ms->hash_table) {
+                js_free(ctx, ms);
+                goto fail;
+            }
+            ms->record_count_threshold = 4;
+            JS_SetOpaque(rec->v, ms);
+            rec->aux_a = cnt;
+            break;
+        }
+        case TT_REC_ARRAY_BUFFER: {
+            uint32_t fl = tt_rd_u8(&r->rd);
+            uint32_t blen = tt_rd_leb(&r->rd);
+            uint64_t mlen = 0;
+            const uint8_t *data = NULL;
+            if (fl & 2) {
+                mlen = tt_rd_leb(&r->rd);
+                if (mlen < blen)
+                    goto trunc;
+            }
+            if (r->rd.err || fl > 3)
+                goto trunc;
+            if (!(fl & 1) && blen) {
+                data = tt_rd_bytes(&r->rd, blen);
+                if (!data)
+                    goto trunc;
+            }
+            rec->v = js_array_buffer_constructor3(ctx, JS_UNDEFINED, blen,
+                                                  (fl & 2) ? &mlen : NULL,
+                                                  JS_CLASS_ARRAY_BUFFER,
+                                                  (uint8_t *)data,
+                                                  js_array_buffer_free,
+                                                  NULL, TRUE);
+            if (JS_IsException(rec->v))
+                goto fail;
+            if (fl & 1)
+                JS_DetachArrayBuffer(ctx, rec->v);
+            break;
+        }
+        case TT_REC_TYPED_ARRAY: {
+            uint32_t cls = tt_rd_leb(&r->rd);
+            rec->aux_a = tt_rd_leb(&r->rd);      /* byte offset */
+            rec->aux_b = tt_rd_leb(&r->rd);      /* byte length */
+            rec->u8a = (uint8_t)tt_rd_u8(&r->rd);/* track_rab */
+            if (r->rd.err || rec->u8a > 1 ||
+                !((cls >= JS_CLASS_UINT8C_ARRAY &&
+                   cls <= JS_CLASS_FLOAT64_ARRAY) ||
+                  cls == JS_CLASS_DATAVIEW))
+                goto trunc;
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL, cls);
+            if (JS_IsException(rec->v))
+                goto fail;
+            /* class init leaves the JSTypedArray slot indeterminate: a
+               NULL shell keeps the finalizer/mark safe until the fill */
+            JS_VALUE_GET_OBJ(rec->v)->u.typed_array = NULL;
+            break;
+        }
+        case TT_REC_REGEXP: {
+            JSValue pat, flstr, bc;
+            char fbuf[9];
+            int fn = 0;
+            uint32_t fl;
+            pat = rd_read_string(r);
+            if (JS_IsException(pat))
+                goto fail;
+            fl = tt_rd_u8(&r->rd);
+            if (r->rd.err) {
+                JS_FreeValue(ctx, pat);
+                goto trunc;
+            }
+            if (fl & LRE_FLAG_INDICES)      fbuf[fn++] = 'd';
+            if (fl & LRE_FLAG_GLOBAL)       fbuf[fn++] = 'g';
+            if (fl & LRE_FLAG_IGNORECASE)   fbuf[fn++] = 'i';
+            if (fl & LRE_FLAG_MULTILINE)    fbuf[fn++] = 'm';
+            if (fl & LRE_FLAG_DOTALL)       fbuf[fn++] = 's';
+            if (fl & LRE_FLAG_UNICODE)      fbuf[fn++] = 'u';
+            if (fl & LRE_FLAG_UNICODE_SETS) fbuf[fn++] = 'v';
+            if (fl & LRE_FLAG_STICKY)       fbuf[fn++] = 'y';
+            flstr = JS_NewStringLen(ctx, fbuf, fn);
+            if (JS_IsException(flstr)) {
+                JS_FreeValue(ctx, pat);
+                goto fail;
+            }
+            bc = js_compile_regexp(ctx, pat, flstr);
+            JS_FreeValue(ctx, flstr);
+            if (JS_IsException(bc)) {
+                JS_FreeValue(ctx, pat);
+                goto fail;
+            }
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_REGEXP);
+            if (JS_IsException(rec->v)) {
+                JS_FreeValue(ctx, pat);
+                JS_FreeValue(ctx, bc);
+                goto fail;
+            }
+            /* fields only -- lastIndex (and anything else) arrives with
+               the serialized own props, so the shell must not pre-create
+               shape entries */
+            JS_VALUE_GET_OBJ(rec->v)->u.regexp.pattern =
+                JS_VALUE_GET_STRING(pat);
+            JS_VALUE_GET_OBJ(rec->v)->u.regexp.bytecode =
+                JS_VALUE_GET_STRING(bc);
+            break;
+        }
+        case TT_REC_PROXY: {
+            uint32_t fl = tt_rd_u8(&r->rd);
+            JSProxyData *ps;
+            if (r->rd.err || fl > 3)
+                goto trunc;
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_PROXY);
+            if (JS_IsException(rec->v))
+                goto fail;
+            ps = js_malloc(ctx, sizeof(*ps));
+            if (!ps)
+                goto fail;
+            ps->target = JS_UNDEFINED;
+            ps->handler = JS_UNDEFINED;
+            ps->is_func = (fl & 1) != 0;
+            ps->is_revoked = (fl & 2) != 0;
+            JS_SetOpaque(rec->v, ps);
+            break;
+        }
+        case TT_REC_PROXY_REVOKE: {
+            JSObject *po;
+            JSCFunctionDataRecord *fdr;
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                            JS_CLASS_C_FUNCTION_DATA);
+            if (JS_IsException(rec->v))
+                goto fail;
+            po = JS_VALUE_GET_OBJ(rec->v);
+            po->u.c_function_data_record = NULL; /* init leaves it garbage */
+            fdr = js_mallocz(ctx, sizeof(*fdr) + sizeof(JSValue));
+            if (!fdr)
+                goto fail;
+            fdr->func = js_proxy_revoke;
+            fdr->length = 0;
+            fdr->data_len = 1;
+            fdr->magic = 0;
+            fdr->data[0] = JS_NULL;
+            po->u.c_function_data_record = fdr;
+            break;
+        }
         case TT_REC_PROMISE: {
             JSPromiseData *pd;
             rec->v = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_PROMISE);
@@ -47702,6 +48113,146 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
             if (JS_IsException(v))
                 goto fail;
             rec->vr->value = v;
+            break;
+        }
+        case TT_REC_MAP: {
+            JSObject *po = JS_VALUE_GET_OBJ(rec->v);
+            JSMapState *ms = po->u.map_state;
+            uint32_t k;
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            for (k = 0; k < rec->aux_a; k++) {
+                JSValue key = rd_get_vref(r);
+                JSValue val = JS_UNDEFINED;
+                JSMapRecord *mr;
+                if (JS_IsException(key))
+                    goto fail;
+                if (po->class_id == JS_CLASS_MAP) {
+                    val = rd_get_vref(r);
+                    if (JS_IsException(val)) {
+                        JS_FreeValue(ctx, key);
+                        goto fail;
+                    }
+                }
+                /* keys were normalized at their original insertion;
+                   re-adding in list order reproduces both the insertion
+                   order and a hash table valid for THIS process */
+                mr = map_add_record(ctx, ms, key);
+                if (!mr) {
+                    JS_FreeValue(ctx, key);
+                    JS_FreeValue(ctx, val);
+                    goto fail;
+                }
+                JS_FreeValue(ctx, key); /* map_add_record took its own ref */
+                mr->value = val;
+            }
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        }
+        case TT_REC_ARRAY_BUFFER:
+        case TT_REC_REGEXP:
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        case TT_REC_TYPED_ARRAY: {
+            JSObject *po = JS_VALUE_GET_OBJ(rec->v);
+            JSValue bufv;
+            JSObject *pbuf;
+            JSArrayBuffer *abuf;
+            JSTypedArray *ta;
+            uint32_t off = rec->aux_a, blen = rec->aux_b;
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            bufv = rd_get_vref(r);
+            if (JS_IsException(bufv))
+                goto fail;
+            if (JS_VALUE_GET_TAG(bufv) != JS_TAG_OBJECT ||
+                JS_VALUE_GET_OBJ(bufv)->class_id != JS_CLASS_ARRAY_BUFFER) {
+                JS_FreeValue(ctx, bufv);
+                JS_ThrowTypeError(ctx, "flow bytes: typed array over a "
+                                  "non-ArrayBuffer");
+                goto fail;
+            }
+            pbuf = JS_VALUE_GET_OBJ(bufv);
+            abuf = pbuf->u.array_buffer;
+            if (!abuf->detached &&
+                ((uint64_t)off + blen > (uint64_t)abuf->byte_length)) {
+                JS_FreeValue(ctx, bufv);
+                JS_ThrowTypeError(ctx, "flow bytes: typed array outside "
+                                  "its buffer");
+                goto fail;
+            }
+            if (po->class_id != JS_CLASS_DATAVIEW) {
+                int lg = typed_array_size_log2(po->class_id);
+                if ((off | blen) & ((1u << lg) - 1)) {
+                    JS_FreeValue(ctx, bufv);
+                    JS_ThrowTypeError(ctx, "flow bytes: misaligned typed "
+                                      "array view");
+                    goto fail;
+                }
+            }
+            ta = js_malloc(ctx, sizeof(*ta));
+            if (!ta) {
+                JS_FreeValue(ctx, bufv);
+                goto fail;
+            }
+            ta->obj = po;
+            ta->buffer = pbuf;   /* keeps bufv's reference */
+            ta->offset = off;
+            ta->length = blen;
+            ta->track_rab = rec->u8a != 0;
+            list_add_tail(&ta->link, &abuf->array_list);
+            po->u.typed_array = ta;
+            if (po->class_id != JS_CLASS_DATAVIEW) {
+                int lg = typed_array_size_log2(po->class_id);
+                po->u.array.count = abuf->detached ? 0 : (blen >> lg);
+                po->u.array.u.ptr = abuf->detached ? NULL
+                                                   : abuf->data + off;
+            }
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        }
+        case TT_REC_PROXY: {
+            JSProxyData *ps = JS_GetOpaque(rec->v, JS_CLASS_PROXY);
+            JSValue t = rd_get_vref(r);
+            JSValue h;
+            if (JS_IsException(t))
+                goto fail;
+            h = rd_get_vref(r);
+            if (JS_IsException(h)) {
+                JS_FreeValue(ctx, t);
+                goto fail;
+            }
+            if (JS_VALUE_GET_TAG(t) != JS_TAG_OBJECT ||
+                JS_VALUE_GET_TAG(h) != JS_TAG_OBJECT) {
+                JS_FreeValue(ctx, t);
+                JS_FreeValue(ctx, h);
+                JS_ThrowTypeError(ctx, "flow bytes: proxy target/handler "
+                                  "must be objects");
+                goto fail;
+            }
+            ps->target = t;
+            ps->handler = h;
+            JS_SetConstructorBit(ctx, rec->v, JS_IsConstructor(ctx, t));
+            break;
+        }
+        case TT_REC_PROXY_REVOKE: {
+            JSObject *po = JS_VALUE_GET_OBJ(rec->v);
+            JSCFunctionDataRecord *fdr = po->u.c_function_data_record;
+            JSValue slot;
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            slot = rd_get_vref(r);
+            if (JS_IsException(slot))
+                goto fail;
+            JS_FreeValue(ctx, fdr->data[0]);
+            fdr->data[0] = slot;
+            if (rd_read_props(r, rec->v))
+                goto fail;
             break;
         }
         case TT_REC_PROMISE: {
@@ -48637,6 +49188,109 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
                 rec->kind == TT_REC_STRING ? JS_TAG_STRING : JS_TAG_SYMBOL,
                 rec->ptr));
             break;
+        case TT_REC_MAP: {
+            JSObject *src = rec->ptr;
+            JSMapState *ms;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    src->class_id);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            ms = js_mallocz(ctx, sizeof(*ms));
+            if (!ms)
+                goto out;
+            init_list_head(&ms->records);
+            ms->hash_bits = 1;
+            ms->hash_size = 1U << ms->hash_bits;
+            ms->hash_table = js_mallocz(ctx, sizeof(ms->hash_table[0]) *
+                                        ms->hash_size);
+            if (!ms->hash_table) {
+                js_free(ctx, ms);
+                goto out;
+            }
+            ms->record_count_threshold = 4;
+            JS_SetOpaque(fk->clone_v[i], ms);
+            break;
+        }
+        case TT_REC_ARRAY_BUFFER: {
+            JSObject *src = rec->ptr;
+            JSArrayBuffer *abuf = src->u.array_buffer;
+            uint64_t mlen = abuf->max_byte_length >= 0 ?
+                (uint64_t)abuf->max_byte_length : 0;
+            fk->clone_v[i] = js_array_buffer_constructor3(
+                ctx, JS_UNDEFINED, abuf->detached ? 0 : abuf->byte_length,
+                abuf->max_byte_length >= 0 ? &mlen : NULL,
+                JS_CLASS_ARRAY_BUFFER, abuf->detached ? NULL : abuf->data,
+                js_array_buffer_free, NULL, TRUE);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            if (abuf->detached)
+                JS_DetachArrayBuffer(ctx, fk->clone_v[i]);
+            break;
+        }
+        case TT_REC_TYPED_ARRAY: {
+            JSObject *src = rec->ptr;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    src->class_id);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            JS_VALUE_GET_OBJ(fk->clone_v[i])->u.typed_array = NULL;
+            break;
+        }
+        case TT_REC_REGEXP: {
+            JSObject *src = rec->ptr;
+            JSRegExp *re = &src->u.regexp;
+            JSObject *dp;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    JS_CLASS_REGEXP);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            /* same process: siblings share the immutable pattern and
+               compiled bytecode strings; own props (lastIndex) travel
+               through the ordinary prop pass */
+            dp = JS_VALUE_GET_OBJ(fk->clone_v[i]);
+            dp->u.regexp.pattern = re->pattern;
+            dp->u.regexp.bytecode = re->bytecode;
+            JS_DupValue(ctx, JS_MKPTR(JS_TAG_STRING, re->pattern));
+            JS_DupValue(ctx, JS_MKPTR(JS_TAG_STRING, re->bytecode));
+            break;
+        }
+        case TT_REC_PROXY: {
+            JSProxyData *ss = ((JSObject *)rec->ptr)->u.opaque;
+            JSProxyData *ps;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    JS_CLASS_PROXY);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            ps = js_malloc(ctx, sizeof(*ps));
+            if (!ps)
+                goto out;
+            ps->target = JS_UNDEFINED;
+            ps->handler = JS_UNDEFINED;
+            ps->is_func = ss->is_func;
+            ps->is_revoked = ss->is_revoked;
+            JS_SetOpaque(fk->clone_v[i], ps);
+            break;
+        }
+        case TT_REC_PROXY_REVOKE: {
+            JSObject *po;
+            JSCFunctionDataRecord *fdr;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    JS_CLASS_C_FUNCTION_DATA);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            po = JS_VALUE_GET_OBJ(fk->clone_v[i]);
+            po->u.c_function_data_record = NULL; /* init leaves it garbage */
+            fdr = js_mallocz(ctx, sizeof(*fdr) + sizeof(JSValue));
+            if (!fdr)
+                goto out;
+            fdr->func = js_proxy_revoke;
+            fdr->length = 0;
+            fdr->data_len = 1;
+            fdr->magic = 0;
+            fdr->data[0] = JS_NULL;
+            po->u.c_function_data_record = fdr;
+            break;
+        }
         case TT_REC_PROMISE: {
             JSPromiseData *pd;
             fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
@@ -48861,6 +49515,118 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
             if (JS_IsException(v))
                 goto out;
             JS_VALUE_GET_OBJ(fk->clone_v[i])->u.tt_tagged.payload = v;
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        }
+        case TT_REC_MAP: {
+            JSObject *src = rec->ptr;
+            JSMapState *sms = src->u.map_state;
+            JSMapState *dms = JS_VALUE_GET_OBJ(fk->clone_v[i])->u.map_state;
+            struct list_head *el;
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            list_for_each(el, &sms->records) {
+                JSMapRecord *smr = list_entry(el, JSMapRecord, link);
+                JSMapRecord *dmr;
+                JSValue k, v2 = JS_UNDEFINED;
+                if (smr->empty)
+                    continue;
+                k = fork_map_value(fk, smr->key);
+                if (JS_IsException(k))
+                    goto out;
+                if (src->class_id == JS_CLASS_MAP) {
+                    v2 = fork_map_value(fk, smr->value);
+                    if (JS_IsException(v2)) {
+                        JS_FreeValue(ctx, k);
+                        goto out;
+                    }
+                }
+                dmr = map_add_record(ctx, dms, k);
+                if (!dmr) {
+                    JS_FreeValue(ctx, k);
+                    JS_FreeValue(ctx, v2);
+                    goto out;
+                }
+                JS_FreeValue(ctx, k);
+                dmr->value = v2;
+            }
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        }
+        case TT_REC_ARRAY_BUFFER:
+        case TT_REC_REGEXP:
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        case TT_REC_TYPED_ARRAY: {
+            JSObject *src = rec->ptr;
+            JSTypedArray *sta = src->u.typed_array;
+            JSObject *dst = JS_VALUE_GET_OBJ(fk->clone_v[i]);
+            JSValue bufv;
+            JSObject *pbuf;
+            JSArrayBuffer *abuf;
+            JSTypedArray *ta;
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            bufv = fork_map_value(fk, JS_MKPTR(JS_TAG_OBJECT, sta->buffer));
+            if (JS_IsException(bufv))
+                goto out;
+            pbuf = JS_VALUE_GET_OBJ(bufv);
+            abuf = pbuf->u.array_buffer;
+            ta = js_malloc(ctx, sizeof(*ta));
+            if (!ta) {
+                JS_FreeValue(ctx, bufv);
+                goto out;
+            }
+            ta->obj = dst;
+            ta->buffer = pbuf;   /* keeps bufv's reference */
+            ta->offset = sta->offset;
+            ta->length = sta->length;
+            ta->track_rab = sta->track_rab;
+            list_add_tail(&ta->link, &abuf->array_list);
+            dst->u.typed_array = ta;
+            if (dst->class_id != JS_CLASS_DATAVIEW) {
+                dst->u.array.count = src->u.array.count;
+                dst->u.array.u.ptr = abuf->detached ? NULL
+                                                    : abuf->data + ta->offset;
+            }
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        }
+        case TT_REC_PROXY: {
+            JSProxyData *ss = ((JSObject *)rec->ptr)->u.opaque;
+            JSProxyData *ps = JS_GetOpaque(fk->clone_v[i], JS_CLASS_PROXY);
+            JSValue t, h;
+            t = fork_map_value(fk, ss->target);
+            if (JS_IsException(t))
+                goto out;
+            ps->target = t;
+            h = fork_map_value(fk, ss->handler);
+            if (JS_IsException(h))
+                goto out;
+            ps->handler = h;
+            JS_SetConstructorBit(ctx, fk->clone_v[i],
+                                 JS_IsConstructor(ctx, t));
+            break;
+        }
+        case TT_REC_PROXY_REVOKE: {
+            JSObject *src = rec->ptr;
+            JSCFunctionDataRecord *sfd = src->u.c_function_data_record;
+            JSCFunctionDataRecord *dfd =
+                JS_VALUE_GET_OBJ(fk->clone_v[i])->u.c_function_data_record;
+            JSValue slot;
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            slot = fork_map_value(fk, sfd->data[0]);
+            if (JS_IsException(slot))
+                goto out;
+            JS_FreeValue(ctx, dfd->data[0]);
+            dfd->data[0] = slot;
             if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
                 goto out;
             break;
