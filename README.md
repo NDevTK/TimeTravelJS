@@ -135,7 +135,12 @@ is honestly a fork, not a patch):
   already ran on heap-allocated frames — the rewrite generalizes their
   frame model to every call. Recursion depth becomes an exact,
   snapshot-stable limit (an ordinary catchable `stack overflow` ~18 000
-  frames deep) instead of a C-stack accident;
+  frames deep) instead of a C-stack accident. `npm run test:stackless`
+  proves the property mechanically: an 8 000-deep JS recursion observes
+  ONE C frame address at every step (the C stack does not track JS
+  depth), parks and resumes at all 24 004 of its steps, and completes
+  inside a 256 KB C stack — where pristine QuickJS segfaults at that
+  budget and throws `stack overflow` even at its defaults;
 - a **step hook in the dispatch loop** that fires per source line — or,
   at opcode granularity, between every two VM instructions — with a
   per-frame pc→line range cache so the check is cheap;
