@@ -541,6 +541,11 @@ typedef struct JSStackFrame {
     uint32_t tt_pc_lo;
     uint32_t tt_pc_hi;
     uint32_t tt_prev_off;
+    /* 1-based chain depth, maintained at link time (parent + 1) so the
+       per-step hook reports depth in O(1) — a chain walk there is
+       quadratic over deep recursions. Not serialized: rebuilt by the
+       hydrator/fork the same way. */
+    int tt_depth;
     /* TimeTravelJS stackless interpreter: frames live in a linear-memory
        arena and a JS→JS call continues the SAME dispatch loop, so the
        former C parameters become per-frame state. frame_kind records how
@@ -8129,7 +8134,6 @@ static no_inline int js_tt_step_check(JSContext *ctx, JSStackFrame *sf,
     JSRuntime *rt = ctx->rt;
     uint32_t off = (uint32_t)(pc - b->byte_code_buf);
     int col, line, depth, parkable;
-    JSStackFrame *f;
 
     if (rt->tt_skip_once) {
         /* first check after a parked resume re-tests the pc that parked */
@@ -8176,9 +8180,9 @@ static no_inline int js_tt_step_check(JSContext *ctx, JSStackFrame *sf,
     sf->tt_last_line = line;
     sf->cur_pc = pc; /* keep backtraces honest while paused here */
 
-    depth = 0;
-    for (f = rt->current_stack_frame; f; f = f->prev_frame)
-        depth++;
+    /* frames carry their chain depth (set at link time): a walk here is
+       O(depth) per step and turns deep recursions quadratic */
+    depth = sf->tt_depth;
     if (tt_vtime_enabled)
         tt_vtime += 1;
     parkable = rt->tt_park_ok && rt->tt_loop_depth == 1;
@@ -19664,6 +19668,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
 
     prev_sf = rt->current_stack_frame;
     sf->prev_frame = prev_sf;
+    sf->tt_depth = prev_sf ? (prev_sf)->tt_depth + 1 : 1;
     rt->current_stack_frame = sf;
     ctx = p->u.cfunc.realm; /* change the current realm */
     sf->js_mode = 0;
@@ -20206,6 +20211,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
             pc = sf->cur_pc;
             sf->prev_frame = rt->current_stack_frame;
+            sf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
             rt->current_stack_frame = sf;
             if (s->throw_flag)
                 goto exception;
@@ -20310,6 +20316,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         for(i = 0; i < fb->var_ref_count; i++)
             nsf->var_refs[i] = NULL;
         nsf->prev_frame = rt->current_stack_frame;
+        nsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
         rt->current_stack_frame = nsf;
         sf = nsf;
         TT_LOAD_FRAME();
@@ -20933,6 +20940,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gsf->tt_aux_i = gmagic;
                         gsf->tt_call_argc = (uint16_t)call_argc;
                         gsf->prev_frame = rt->current_stack_frame;
+                        gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                         rt->current_stack_frame = gsf;
                         sf = gsf;
                         TT_LOAD_FRAME();
@@ -20978,6 +20986,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gsf->tt_aux = ags;
                         gsf->tt_ctor_this = agobj; /* the drive's ref */
                         gsf->prev_frame = rt->current_stack_frame;
+                        gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                         rt->current_stack_frame = gsf;
                         sf = gsf;
                         TT_LOAD_FRAME();
@@ -21959,6 +21968,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 (TT_GENSHAPE_FOROF << 8) | (offbyte << 16);
                             gsf->tt_call_argc = 0;
                             gsf->prev_frame = rt->current_stack_frame;
+                            gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                             rt->current_stack_frame = gsf;
                             sf = gsf;
                             TT_LOAD_FRAME();
@@ -22087,6 +22097,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             ic_gsf->tt_aux_i = ic_magic | (TT_GENSHAPE_CLOSE << 8);
                             ic_gsf->tt_call_argc = 0;
                             ic_gsf->prev_frame = rt->current_stack_frame;
+                            ic_gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                             rt->current_stack_frame = ic_gsf;
                             sf = ic_gsf;
                             TT_LOAD_FRAME();
@@ -22174,6 +22185,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             gsf->tt_aux_i = GEN_MAGIC_NEXT | (TT_GENSHAPE_ITERNEXT << 8);
                             gsf->tt_call_argc = 0;
                             gsf->prev_frame = rt->current_stack_frame;
+                            gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                             rt->current_stack_frame = gsf;
                             sf = gsf;
                             TT_LOAD_FRAME();
@@ -22212,6 +22224,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             gsf->tt_aux = ags;
                             gsf->tt_ctor_this = JS_DupValue(ctx, sp[-4]);
                             gsf->prev_frame = rt->current_stack_frame;
+                            gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                             rt->current_stack_frame = gsf;
                             sf = gsf;
                             TT_LOAD_FRAME();
@@ -22307,6 +22320,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 gsf->tt_aux_i = gmagic | (TT_GENSHAPE_ITERCALL << 8);
                                 gsf->tt_call_argc = 0;
                                 gsf->prev_frame = rt->current_stack_frame;
+                                gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                                 rt->current_stack_frame = gsf;
                                 sf = gsf;
                                 TT_LOAD_FRAME();
@@ -24261,6 +24275,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gsf->tt_aux = ags;
                 gsf->tt_ctor_this = agref; /* carry the drive's ref */
                 gsf->prev_frame = rt->current_stack_frame;
+                gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                 rt->current_stack_frame = gsf;
                 sf = gsf;
                 TT_LOAD_FRAME();
@@ -25189,6 +25204,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ap_gsf->tt_call_argc = 0;
                     ap_gsf->tt_ctor_this = JS_MKPTR(JS_TAG_INT, ap_blk);
                     ap_gsf->prev_frame = rt->current_stack_frame;
+                    ap_gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                     rt->current_stack_frame = ap_gsf;
                     sf = ap_gsf;
                     TT_LOAD_FRAME();
@@ -25241,6 +25257,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         agsf2->tt_aux_i = gi_base;
         agsf2->tt_call_argc = (uint16_t)pf_argc;
         agsf2->prev_frame = rt->current_stack_frame;
+        agsf2->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
         rt->current_stack_frame = agsf2;
         sf = agsf2;
         TT_LOAD_FRAME();
@@ -25267,6 +25284,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         gsf2->tt_aux_i = gi_base;
         gsf2->tt_call_argc = (uint16_t)pf_argc;
         gsf2->prev_frame = rt->current_stack_frame;
+        gsf2->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
         rt->current_stack_frame = gsf2;
         sf = gsf2;
         TT_LOAD_FRAME();
@@ -25378,6 +25396,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         asf2->tt_call_argc = (uint16_t)pf_argc;
         asf2->tt_ctor_this = apromise; /* owned: the call's result */
         asf2->prev_frame = rt->current_stack_frame;
+        asf2->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
         rt->current_stack_frame = asf2;
         sf = asf2;
         TT_LOAD_FRAME();
@@ -47454,6 +47473,7 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
             for (k = 0; k < val_count; k++)
                 vals[k] = JS_UNDEFINED;
             sf->prev_frame = pe->sf;
+            sf->tt_depth = pe->sf ? (pe->sf)->tt_depth + 1 : 1;
             fe->sf = sf;
             fe->b = b;
             fe->start = vals;
@@ -47884,6 +47904,7 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
             sf->tt_aux_i = (int)fe->aux_i;
             sf->tt_call_argc = (uint16_t)fe->cargc;
             sf->prev_frame = pe->sf;
+            sf->tt_depth = pe->sf ? (pe->sf)->tt_depth + 1 : 1;
         } else if (fe->chained) {
             /* the base frame of a machine-parked flow: rebuilt as a C
                entry so its yields/returns come back to the host */
@@ -48734,6 +48755,7 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
             nsf->arg_buf = (src->arg_buf == src->tt_frame_base)
                 ? vals : cstart + (src->arg_buf - pstart);
             nsf->prev_frame = fk->clone_frame[i - 1];
+            nsf->tt_depth = fk->clone_frame[i - 1] ? (fk->clone_frame[i - 1])->tt_depth + 1 : 1;
             nsf->tt_last_line = src->tt_last_line;
             nsf->tt_pc_lo = src->tt_pc_lo;
             nsf->tt_pc_hi = src->tt_pc_hi;
@@ -49260,6 +49282,7 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
         nsf->tt_aux_i = srcf->tt_aux_i;
         nsf->tt_call_argc = srcf->tt_call_argc;
         nsf->prev_frame = fk->clone_frame[i - 1];
+        nsf->tt_depth = fk->clone_frame[i - 1] ? (fk->clone_frame[i - 1])->tt_depth + 1 : 1;
     }
 
     /* the sibling adopts its machine: an independently suspended,
