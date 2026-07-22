@@ -391,14 +391,31 @@ struct JSRuntime {
        in this arena (linear memory), so when no native C frame is below the
        dispatch loop, suspending is just returning to the host and resuming
        is a fresh call — no stack switching machinery at all. */
-    uint8_t *tt_arena_base;
-    uint8_t *tt_arena_top;
-    uint8_t *tt_arena_limit;
+    uint8_t *tt_arena_base;   /* CURRENT segment's storage range: frames of */
+    uint8_t *tt_arena_top;    /* the active machine bump-allocate here and */
+    uint8_t *tt_arena_limit;  /* release LIFO (tt_arena_pop_to)            */
+    struct TTArenaSeg *tt_arena_seg; /* segment holding tt_arena_top */
+    BOOL tt_arena_grow;       /* exhaustion appends a demand-sized segment
+                                 (per-machine arenas) instead of failing
+                                 (the fixed execution arena) */
+    size_t tt_arena_total;    /* Σ segment storage bytes (the growth cap) */
+    struct TTArenaSeg *tt_arena_graveyard; /* segments of machines freed
+                                 DURING cycle removal: late free_var_ref
+                                 unlinks still write into their frames, so
+                                 the memory stays mapped until the pass
+                                 ends */
+    /* TimeTravelJS automatic COW: the CHECKED-IN flow. While set, a
+       mutation of a baseline (tt_baseline-marked) target records its
+       pre-image into this flow's delta first -- transparently, from the
+       engine's own mutation chokepoints. */
+    struct JSAsyncFunctionState *tt_cow_flow;
     int tt_loop_depth;        /* dispatch-loop entries currently on the C stack */
     BOOL tt_park_ok;          /* the host entry point supports park-by-return */
     BOOL tt_park_abort;       /* deliver an abort on the next parked resume */
     BOOL tt_skip_once;        /* swallow the re-check at the resume pc */
     struct JSStackFrame *tt_parked_frame; /* set while parked-by-return */
+    JSValue *tt_step_sp;      /* transient: the running frame's sp during a
+                                 step-hook callback (JS_TTForkHere reads it) */
     JSValue tt_exec_fn;       /* callable held alive across a parked script */
     /* parked-job continuation (stackless job pump): inputs for the post
        half of a job whose user callback parked mid-run */
@@ -428,6 +445,9 @@ struct JSRuntime {
                             must never see the token) */
     int tt_pump_kind;    /* TT_PUMP_* */
     void *tt_pump_state; /* per-kind state (js_malloc'd), owned by the pump */
+    /* TimeTravelJS flow serialization: the shared-baseline registry giving
+       every baseline heap entity a process-stable id (NULL until captured) */
+    struct TTFlowBaseline *tt_flow_baseline;
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
@@ -613,6 +633,7 @@ typedef struct JSVarRef {
     uint8_t is_detached;
     uint8_t is_lexical; /* only used with global variables */
     uint8_t is_const; /* only used with global variables */
+    uint8_t tt_baseline; /* TimeTravelJS: a shared-baseline cell */
     JSValue *pvalue; /* pointer to the value, either on the stack or
                         to 'value' */
     union {
@@ -952,6 +973,15 @@ typedef struct JSAsyncFunctionState {
     BOOL is_completed; /* TRUE if the function has returned. The stack
                           frame is no longer valid */
     JSValue resolving_funcs[2]; /* only used in JS async functions */
+    /* TimeTravelJS flow serialization: per-flow COW delta of first-write
+       records against shared baseline objects (NULL if none) */
+    struct TTFlowDelta *tt_delta;
+    /* per-flow suspended machine: the parked TrampFrame chain rooted at
+       this state, with its own arena (NULL if not machine-parked) */
+    struct TTMachine *tt_machine;
+    /* per-flow pending job queue: reactions/microtasks captured out of the
+       live queue at checkout, spliced back at checkin (NULL if empty) */
+    struct TTFlowJobs *tt_jobs;
     JSStackFrame frame;
     /* arg_buf, var_buf, stack_buf and var_refs follow */
 } JSAsyncFunctionState;
@@ -1168,6 +1198,8 @@ struct JSObject {
     uint8_t has_immutable_prototype : 1; /* cannot modify the prototype */
     uint8_t tmp_mark : 1; /* used in JS_WriteObjectRec() */
     uint8_t is_HTMLDDA : 1; /* specific annex B IsHtmlDDA behavior */
+    uint8_t tt_baseline : 1; /* TimeTravelJS: in the shared-baseline
+                                registry -- flow writes copy-on-write */
     uint16_t class_id; /* see JS_CLASS_x */
     /* count the number of weak references to this object. The object
        structure is freed only if header.ref_count = 0 and
@@ -1492,6 +1524,50 @@ static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
 static JSValue js_import_meta(JSContext *ctx);
 static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier, JSValueConst options);
 static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref);
+struct TTFlowDelta;
+static void tt_flow_delta_free(JSRuntime *rt, struct TTFlowDelta *d);
+struct TTMachine;
+static void tt_machine_free(JSRuntime *rt, struct TTMachine *m,
+                            struct JSStackFrame *base_frame);
+static void tt_machine_mark(JSRuntime *rt, struct TTMachine *m,
+                            struct JSStackFrame *base_frame,
+                            JS_MarkFunc *mark_func);
+struct TTArenaSeg;
+static void tt_arena_segs_free(JSRuntime *rt, struct TTArenaSeg *seg);
+static void tt_arena_flush_graveyard(JSRuntime *rt);
+struct TTFlowJobs;
+static void tt_flow_jobs_free(JSRuntime *rt, struct TTFlowJobs *q);
+/* TimeTravelJS automatic COW capture (defined with the delta machinery).
+   Gate every call on TT_COW_HIT so the fast path is two loads + tests. */
+#define TT_COW_HIT(ctx, pobj) \
+    (unlikely((ctx)->rt->tt_cow_flow != NULL) && (pobj)->tt_baseline)
+static no_inline int tt_cow_prop(JSContext *ctx, JSObject *p, JSAtom atom);
+static no_inline int tt_cow_add(JSContext *ctx, JSObject *p, JSAtom atom,
+                                int prop_flags);
+static no_inline int tt_cow_del(JSContext *ctx, JSObject *p, JSAtom atom);
+static no_inline int tt_cow_array(JSContext *ctx, JSObject *p);
+static no_inline int tt_cow_cellw(JSContext *ctx, struct JSVarRef *vr);
+static no_inline int tt_cow_promise(JSContext *ctx, JSObject *p);
+static no_inline int tt_cow_presolved(JSContext *ctx, JSObject *fp);
+static no_inline int tt_cow_map(JSContext *ctx, JSObject *p);
+static no_inline int tt_cow_abuf(JSContext *ctx, JSObject *p);
+static no_inline int tt_cow_odata(JSContext *ctx, JSObject *p);
+static no_inline int tt_cow_ta(JSContext *ctx, JSObject *p);
+static uint32_t map_hash_key(JSValueConst key, int hash_bits);
+static void tt_flow_jobs_mark(JSRuntime *rt, struct TTFlowJobs *q,
+                              JS_MarkFunc *mark_func);
+static void tt_async_flow_link(JSContext *ctx, JSValueConst promise,
+                               JSAsyncFunctionState *s);
+static void tt_async_flow_unlink(JSContext *ctx, JSAsyncFunctionState *s);
+static JSValue promise_reaction_job(JSContext *ctx, int argc,
+                                    JSValueConst *argv);
+static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
+                                               int argc, JSValueConst *argv);
+struct JSPromiseFunctionDataResolved;
+static void js_promise_resolve_function_free_resolved(JSRuntime *rt,
+                              struct JSPromiseFunctionDataResolved *sr);
+static void tt_flow_delta_mark(JSRuntime *rt, struct TTFlowDelta *d,
+                               JS_MarkFunc *mark_func);
 static JSValue js_new_promise_capability(JSContext *ctx,
                                          JSValue *resolving_funcs,
                                          JSValueConst ctor);
@@ -2578,9 +2654,11 @@ void JS_FreeRuntime(JSRuntime *rt)
     int i;
 
     JS_FreeValueRT(rt, rt->current_exception);
-    if (rt->tt_arena_base) {
-        js_free_rt(rt, rt->tt_arena_base);
-        rt->tt_arena_base = NULL;
+    JS_TTBaselineFree(rt);
+    if (rt->tt_arena_seg) {
+        tt_arena_segs_free(rt, rt->tt_arena_seg);
+        rt->tt_arena_seg = NULL;
+        rt->tt_arena_base = rt->tt_arena_top = rt->tt_arena_limit = NULL;
     }
 
     list_for_each_safe(el, el1, &rt->job_list) {
@@ -5804,6 +5882,7 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     p->has_immutable_prototype = 0;
     p->tmp_mark = 0;
     p->is_HTMLDDA = 0;
+    p->tt_baseline = 0;
     p->weakref_count = 0;
     p->u.opaque = NULL;
     p->shape = sh;
@@ -6831,6 +6910,21 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
             }
             JS_MarkValue(rt, s->resolving_funcs[0], mark_func);
             JS_MarkValue(rt, s->resolving_funcs[1], mark_func);
+            /* TimeTravelJS: the per-flow COW delta owns references (target
+               objects/cells and displaced values); they are ordinary GC
+               edges of the state and must be visible to the collector */
+            if (s->tt_delta)
+                tt_flow_delta_mark(rt, s->tt_delta, mark_func);
+            /* TimeTravelJS: a per-flow suspended machine hangs its parked
+               TrampFrame chain off the base state; the arena frames' owned
+               slots are GC edges of the state (heap frames in the chain
+               mark through their own states above) */
+            if (s->tt_machine)
+                tt_machine_mark(rt, s->tt_machine, &s->frame, mark_func);
+            /* TimeTravelJS: the flow's captured pending jobs own their
+               argument values (and a realm reference) -- GC edges too */
+            if (s->tt_jobs)
+                tt_flow_jobs_mark(rt, s->tt_jobs, mark_func);
         }
         break;
     case JS_GC_OBJ_TYPE_SHAPE:
@@ -7004,6 +7098,10 @@ static void JS_RunGCInternal(JSRuntime *rt, BOOL remove_weak_objects)
 
     /* free the GC objects in a cycle */
     gc_free_cycles(rt);
+
+    /* TimeTravelJS: machine arenas parked during the pass (their frames
+       stayed writable for late cell unlinks) can be released now */
+    tt_arena_flush_graveyard(rt);
 }
 
 void JS_RunGC(JSRuntime *rt)
@@ -8378,6 +8476,12 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
     if (throw_flag && JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
         return TRUE;
 
+    if (TT_COW_HIT(ctx, p) && p->shape->proto != proto) {
+        JS_ThrowTypeError(ctx, "flow COW: baseline prototype mutation is "
+                          "not capturable");
+        return -1;
+    }
+
     if (unlikely(p->is_exotic)) {
         const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
         int ret;
@@ -8918,6 +9022,8 @@ static int JS_SetPrivateField(JSContext *ctx, JSValueConst obj,
         JS_FreeValue(ctx, val);
         return -1;
     }
+    if (TT_COW_HIT(ctx, p) && tt_cow_prop(ctx, p, prop))
+        goto fail;
     set_value(ctx, &pr->u.value, val);
     return 0;
 }
@@ -9650,6 +9756,9 @@ static JSProperty *add_property(JSContext *ctx,
 {
     JSShape *sh, *new_sh;
 
+    if (TT_COW_HIT(ctx, p) && tt_cow_add(ctx, p, prop, prop_flags))
+        return NULL;
+
     if (unlikely(__JS_AtomIsTaggedInt(prop))) {
         /* update is_std_array_prototype */
         if (unlikely(p->is_std_array_prototype)) {
@@ -9717,6 +9826,13 @@ static no_inline __exception int convert_fast_array_to_array(JSContext *ctx,
     JSShape *sh;
     uint32_t i, len, new_count;
 
+    if (TT_COW_HIT(ctx, p)) {
+        JS_ThrowTypeError(ctx, "flow COW: baseline array storage "
+                          "conversion under a checked-in flow is not "
+                          "capturable");
+        return -1;
+    }
+
     if (js_shape_prepare_update(ctx, p, NULL))
         return -1;
     len = p->u.array.count;
@@ -9779,6 +9895,8 @@ static int remove_global_object_property(JSContext *ctx, JSObject *p,
 
 static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
 {
+    if (TT_COW_HIT(ctx, p) && tt_cow_del(ctx, p, atom))
+        return -1;
     JSShape *sh;
     JSShapeProperty *pr, *lpr, *prop;
     JSProperty *pr1;
@@ -9921,6 +10039,14 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
     /* JS_ToArrayLengthFree() must be done before the read-only test */
     if (unlikely(!(get_shape_prop(p->shape)[0].flags & JS_PROP_WRITABLE)))
         return JS_ThrowTypeErrorReadOnly(ctx, flags, JS_ATOM_length);
+    if (TT_COW_HIT(ctx, p)) {
+        /* length writes and truncation mutate the payload; slow arrays
+           funnel their per-index deletions through delete_property */
+        int cr = p->fast_array ? tt_cow_array(ctx, p)
+                               : tt_cow_prop(ctx, p, JS_ATOM_length);
+        if (cr)
+            return -1;
+    }
 
     if (likely(p->fast_array)) {
         uint32_t old_len = p->u.array.count;
@@ -10020,6 +10146,10 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
 static inline int add_fast_array_element(JSContext *ctx, JSObject *p,
                                          JSValue val, int flags)
 {
+    if (TT_COW_HIT(ctx, p) && tt_cow_array(ctx, p)) {
+        JS_FreeValue(ctx, val);
+        return -1;
+    }
     uint32_t new_len, array_len;
     /* extend the array by one */
     /* XXX: convert to slow array if new_len > 2^31-1 elements */
@@ -10187,6 +10317,10 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
         if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
             /* fast case */
+            if (TT_COW_HIT(ctx, p1) && tt_cow_prop(ctx, p1, prop)) {
+                JS_FreeValue(ctx, val);
+                return -1;
+            }
             set_value(ctx, &pr->u.value, val);
             return TRUE;
         } else if (prs->flags & JS_PROP_LENGTH) {
@@ -10435,6 +10569,18 @@ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
         /* fast path for array access */
         p = JS_VALUE_GET_OBJ(this_obj);
         idx = JS_VALUE_GET_INT(prop);
+        if (unlikely(ctx->rt->tt_cow_flow != NULL)) {
+            int cr;
+            if ((p->class_id == JS_CLASS_ARRAY ||
+                 p->class_id == JS_CLASS_ARGUMENTS) && p->tt_baseline)
+                cr = tt_cow_array(ctx, p);
+            else
+                cr = tt_cow_ta(ctx, p);
+            if (cr) {
+                JS_FreeValue(ctx, val);
+                return -1;
+            }
+        }
         switch(p->class_id) {
         case JS_CLASS_ARRAY:
             if (unlikely(idx >= (uint32_t)p->u.array.count)) {
@@ -11025,6 +11171,8 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                     return res;
                 } else {
                     if (flags & JS_PROP_HAS_VALUE) {
+                        if (TT_COW_HIT(ctx, p) && tt_cow_prop(ctx, p, prop))
+                            return -1;
                         JS_FreeValue(ctx, pr->u.value);
                         pr->u.value = JS_DupValue(ctx, val);
                     }
@@ -17551,6 +17699,7 @@ static JSVarRef *js_create_var_ref(JSContext *ctx, BOOL is_lexical)
     var_ref->is_detached = TRUE;
     var_ref->is_lexical = FALSE;
     var_ref->is_const = FALSE;
+    var_ref->tt_baseline = 0;
     add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
     return var_ref;
 }
@@ -17595,6 +17744,7 @@ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
     var_ref->is_detached = FALSE;
     var_ref->is_lexical = FALSE;
     var_ref->is_const = FALSE;
+    var_ref->tt_baseline = 0;
     var_ref->var_ref_idx = var_ref_idx;
     var_ref->stack_frame = sf;
     sf->var_refs[var_ref_idx] = var_ref;
@@ -18123,11 +18273,166 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
 #define JS_CALL_FLAG_TT_RESUME   (1 << 3)
 
 /* TimeTravelJS stackless interpreter: every frame (and its argument copy,
-   variables, operand stack and var-ref slots) is bump-allocated from a
-   fixed arena in linear memory instead of alloca. JS recursion depth
-   becomes an exact, snapshot-stable limit, and a suspended machine is
-   nothing but bytes. */
+   variables, operand stack and var-ref slots) is bump-allocated from an
+   arena in linear memory instead of alloca. JS recursion depth becomes an
+   exact, snapshot-stable limit, and a suspended machine is nothing but
+   bytes.
+
+   The arena is SEGMENTED: a linked chain of malloc'd segments, grown on
+   demand and never moved (live frames carry parent-relative aliases and
+   open-cell storage pointers, so a block's address is forever). A block
+   never straddles segments -- when the current segment cannot hold a
+   request, allocation continues in a fresh (or kept-for-reuse) successor
+   segment. The runtime's own execution arena is one fixed 2 MB segment
+   (exhaustion IS the engine's recursion limit); per-machine arenas start
+   at a demand-sized sliver and double up to TT_ARENA_SEG_MAX, capped at
+   the same 2 MB total, so N suspended machines cost the sum of their
+   actual chain depths, not N slabs. */
 #define TT_FRAME_ARENA_SIZE (2 * 1024 * 1024)
+#define TT_ARENA_SEG_MIN    1024
+#define TT_ARENA_SEG_MAX    (64 * 1024)
+
+typedef struct TTArenaSeg {
+    struct TTArenaSeg *prev;  /* toward older blocks */
+    struct TTArenaSeg *next;  /* kept when vacated, for push/pop reuse */
+    uint8_t *base, *limit;    /* the 16-aligned storage range */
+    size_t size;              /* limit - base */
+} TTArenaSeg;
+
+/* free the empty successors of 'seg' (kept earlier for reuse) */
+static void tt_arena_seg_free_tail(JSRuntime *rt, TTArenaSeg *seg,
+                                   size_t *ptotal)
+{
+    TTArenaSeg *t = seg->next, *n;
+    seg->next = NULL;
+    while (t) {
+        n = t->next;
+        if (ptotal)
+            *ptotal -= t->size;
+        js_free_rt(rt, t);
+        t = n;
+    }
+}
+
+/* free a whole segment chain, given any member */
+static void tt_arena_segs_free(JSRuntime *rt, struct TTArenaSeg *seg)
+{
+    TTArenaSeg *n;
+    if (!seg)
+        return;
+    while (seg->prev)
+        seg = seg->prev;
+    while (seg) {
+        n = seg->next;
+        js_free_rt(rt, seg);
+        seg = n;
+    }
+}
+
+/* a machine dismantled DURING cycle removal cannot free its segments yet:
+   cells dying later in the same pass still unlink through the frames'
+   var_refs slots. Park the chain on the graveyard; the pass's end frees
+   it. */
+static void tt_arena_segs_to_graveyard(JSRuntime *rt, TTArenaSeg *seg)
+{
+    TTArenaSeg *first, *last;
+    if (!seg)
+        return;
+    first = seg;
+    while (first->prev)
+        first = first->prev;
+    last = seg;
+    while (last->next)
+        last = last->next;
+    last->next = rt->tt_arena_graveyard;
+    rt->tt_arena_graveyard = first;
+}
+
+static void tt_arena_flush_graveyard(JSRuntime *rt)
+{
+    TTArenaSeg *seg = rt->tt_arena_graveyard, *n;
+    rt->tt_arena_graveyard = NULL;
+    while (seg) {
+        n = seg->next;
+        js_free_rt(rt, seg);
+        seg = n;
+    }
+}
+
+/* enter the segment after 'cur' that can hold an aligned block of 'need'
+   bytes: reuse a kept successor when it fits, else append a fresh
+   demand-sized one (dropping a too-small stale tail). Returns NULL at the
+   total growth cap or OOM. */
+static TTArenaSeg *tt_arena_seg_append(JSRuntime *rt, TTArenaSeg *cur,
+                                       size_t need, size_t *ptotal)
+{
+    TTArenaSeg *seg;
+    size_t want, cap_left;
+    uint8_t *storage;
+
+    if (cur && cur->next) {
+        if (cur->next->size >= need)
+            return cur->next;
+        tt_arena_seg_free_tail(rt, cur, ptotal);
+    }
+    if (*ptotal >= TT_FRAME_ARENA_SIZE)
+        return NULL;
+    cap_left = TT_FRAME_ARENA_SIZE - *ptotal;
+    want = cur ? cur->size * 2 : TT_ARENA_SEG_MIN;
+    if (want > TT_ARENA_SEG_MAX)
+        want = TT_ARENA_SEG_MAX;
+    if (want < need)
+        want = need;
+    if (want > cap_left)
+        want = cap_left;
+    if (want < need)
+        return NULL;
+    seg = js_malloc_rt(rt, sizeof(*seg) + want + 16);
+    if (!seg)
+        return NULL;
+    storage = (uint8_t *)(((uintptr_t)(seg + 1) + 15) & ~(uintptr_t)15);
+    seg->prev = cur;
+    seg->next = NULL;
+    seg->base = storage;
+    seg->limit = storage + want;
+    seg->size = want;
+    if (cur)
+        cur->next = seg;
+    *ptotal += want;
+    return seg;
+}
+
+/* the allocators' slow path: make the runtime's current-segment registers
+   able to hold 'size' more bytes. The fixed execution arena allocates its
+   single 2 MB segment lazily and then refuses (stack overflow); growable
+   (machine) arenas append segments up to the same total cap. */
+static no_inline BOOL tt_arena_extend(JSRuntime *rt, size_t size)
+{
+    TTArenaSeg *seg = rt->tt_arena_seg;
+
+    if (!rt->tt_arena_grow) {
+        if (seg || size > TT_FRAME_ARENA_SIZE)
+            return FALSE;
+        seg = js_malloc_rt(rt, sizeof(*seg) + TT_FRAME_ARENA_SIZE + 16);
+        if (!seg)
+            return FALSE;
+        seg->prev = seg->next = NULL;
+        seg->base = (uint8_t *)(((uintptr_t)(seg + 1) + 15) &
+                                ~(uintptr_t)15);
+        seg->limit = seg->base + TT_FRAME_ARENA_SIZE;
+        seg->size = TT_FRAME_ARENA_SIZE;
+        rt->tt_arena_total = seg->size;
+    } else {
+        seg = tt_arena_seg_append(rt, seg, size, &rt->tt_arena_total);
+        if (!seg)
+            return FALSE;
+    }
+    rt->tt_arena_seg = seg;
+    rt->tt_arena_base = seg->base;
+    rt->tt_arena_limit = seg->limit;
+    rt->tt_arena_top = seg->base;
+    return TRUE;
+}
 
 static JSStackFrame *tt_arena_push(JSRuntime *rt, size_t val_count,
                                    size_t ref_count, JSValue **pvals)
@@ -18136,28 +18441,50 @@ static JSStackFrame *tt_arena_push(JSRuntime *rt, size_t val_count,
     uint8_t *base;
     JSStackFrame *sf;
 
-    if (unlikely(!rt->tt_arena_base)) {
-        rt->tt_arena_base = js_malloc_rt(rt, TT_FRAME_ARENA_SIZE);
-        if (!rt->tt_arena_base)
-            return NULL;
-        rt->tt_arena_top = rt->tt_arena_base;
-        rt->tt_arena_limit = rt->tt_arena_base + TT_FRAME_ARENA_SIZE;
-    }
     size = sizeof(JSStackFrame) + sizeof(JSValue) * val_count +
         sizeof(JSVarRef *) * ref_count;
     size = (size + 15) & ~(size_t)15;
     base = rt->tt_arena_top;
-    if (unlikely(size > (size_t)(rt->tt_arena_limit - base)))
-        return NULL;
+    if (unlikely(!rt->tt_arena_seg ||
+                 size > (size_t)(rt->tt_arena_limit - base))) {
+        if (!tt_arena_extend(rt, size))
+            return NULL;
+        base = rt->tt_arena_top;
+    }
     rt->tt_arena_top = base + size;
     sf = (JSStackFrame *)base;
     *pvals = (JSValue *)(sf + 1);
     return sf;
 }
 
+/* LIFO release back to 'mark' (the start of a block pushed earlier). The
+   mark may live in an earlier segment: cross back by range membership --
+   inter-segment address ORDER means nothing -- keeping the vacated
+   segments linked for push/pop reuse. */
+static no_inline void tt_arena_pop_cross(JSRuntime *rt, uint8_t *mark)
+{
+    TTArenaSeg *seg = rt->tt_arena_seg;
+    do {
+        seg = seg->prev;
+    } while (!(mark >= seg->base && mark < seg->limit));
+    rt->tt_arena_seg = seg;
+    rt->tt_arena_base = seg->base;
+    rt->tt_arena_limit = seg->limit;
+    rt->tt_arena_top = mark;
+}
+
+static force_inline void tt_arena_pop_to(JSRuntime *rt, void *mark)
+{
+    uint8_t *m = (uint8_t *)mark;
+    if (likely(m >= rt->tt_arena_base && m < rt->tt_arena_limit))
+        rt->tt_arena_top = m;
+    else
+        tt_arena_pop_cross(rt, m);
+}
+
 static force_inline void tt_arena_pop(JSRuntime *rt, JSStackFrame *sf)
 {
-    rt->tt_arena_top = (uint8_t *)sf;
+    tt_arena_pop_to(rt, sf);
 }
 
 /* raw value block from the arena (for synthesized argument vectors); freed
@@ -18167,17 +18494,14 @@ static JSValue *tt_arena_alloc_vals(JSRuntime *rt, size_t n)
     size_t size;
     uint8_t *base;
 
-    if (unlikely(!rt->tt_arena_base)) {
-        rt->tt_arena_base = js_malloc_rt(rt, TT_FRAME_ARENA_SIZE);
-        if (!rt->tt_arena_base)
-            return NULL;
-        rt->tt_arena_top = rt->tt_arena_base;
-        rt->tt_arena_limit = rt->tt_arena_base + TT_FRAME_ARENA_SIZE;
-    }
     size = (sizeof(JSValue) * n + 15) & ~(size_t)15;
     base = rt->tt_arena_top;
-    if (unlikely(size > (size_t)(rt->tt_arena_limit - base)))
-        return NULL;
+    if (unlikely(!rt->tt_arena_seg ||
+                 size > (size_t)(rt->tt_arena_limit - base))) {
+        if (!tt_arena_extend(rt, size))
+            return NULL;
+        base = rt->tt_arena_top;
+    }
     rt->tt_arena_top = base + size;
     return (JSValue *)base;
 }
@@ -18657,13 +18981,13 @@ static int tt_append_step(JSContext *ctx, JSValue *sp, JSValue *blk,
  finished:
     JS_FreeValue(ctx, blk[0]);
     JS_FreeValue(ctx, blk[1]);
-    rt->tt_arena_top = (uint8_t *)blk;
+    tt_arena_pop_to(rt, blk);
     return 1;
  fail:
     JS_IteratorClose(ctx, blk[0], TRUE);
     JS_FreeValue(ctx, blk[0]);
     JS_FreeValue(ctx, blk[1]);
-    rt->tt_arena_top = (uint8_t *)blk;
+    tt_arena_pop_to(rt, blk);
     return -1;
 }
 
@@ -18980,9 +19304,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
    RETURNING to the host — legal because at that moment the frame chain,
    locals and pc all live in linear memory and no C frame below us holds
    interpreter state. Resuming is a fresh call with JS_CALL_FLAG_TT_RESUME. */
+/* TimeTravelJS automatic COW: a write through a BASELINE closure cell
+   snapshots its pre-image into the checked-in flow's delta first */
+#define TT_COW_CELL_CHECK(vrx) do {                              \
+        JSVarRef *tt_vr_ = (vrx);                                \
+        if (unlikely(rt->tt_cow_flow != NULL) &&                 \
+            tt_vr_->tt_baseline) {                               \
+            sf->cur_pc = pc;                                     \
+            if (tt_cow_cellw(ctx, tt_vr_))                       \
+                goto exception;                                  \
+        }                                                        \
+    } while (0)
+
 #define TT_STEP_CHECK() do {                                     \
         if (unlikely(rt->tt_step_enabled)) {                     \
-            int tt_r_ = js_tt_step_check(ctx, sf, b, pc);        \
+            int tt_r_;                                           \
+            rt->tt_step_sp = sp;                                 \
+            tt_r_ = js_tt_step_check(ctx, sf, b, pc);            \
+            rt->tt_step_sp = NULL;                               \
             if (unlikely(tt_r_)) {                               \
                 if (tt_r_ == 2) {                                \
                     sf->cur_pc = pc;                             \
@@ -19049,13 +19388,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         pu->nargs = 0;                                                      \
         pact = tt_pump_step(ctx, pu, JS_UNDEFINED, TRUE, &pfn, &pth, &pres);\
         if (pact < 0) {                                                     \
-            rt->tt_arena_top = (uint8_t *)pu;                               \
+            tt_arena_pop_to(rt, pu);                               \
             goto exception;                                                 \
         }                                                                   \
         if (pact == 0) {                                                    \
             if (unlikely(js_poll_interrupts(ctx))) {                        \
                 tt_pump_abort(ctx, pu);                                     \
-                rt->tt_arena_top = (uint8_t *)pu;                           \
+                tt_arena_pop_to(rt, pu);                           \
                 goto exception;                                             \
             }                                                               \
             sf->cur_sp = sp;                                                \
@@ -19072,7 +19411,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             pf_cargc = pu->cargc;                                           \
             goto push_frame;                                                \
         }                                                                   \
-        rt->tt_arena_top = (uint8_t *)pu;                                   \
+        tt_arena_pop_to(rt, pu);                                   \
         ret_val = pres;                                                     \
     }
 
@@ -20477,6 +20816,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 } else {
                 put_var_ok:
+                   TT_COW_CELL_CHECK(var_ref);
                    set_value(ctx, var_ref->pvalue, sp[-1]);
                    sp--;
                 }
@@ -20568,14 +20908,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_get_var_ref1): *sp++ = JS_DupValue(ctx, *var_refs[1]->pvalue); BREAK;
         CASE(OP_get_var_ref2): *sp++ = JS_DupValue(ctx, *var_refs[2]->pvalue); BREAK;
         CASE(OP_get_var_ref3): *sp++ = JS_DupValue(ctx, *var_refs[3]->pvalue); BREAK;
-        CASE(OP_put_var_ref0): set_value(ctx, var_refs[0]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref1): set_value(ctx, var_refs[1]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref2): set_value(ctx, var_refs[2]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref3): set_value(ctx, var_refs[3]->pvalue, *--sp); BREAK;
-        CASE(OP_set_var_ref0): set_value(ctx, var_refs[0]->pvalue, JS_DupValue(ctx, sp[-1])); BREAK;
-        CASE(OP_set_var_ref1): set_value(ctx, var_refs[1]->pvalue, JS_DupValue(ctx, sp[-1])); BREAK;
-        CASE(OP_set_var_ref2): set_value(ctx, var_refs[2]->pvalue, JS_DupValue(ctx, sp[-1])); BREAK;
-        CASE(OP_set_var_ref3): set_value(ctx, var_refs[3]->pvalue, JS_DupValue(ctx, sp[-1])); BREAK;
+        CASE(OP_put_var_ref0): TT_COW_CELL_CHECK(var_refs[0]); set_value(ctx, var_refs[0]->pvalue, *--sp); BREAK;
+        CASE(OP_put_var_ref1): TT_COW_CELL_CHECK(var_refs[1]); set_value(ctx, var_refs[1]->pvalue, *--sp); BREAK;
+        CASE(OP_put_var_ref2): TT_COW_CELL_CHECK(var_refs[2]); set_value(ctx, var_refs[2]->pvalue, *--sp); BREAK;
+        CASE(OP_put_var_ref3): TT_COW_CELL_CHECK(var_refs[3]); set_value(ctx, var_refs[3]->pvalue, *--sp); BREAK;
+        CASE(OP_set_var_ref0): TT_COW_CELL_CHECK(var_refs[0]); set_value(ctx, var_refs[0]->pvalue, JS_DupValue(ctx, sp[-1])); BREAK;
+        CASE(OP_set_var_ref1): TT_COW_CELL_CHECK(var_refs[1]); set_value(ctx, var_refs[1]->pvalue, JS_DupValue(ctx, sp[-1])); BREAK;
+        CASE(OP_set_var_ref2): TT_COW_CELL_CHECK(var_refs[2]); set_value(ctx, var_refs[2]->pvalue, JS_DupValue(ctx, sp[-1])); BREAK;
+        CASE(OP_set_var_ref3): TT_COW_CELL_CHECK(var_refs[3]); set_value(ctx, var_refs[3]->pvalue, JS_DupValue(ctx, sp[-1])); BREAK;
 #endif
 
         CASE(OP_get_var_ref):
@@ -20594,6 +20934,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
+                TT_COW_CELL_CHECK(var_refs[idx]);
                 set_value(ctx, var_refs[idx]->pvalue, sp[-1]);
                 sp--;
             }
@@ -20603,6 +20944,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
+                TT_COW_CELL_CHECK(var_refs[idx]);
                 set_value(ctx, var_refs[idx]->pvalue, JS_DupValue(ctx, sp[-1]));
             }
             BREAK;
@@ -20630,6 +20972,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_ThrowReferenceErrorUninitialized2(ctx, b, idx, TRUE);
                     goto exception;
                 }
+                TT_COW_CELL_CHECK(var_refs[idx]);
                 set_value(ctx, var_refs[idx]->pvalue, sp[-1]);
                 sp--;
             }
@@ -20643,6 +20986,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_ThrowReferenceErrorUninitialized2(ctx, b, idx, TRUE);
                     goto exception;
                 }
+                TT_COW_CELL_CHECK(var_refs[idx]);
                 set_value(ctx, var_refs[idx]->pvalue, sp[-1]);
                 sp--;
             }
@@ -21563,6 +21907,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
                                               JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
                         /* fast path */
+                        if (TT_COW_HIT(ctx, p)) {
+                            sf->cur_pc = pc;
+                            if (tt_cow_prop(ctx, p, atom))
+                                goto exception;
+                        }
                         set_value(ctx, &pr->u.value, sp[-1]);
                     } else {
                         goto put_field_slow_path;
@@ -22009,6 +22358,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     idx = JS_VALUE_GET_INT(sp[-2]);
                     if (unlikely(p->class_id != JS_CLASS_ARRAY))
                         goto put_array_el_slow_path;
+                    if (TT_COW_HIT(ctx, p)) {
+                        sf->cur_pc = pc;
+                        if (tt_cow_array(ctx, p))
+                            goto exception;
+                    }
                     if (unlikely(idx >= (uint32_t)p->u.array.count)) {
                         uint32_t new_len, array_len;
                         if (unlikely(idx != (uint32_t)p->u.array.count ||
@@ -23441,7 +23795,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_IteratorClose(ctx, gablk[0], TRUE);
                     JS_FreeValue(ctx, gablk[0]);
                     JS_FreeValue(ctx, gablk[1]);
-                    rt->tt_arena_top = (uint8_t *)gablk;
+                    tt_arena_pop_to(rt, gablk);
                     goto exception;
                 }
                 ap_r = tt_append_step(ctx, sp, gablk, ret_val,
@@ -23507,12 +23861,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         tt_arena_pop(rt, sf);
         if (kind == TT_FRAME_BOUND_CALL || kind == TT_FRAME_BOUND_METHOD) {
             /* release the synthesized (borrowed) argument block */
-            rt->tt_arena_top = (uint8_t *)kaux_p;
+            tt_arena_pop_to(rt, kaux_p);
         }
         if (kind == TT_FRAME_TOPRIM && kaux_p) {
             /* exotic @@toPrimitive: hint-string argument block */
             JS_FreeValue(ctx, ((JSValue *)kaux_p)[0]);
-            rt->tt_arena_top = (uint8_t *)kaux_p;
+            tt_arena_pop_to(rt, kaux_p);
         }
         if (kind == TT_FRAME_ENTRY) {
             rt->tt_loop_depth--;
@@ -23536,14 +23890,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, pg_blk[1]);
                 JS_FreeValue(ctx, pg_blk[2]);
                 JS_FreeValue(ctx, pg_blk[3]);
-                rt->tt_arena_top = (uint8_t *)pg_blk;
+                tt_arena_pop_to(rt, pg_blk);
             }
             if (kind == TT_FRAME_APPEND_NEXT) {
                 JSValue *ap_eb = (JSValue *)kaux_p;
                 JS_IteratorClose(ctx, ap_eb[0], TRUE);
                 JS_FreeValue(ctx, ap_eb[0]);
                 JS_FreeValue(ctx, ap_eb[1]);
-                rt->tt_arena_top = (uint8_t *)ap_eb;
+                tt_arena_pop_to(rt, ap_eb);
             }
             if (kind == TT_FRAME_PROXY_SET || kind == TT_FRAME_PROXY_DEFINE) {
                 JSValue *pt_eb = (JSValue *)kaux_p;
@@ -23551,18 +23905,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, ctor_this);
                 for (pt_i = 0; pt_i < 5; pt_i++)
                     JS_FreeValue(ctx, pt_eb[pt_i]);
-                rt->tt_arena_top = (uint8_t *)pt_eb;
+                tt_arena_pop_to(rt, pt_eb);
             }
             if (kind == TT_FRAME_INIT_CTOR) {
                 JSValue *ic_eb = (JSValue *)kaux_p;
                 JS_FreeValue(ctx, ctor_this);
                 JS_FreeValue(ctx, ic_eb[0]); /* super */
-                rt->tt_arena_top = (uint8_t *)ic_eb;
+                tt_arena_pop_to(rt, ic_eb);
             }
             if (kind == TT_FRAME_PUMP) {
                 TTPump *pu = (TTPump *)kaux_p;
                 tt_pump_abort(ctx, pu);
-                rt->tt_arena_top = (uint8_t *)pu;
+                tt_arena_pop_to(rt, pu);
             }
             if (kind == TT_FRAME_APPLY)
                 free_arg_list(ctx, kaux_p, (uint32_t)kaux);
@@ -23733,7 +24087,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, ps_blk[2]);
             JS_FreeValue(ctx, ps_blk[3]);
             JS_FreeValue(ctx, ps_blk[4]);
-            rt->tt_arena_top = (uint8_t *)ps_blk;
+            tt_arena_pop_to(rt, ps_blk);
             if (kaux == 0) { /* put_field / with_put_var: [.. x value-ish obj-ish] */
                 JS_FreeValue(ctx, sp[-1]);
                 JS_FreeValue(ctx, sp[-2]);
@@ -23750,7 +24104,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, ps_blk[2]);
             JS_FreeValue(ctx, ps_blk[3]);
             JS_FreeValue(ctx, ps_blk[4]);
-            rt->tt_arena_top = (uint8_t *)ps_blk;
+            tt_arena_pop_to(rt, ps_blk);
             goto exception;
         }
         if (kind == TT_FRAME_PROXY_DEFINE) {
@@ -23812,7 +24166,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, pd_blk[2]);
             JS_FreeValue(ctx, pd_blk[3]);
             JS_FreeValue(ctx, pd_blk[4]);
-            rt->tt_arena_top = (uint8_t *)pd_blk;
+            tt_arena_pop_to(rt, pd_blk);
             JS_FreeValue(ctx, sp[-1]); /* the dead value slot */
             sp--;
             goto restart;
@@ -23822,7 +24176,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, pd_blk[2]);
             JS_FreeValue(ctx, pd_blk[3]);
             JS_FreeValue(ctx, pd_blk[4]);
-            rt->tt_arena_top = (uint8_t *)pd_blk;
+            tt_arena_pop_to(rt, pd_blk);
             goto exception;
         }
         if (kind == TT_FRAME_APPEND_NEXT) {
@@ -23876,7 +24230,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, pg_blk[1]);
             JS_FreeValue(ctx, pg_blk[2]);
             JS_FreeValue(ctx, pg_blk[3]);
-            rt->tt_arena_top = (uint8_t *)pg_blk;
+            tt_arena_pop_to(rt, pg_blk);
             switch (kaux) {
             case 0: /* get_field / with_get_var */
                 JS_FreeValue(ctx, sp[-1]);
@@ -23904,7 +24258,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, pg_blk[1]);
             JS_FreeValue(ctx, pg_blk[2]);
             JS_FreeValue(ctx, pg_blk[3]);
-            rt->tt_arena_top = (uint8_t *)pg_blk;
+            tt_arena_pop_to(rt, pg_blk);
             goto exception;
         }
         if (kind == TT_FRAME_TOPRIM) {
@@ -24013,7 +24367,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                the object-result-wins-else-`this` rule. */
             JSValue *ic_blk = (JSValue *)kaux_p;
             JS_FreeValue(ctx, ic_blk[0]); /* super */
-            rt->tt_arena_top = (uint8_t *)ic_blk;
+            tt_arena_pop_to(rt, ic_blk);
             if (JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) {
                 JS_FreeValue(ctx, ctor_this);
             } else {
@@ -24028,13 +24382,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JSValue pfn, pth, pres;
             int pact = tt_pump_step(ctx, pu, ret_val, FALSE, &pfn, &pth, &pres);
             if (pact < 0) {
-                rt->tt_arena_top = (uint8_t *)pu;
+                tt_arena_pop_to(rt, pu);
                 goto exception;
             }
             if (pact == 0) {
                 if (unlikely(js_poll_interrupts(ctx))) {
                     tt_pump_abort(ctx, pu);
-                    rt->tt_arena_top = (uint8_t *)pu;
+                    tt_arena_pop_to(rt, pu);
                     goto exception;
                 }
                 sf->cur_sp = sp;
@@ -24054,7 +24408,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 int p_cargc = pu->cargc, p_base = pu->base, p_tail = pu->tail;
                 JSValue *cav;
-                rt->tt_arena_top = (uint8_t *)pu;
+                tt_arena_pop_to(rt, pu);
                 cav = sp - p_cargc;
                 for (i = p_base; i < p_cargc; i++)
                     JS_FreeValue(ctx, cav[i]);
@@ -24244,7 +24598,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         JS_IteratorClose(ctx, ap_blk[0], TRUE);
         JS_FreeValue(ctx, ap_blk[0]);
         JS_FreeValue(ctx, ap_blk[1]);
-        rt->tt_arena_top = (uint8_t *)ap_blk;
+        tt_arena_pop_to(rt, ap_blk);
         goto exception;
     }
 
@@ -24685,6 +25039,10 @@ static JSValue async_func_finish(JSContext *ctx, JSAsyncFunctionState *s,
         }
         /* end of execution */
         s->is_completed = TRUE;
+        /* a flow completing while checked in commits its view: automatic
+           COW disarms, the delta dies with the state, values stay live */
+        if (rt->tt_cow_flow == s)
+            rt->tt_cow_flow = NULL;
 
         /* close the closure variables. */
         close_var_refs(rt, b, sf);
@@ -24713,12 +25071,29 @@ static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
 
 static void __async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
 {
+    if (rt->tt_cow_flow == s)
+        rt->tt_cow_flow = NULL;
+    if (s->tt_machine) {
+        /* dismantle the parked chain first: arena frames' owned values
+           free while the nested states they reference (via this frame's
+           still-live stack) can be safely released */
+        tt_machine_free(rt, s->tt_machine, &s->frame);
+        s->tt_machine = NULL;
+    }
     /* cannot close the closure variables here because it would
        potentially modify the object graph */
     if (!s->is_completed) {
         async_func_free_frame(rt, s);
     }
 
+    if (s->tt_delta) {
+        tt_flow_delta_free(rt, s->tt_delta);
+        s->tt_delta = NULL;
+    }
+    if (s->tt_jobs) {
+        tt_flow_jobs_free(rt, s->tt_jobs);
+        s->tt_jobs = NULL;
+    }
     JS_FreeValueRT(rt, s->resolving_funcs[0]);
     JS_FreeValueRT(rt, s->resolving_funcs[1]);
 
@@ -25044,6 +25419,9 @@ static void js_async_function_post(JSContext *ctx, JSAsyncFunctionState *s,
             JS_FreeValue(ctx, func_ret);
             JS_FreeValue(ctx, ret2); /* XXX: what to do if exception ? */
         }
+        /* TimeTravelJS: completed -- the result promise drops its flow
+           handle link */
+        tt_async_flow_unlink(ctx, s);
     } else {
         JSValue value, promise, resolving_funcs[2], resolving_funcs1[2];
         int i, res;
@@ -25125,6 +25503,11 @@ static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
         async_func_free(ctx->rt, s);
         return JS_EXCEPTION;
     }
+
+    /* TimeTravelJS: the result promise is the flow's host handle -- give it
+       an owned, GC-visible link to the state so an await-suspended flow can
+       be forked/serialized/evicted through it */
+    tt_async_flow_link(ctx, promise, s);
 
     js_async_function_resume(ctx, s);
 
@@ -41374,6 +41757,6626 @@ typedef enum BCTagEnum {
 
 #define BC_VERSION 5
 
+/* Promise internals -- defined here so the TimeTravelJS flow serializer
+   below can classify, clone and serialize a flow-private promise graph
+   (pending promises, their reaction lists, resolve/reject capabilities,
+   async-function await continuations). */
+typedef struct JSPromiseData {
+    JSPromiseStateEnum promise_state;
+    /* 0=fulfill, 1=reject, list of JSPromiseReactionData.link */
+    struct list_head promise_reactions[2];
+    BOOL is_handled; /* Note: only useful to debug */
+    JSValue promise_result;
+    /* TimeTravelJS: when this promise is the RESULT of an async function,
+       an owned, GC-marked link to the flow's suspended state -- the
+       promise IS the flow's host handle. Cleared on completion, on
+       eviction, and by the finalizer. */
+    JSAsyncFunctionState *tt_flow_state;
+} JSPromiseData;
+
+typedef struct JSPromiseFunctionDataResolved {
+    int ref_count;
+    BOOL already_resolved;
+} JSPromiseFunctionDataResolved;
+
+typedef struct JSPromiseFunctionData {
+    JSValue promise;
+    JSPromiseFunctionDataResolved *presolved;
+} JSPromiseFunctionData;
+
+typedef struct JSPromiseReactionData {
+    struct list_head link; /* not used in promise_reaction_job */
+    JSValue resolving_funcs[2];
+    JSValue handler;
+} JSPromiseReactionData;
+
+/*---------------------------------------------------------------------------*/
+/* TimeTravelJS: cross-process flow serialization                            */
+/*                                                                           */
+/* A *flow* is a suspended computation rooted at a JSAsyncFunctionState (the */
+/* type QuickJS uses for generator and async-function activations): the base */
+/* state plus the chain of parked interpreter frames reachable from it (a    */
+/* yield* chain parks one frame per nested state), plus a per-flow COW delta */
+/* of first-write records against shared baseline objects.                   */
+/*                                                                           */
+/* serialize_flow(base) turns that into self-contained bytes such that       */
+/* deserialize_flow(bytes, fresh_rt) rebuilds a state that resumes byte-     */
+/* identically in a fresh process, provided the fresh process rebuilt the    */
+/* same *baseline* first (same bytecode evaluated, then                      */
+/* JS_TTBaselineCapture(), which assigns every reachable heap entity a       */
+/* stable id in deterministic BFS order).                                    */
+/*                                                                           */
+/* The stable-id scheme splits every JSValue reachable from the frames and   */
+/* the delta into two spaces:                                                */
+/*   - baseline (BY REFERENCE): the pointer is found in the baseline         */
+/*     registry -> the wire carries only its uleb id. A baseline object      */
+/*     shared by N flows costs each flow a few bytes, never a copy, and all  */
+/*     N flows relink to the *same* object in the fresh process.             */
+/*   - flow-private (BY VALUE): everything else reachable is copied          */
+/*     structurally into a record table (objects, closures, strings,         */
+/*     symbols, var_refs, nested generator states).                          */
+/*                                                                           */
+/* Wire layout ("TTFL01"): header (baseline fingerprint + count), private    */
+/* atom table, record shell table, frame table, record payloads, frame       */
+/* payloads, delta records, root. The reader swizzles in two passes:         */
+/*   pass 1 (assign): every shell is allocated empty and given its index;    */
+/*     frames get their arenas and their cur_pc relocated via                */
+/*     (function-id, offset) against the fresh registry's bytecode table;    */
+/*   pass 2 (relink): every field/slot/property is decoded against the now-  */
+/*     complete id -> pointer map, so cycles cost nothing.                   */
+/*                                                                           */
+/* value ref (vref), one uleb 'h' + optional payload; h&3 selects the space: */
+/*   0 -> inline immediate, h>>2 is the subtag (see TT_VR_*)                 */
+/*   1 -> baseline id  (h>>2)   [by reference]                               */
+/*   2 -> private record index (h>>2)  [by value]                            */
+/* atom ref, one uleb 'a'; a&3:                                              */
+/*   0 -> predefined atom id (a>>2 < JS_ATOM_END: quickjs-atom.h is part of  */
+/*        the baseline contract, so these are process-stable)                */
+/*   1 -> private atom-table index (interned from bytes on read)             */
+/*   2 -> array-index atom (a>>2)                                            */
+/*   3 -> symbol-keyed: a vref of the symbol follows                         */
+/*                                                                           */
+/* Refcount/GC reconciliation on the read side: each record is built with    */
+/* exactly one construction reference held by the swizzle map; every link    */
+/* written during pass 2 takes its own reference (dup); when the graph is    */
+/* complete the map drops all construction references. Whatever the graph    */
+/* reaches survives with a correct count, anything unreferenced is freed --  */
+/* no leak, no double free. Open var_refs mirror get_var_ref(): the frame's  */
+/* var_refs[] slot stays weak, the ref pins its owning async state.          */
+/*---------------------------------------------------------------------------*/
+
+/* -- limits and wire constants -- */
+
+#define TT_FLOW_MAGIC     "TTFL04"
+#define TT_FLOW_MAGIC_LEN 6
+
+/* header flag bits */
+#define TT_FLOWF_MACHINE  1   /* carries a machine-parked TrampFrame chain */
+
+enum {                        /* private record kinds */
+    TT_REC_PLAIN = 1,         /* JS_CLASS_OBJECT / JS_CLASS_ERROR            */
+    TT_REC_ARRAY,             /* fast JS_CLASS_ARRAY                         */
+    TT_REC_CLOSURE,           /* bytecode function over baseline bytecode    */
+    TT_REC_GENOBJ,            /* JS_CLASS_GENERATOR wrapper                  */
+    TT_REC_STATE,             /* JSAsyncFunctionState (a flow frame owner)   */
+    TT_REC_VARREF_OPEN,       /* JSVarRef into one of the flow's frames      */
+    TT_REC_VARREF_CLOSED,     /* detached JSVarRef (owns its cell)           */
+    TT_REC_STRING,            /* immutable string, copied                    */
+    TT_REC_SYMBOL,            /* unique symbol, identity kept inside flow    */
+    TT_REC_DATAOBJ,           /* Number/String/Boolean/Symbol/Date wrapper   */
+    TT_REC_PROMISE,           /* JS_CLASS_PROMISE: state/result/reactions    */
+    TT_REC_PROMISE_FUNC,      /* resolve/reject capability function          */
+    TT_REC_PRESOLVED,         /* the capability pair's shared resolved flag  */
+    TT_REC_ASYNC_RESOLVE,     /* async-function await continuation handler   */
+    TT_REC_LAST = TT_REC_ASYNC_RESOLVE
+};
+
+enum {                        /* vref inline subtags */
+    TT_VR_UNDEFINED = 0,
+    TT_VR_NULL,
+    TT_VR_FALSE,
+    TT_VR_TRUE,
+    TT_VR_UNINITIALIZED,      /* TDZ slots on frames                          */
+    TT_VR_INT,                /* sleb                                         */
+    TT_VR_FLOAT64,            /* 8 bytes little-endian                        */
+    TT_VR_CATCH_OFFSET,       /* leb; only ever lives on operand stacks       */
+    TT_VR_SHORT_BIGINT,       /* sleb                                         */
+    TT_VR_INLINE_STR          /* string bytes; used for flattened ropes       */
+};
+
+enum {
+    TT_DELTA_PROP = 1,        /* existing plain data property: slot swap    */
+    TT_DELTA_CELL,            /* detached closure cell: slot swap           */
+    TT_DELTA_PROPX,           /* property present in exactly one view       */
+    TT_DELTA_ARRAY,           /* fast-array payload snapshot                */
+    TT_DELTA_PROMISE,         /* JSPromiseData snapshot (pointer swap)      */
+    TT_DELTA_PRESOLVED,       /* capability pair's already-resolved flag    */
+    TT_DELTA_MAP,             /* JSMapState snapshot (pointer swap)         */
+    TT_DELTA_ABUF,            /* ArrayBuffer byte image (content swap)      */
+    TT_DELTA_ODATA,           /* u.object_data (Date & friends): slot swap  */
+    TT_DELTA_DEAD             /* neutralized record (swap no-op)            */
+};
+/* dedup-index key tags, folded into the target pointer's low bits */
+enum { TT_COWK_PROPS = 1, TT_COWK_OBJ = 2, TT_COWK_CELL = 3,
+       TT_COWK_PRES = 4 };
+
+/* baseline registry entry kinds */
+enum {
+    TT_BASE_OBJ = 1,          /* JSObject*                                   */
+    TT_BASE_FUNC_BC,          /* JSFunctionBytecode* (the fn_id space)       */
+    TT_BASE_VARREF,           /* JSVarRef*, detached (module/global cells)   */
+    TT_BASE_SYM               /* JSAtomStruct* of a symbol                   */
+};
+
+/* -- tiny pointer -> uint32 open-addressed map ---------------------------- */
+
+typedef struct TTPtrMap {
+    struct TTPtrMapEnt { void *ptr; uint32_t val; } *tab; /* val = id + 1 */
+    uint32_t count, size;    /* size = power of two, 0 until first insert */
+} TTPtrMap;
+
+static uint32_t tt_ptrmap_hash(void *ptr, uint32_t size)
+{
+    uintptr_t h = (uintptr_t)ptr;
+    h ^= h >> 9; h *= 0x9E3779B1u; h ^= h >> 16;
+    return (uint32_t)h & (size - 1);
+}
+
+/* returns id+1, or 0 if absent */
+static uint32_t tt_ptrmap_get(TTPtrMap *m, void *ptr)
+{
+    uint32_t i;
+    if (!m->size)
+        return 0;
+    i = tt_ptrmap_hash(ptr, m->size);
+    while (m->tab[i].ptr) {
+        if (m->tab[i].ptr == ptr)
+            return m->tab[i].val;
+        i = (i + 1) & (m->size - 1);
+    }
+    return 0;
+}
+
+static int tt_ptrmap_put(JSContext *ctx, TTPtrMap *m, void *ptr, uint32_t id)
+{
+    uint32_t i;
+    if ((m->count + 1) * 4 >= m->size * 3) {
+        struct TTPtrMapEnt *ntab;
+        uint32_t nsize = m->size ? m->size * 2 : 16;
+        ntab = js_mallocz(ctx, sizeof(*ntab) * nsize);
+        if (!ntab)
+            return -1;
+        if (m->tab) {
+            for (i = 0; i < m->size; i++) {
+                if (m->tab[i].ptr) {
+                    uint32_t j = tt_ptrmap_hash(m->tab[i].ptr, nsize);
+                    while (ntab[j].ptr)
+                        j = (j + 1) & (nsize - 1);
+                    ntab[j] = m->tab[i];
+                }
+            }
+            js_free(ctx, m->tab);
+        }
+        m->tab = ntab;
+        m->size = nsize;
+    }
+    i = tt_ptrmap_hash(ptr, m->size);
+    while (m->tab[i].ptr) {
+        if (m->tab[i].ptr == ptr) {
+            m->tab[i].val = id + 1;
+            return 0;
+        }
+        i = (i + 1) & (m->size - 1);
+    }
+    m->tab[i].ptr = ptr;
+    m->tab[i].val = id + 1;
+    m->count++;
+    return 0;
+}
+
+static void tt_ptrmap_free(JSContext *ctx, TTPtrMap *m)
+{
+    js_free(ctx, m->tab);
+    m->tab = NULL;
+    m->size = m->count = 0;
+}
+
+static void tt_ptrmap_free_rt(JSRuntime *rt, TTPtrMap *m)
+{
+    js_free_rt(rt, m->tab);
+    m->tab = NULL;
+    m->size = m->count = 0;
+}
+
+/* -- bounded byte reader --------------------------------------------------- */
+
+typedef struct TTRdBuf {
+    const uint8_t *ptr, *end;
+    int err;
+} TTRdBuf;
+
+static uint32_t tt_rd_u8(TTRdBuf *r)
+{
+    if (r->ptr >= r->end) {
+        r->err = 1;
+        return 0;
+    }
+    return *r->ptr++;
+}
+
+static uint32_t tt_rd_leb(TTRdBuf *r)
+{
+    uint32_t v = 0;
+    int shift = 0;
+    for (;;) {
+        uint32_t b;
+        if (r->ptr >= r->end || shift >= 35) {
+            r->err = 1;
+            return 0;
+        }
+        b = *r->ptr++;
+        v |= (b & 0x7f) << shift;
+        if (!(b & 0x80))
+            return v;
+        shift += 7;
+    }
+}
+
+static int32_t tt_rd_sleb(TTRdBuf *r)
+{
+    uint32_t v = tt_rd_leb(r);
+    return (int32_t)(v >> 1) ^ -(int32_t)(v & 1);
+}
+
+static const uint8_t *tt_rd_bytes(TTRdBuf *r, size_t n)
+{
+    const uint8_t *p = r->ptr;
+    if ((size_t)(r->end - r->ptr) < n) {
+        r->err = 1;
+        return NULL;
+    }
+    r->ptr += n;
+    return p;
+}
+
+static double tt_rd_f64(TTRdBuf *r)
+{
+    const uint8_t *p = tt_rd_bytes(r, 8);
+    uint64_t u = 0;
+    double d;
+    int i;
+    if (!p)
+        return 0;
+    for (i = 7; i >= 0; i--)
+        u = (u << 8) | p[i];
+    memcpy(&d, &u, 8);
+    return d;
+}
+
+static void tt_wr_f64(DynBuf *db, double d)
+{
+    uint64_t u;
+    uint8_t b[8];
+    int i;
+    memcpy(&u, &d, 8);
+    for (i = 0; i < 8; i++)
+        b[i] = (uint8_t)(u >> (i * 8));
+    dbuf_put(db, b, 8);
+}
+
+/* -- the baseline registry ------------------------------------------------- */
+
+typedef struct TTBaseEnt {
+    void *ptr;
+    uint8_t kind;             /* TT_BASE_* */
+} TTBaseEnt;
+
+typedef struct TTFlowBaseline {
+    JSContext *ctx;           /* realm the baseline was captured in */
+    TTBaseEnt *tab;           /* id -> entry (each entry holds one reference) */
+    uint32_t count, size;
+    TTPtrMap map;             /* ptr -> id + 1 */
+    uint64_t fingerprint;     /* order/kind hash: cheap drift detector */
+} TTFlowBaseline;
+
+static void tt_baseline_fp(TTFlowBaseline *bl, uint32_t a, uint32_t b)
+{
+    uint64_t h = bl->fingerprint;
+    h ^= a + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    h ^= b + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    bl->fingerprint = h;
+}
+
+/* register 'ptr' (taking one reference according to kind); returns id or -1 */
+static int tt_baseline_add(JSContext *ctx, TTFlowBaseline *bl, void *ptr,
+                           int kind)
+{
+    uint32_t v = tt_ptrmap_get(&bl->map, ptr);
+    if (v)
+        return (int)(v - 1);
+    if (bl->count >= bl->size) {
+        uint32_t nsize = bl->size ? bl->size * 2 : 64;
+        TTBaseEnt *ntab = js_realloc(ctx, bl->tab, sizeof(*ntab) * nsize);
+        if (!ntab)
+            return -1;
+        bl->tab = ntab;
+        bl->size = nsize;
+    }
+    if (tt_ptrmap_put(ctx, &bl->map, ptr, bl->count))
+        return -1;
+    bl->tab[bl->count].ptr = ptr;
+    bl->tab[bl->count].kind = kind;
+    switch (kind) {
+    case TT_BASE_OBJ:
+        JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, ptr));
+        ((JSObject *)ptr)->tt_baseline = 1;   /* the COW birthmark */
+        tt_baseline_fp(bl, kind, ((JSObject *)ptr)->class_id);
+        break;
+    case TT_BASE_FUNC_BC: {
+        JSFunctionBytecode *b = ptr;
+        JS_DupValue(ctx, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b));
+        tt_baseline_fp(bl, kind, (uint32_t)b->byte_code_len ^
+                       ((uint32_t)b->arg_count << 20) ^
+                       ((uint32_t)b->var_count << 26));
+        break;
+    }
+    case TT_BASE_VARREF:
+        js_rc((JSVarRef *)ptr)->ref_count++;
+        ((JSVarRef *)ptr)->tt_baseline = 1;   /* the COW birthmark */
+        tt_baseline_fp(bl, kind, 0);
+        break;
+    case TT_BASE_SYM:
+        JS_DupValue(ctx, JS_MKPTR(JS_TAG_SYMBOL, ptr));
+        tt_baseline_fp(bl, kind, ((JSAtomStruct *)ptr)->len);
+        break;
+    }
+    return (int)bl->count++;
+}
+
+/* baseline capture work queue */
+typedef struct TTBaseQ {
+    struct { void *ptr; uint8_t kind; } *tab;
+    uint32_t count, size;
+} TTBaseQ;
+
+static int tt_baseq_push(JSContext *ctx, TTBaseQ *q, void *ptr, int kind)
+{
+    if (q->count >= q->size) {
+        uint32_t nsize = q->size ? q->size * 2 : 256;
+        void *ntab = js_realloc(ctx, q->tab, sizeof(*q->tab) * nsize);
+        if (!ntab)
+            return -1;
+        q->tab = ntab;
+        q->size = nsize;
+    }
+    q->tab[q->count].ptr = ptr;
+    q->tab[q->count].kind = kind;
+    q->count++;
+    return 0;
+}
+
+static int tt_baseline_queue_value(JSContext *ctx, TTFlowBaseline *bl,
+                                   TTBaseQ *q, JSValueConst v)
+{
+    switch (JS_VALUE_GET_TAG(v)) {
+    case JS_TAG_OBJECT:
+        return tt_baseq_push(ctx, q, JS_VALUE_GET_OBJ(v), TT_BASE_OBJ);
+    case JS_TAG_SYMBOL:
+        return tt_baseq_push(ctx, q, JS_VALUE_GET_PTR(v), TT_BASE_SYM);
+    case JS_TAG_FUNCTION_BYTECODE:
+        return tt_baseq_push(ctx, q, JS_VALUE_GET_PTR(v), TT_BASE_FUNC_BC);
+    default:
+        return 0;             /* primitives carry no identity */
+    }
+}
+
+/* register a function bytecode and, depth-first, every function bytecode in
+   its constant pool: fn_id order is purely structural, so both processes
+   agree on it. Non-function cpool values join the BFS queue. */
+static int tt_baseline_add_bc(JSContext *ctx, TTFlowBaseline *bl, TTBaseQ *q,
+                              JSFunctionBytecode *b)
+{
+    int i;
+    if (tt_ptrmap_get(&bl->map, b))
+        return 0;
+    if (tt_baseline_add(ctx, bl, b, TT_BASE_FUNC_BC) < 0)
+        return -1;
+    for (i = 0; i < b->cpool_count; i++) {
+        JSValueConst cv = b->cpool[i];
+        if (JS_VALUE_GET_TAG(cv) == JS_TAG_FUNCTION_BYTECODE) {
+            if (tt_baseline_add_bc(ctx, bl, q,
+                                   (JSFunctionBytecode *)JS_VALUE_GET_PTR(cv)))
+                return -1;
+        } else {
+            if (tt_baseline_queue_value(ctx, bl, q, cv))
+                return -1;
+        }
+    }
+    return 0;
+}
+
+static int tt_baseline_scan_props(JSContext *ctx, TTFlowBaseline *bl,
+                                  TTBaseQ *q, JSObject *p)
+{
+    int i;
+    /* p->shape is re-read every iteration: forcing an autoinit property may
+       clone the shape under us (prop order and indices are preserved) */
+    for (i = 0; i < p->shape->prop_count; i++) {
+        JSShapeProperty *prs = get_shape_prop(p->shape) + i;
+        JSProperty *pr;
+        if (prs->atom == JS_ATOM_NULL)
+            continue;
+        if (!__JS_AtomIsTaggedInt(prs->atom)) {
+            JSAtomStruct *ap = ctx->rt->atom_array[prs->atom];
+            if (ap->atom_type != JS_ATOM_TYPE_STRING) {
+                if (tt_baseq_push(ctx, q, ap, TT_BASE_SYM))
+                    return -1;
+            }
+        }
+        if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
+            /* lazily-installed intrinsics (method lists, fn.prototype)
+               would otherwise materialize as flow-private objects on first
+               read; force them NOW, in shape order, so both processes
+               materialize identically before ids are assigned */
+            if (JS_AutoInitProperty(ctx, p, prs->atom, &p->prop[i], prs))
+                return -1;
+            prs = get_shape_prop(p->shape) + i;
+        }
+        pr = &p->prop[i];
+        switch (prs->flags & JS_PROP_TMASK) {
+        case JS_PROP_NORMAL:
+            if (tt_baseline_queue_value(ctx, bl, q, pr->u.value))
+                return -1;
+            break;
+        case JS_PROP_GETSET:
+            if (pr->u.getset.getter &&
+                tt_baseq_push(ctx, q, pr->u.getset.getter, TT_BASE_OBJ))
+                return -1;
+            if (pr->u.getset.setter &&
+                tt_baseq_push(ctx, q, pr->u.getset.setter, TT_BASE_OBJ))
+                return -1;
+            break;
+        case JS_PROP_VARREF: {
+            JSVarRef *vr = pr->u.var_ref;
+            if (tt_baseline_add(ctx, bl, vr, TT_BASE_VARREF) < 0)
+                return -1;
+            if (tt_baseline_queue_value(ctx, bl, q, *vr->pvalue))
+                return -1;
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    return 0;
+}
+
+static int tt_baseline_scan_object(JSContext *ctx, TTFlowBaseline *bl,
+                                   TTBaseQ *q, JSObject *p)
+{
+    int i;
+    if (p->shape->proto &&
+        tt_baseq_push(ctx, q, p->shape->proto, TT_BASE_OBJ))
+        return -1;
+    switch (p->class_id) {
+    case JS_CLASS_BYTECODE_FUNCTION:
+    case JS_CLASS_GENERATOR_FUNCTION:
+    case JS_CLASS_ASYNC_FUNCTION:
+    case JS_CLASS_ASYNC_GENERATOR_FUNCTION: {
+        JSFunctionBytecode *b = p->u.func.function_bytecode;
+        if (b && tt_baseline_add_bc(ctx, bl, q, b))
+            return -1;
+        if (p->u.func.home_object &&
+            tt_baseq_push(ctx, q, p->u.func.home_object, TT_BASE_OBJ))
+            return -1;
+        if (b && p->u.func.var_refs) {
+            for (i = 0; i < b->closure_var_count; i++) {
+                JSVarRef *vr = p->u.func.var_refs[i];
+                if (!vr)
+                    continue;
+                if (!vr->is_detached) {
+                    JS_ThrowTypeError(ctx, "baseline capture: closure over a "
+                                      "live (non-quiescent) stack frame");
+                    return -1;
+                }
+                if (tt_baseline_add(ctx, bl, vr, TT_BASE_VARREF) < 0)
+                    return -1;
+                if (tt_baseline_queue_value(ctx, bl, q, *vr->pvalue))
+                    return -1;
+            }
+        }
+        break;
+    }
+    case JS_CLASS_BOUND_FUNCTION: {
+        JSBoundFunction *bf = p->u.bound_function;
+        if (bf) {
+            if (tt_baseline_queue_value(ctx, bl, q, bf->func_obj) ||
+                tt_baseline_queue_value(ctx, bl, q, bf->this_val))
+                return -1;
+            for (i = 0; i < bf->argc; i++)
+                if (tt_baseline_queue_value(ctx, bl, q, bf->argv[i]))
+                    return -1;
+        }
+        break;
+    }
+    case JS_CLASS_ARRAY:
+    case JS_CLASS_ARGUMENTS:
+        if (p->fast_array) {
+            for (i = 0; i < (int)p->u.array.count; i++)
+                if (tt_baseline_queue_value(ctx, bl, q, p->u.array.u.values[i]))
+                    return -1;
+        }
+        break;
+    case JS_CLASS_MAP:
+    case JS_CLASS_SET: {
+        JSMapState *s = p->u.map_state;
+        if (s && !s->is_weak) {
+            struct list_head *el;
+            list_for_each(el, &s->records) {
+                JSMapRecord *mr = list_entry(el, JSMapRecord, link);
+                if (tt_baseline_queue_value(ctx, bl, q, mr->key) ||
+                    tt_baseline_queue_value(ctx, bl, q, mr->value))
+                    return -1;
+            }
+        }
+        break;
+    }
+    case JS_CLASS_PROXY: {
+        JSProxyData *s = p->u.proxy_data;
+        if (s) {
+            if (tt_baseline_queue_value(ctx, bl, q, s->target) ||
+                tt_baseline_queue_value(ctx, bl, q, s->handler))
+                return -1;
+        }
+        break;
+    }
+    case JS_CLASS_NUMBER:
+    case JS_CLASS_STRING:
+    case JS_CLASS_BOOLEAN:
+    case JS_CLASS_SYMBOL:
+    case JS_CLASS_DATE:
+        if (tt_baseline_queue_value(ctx, bl, q, p->u.object_data))
+            return -1;
+        break;
+    case JS_CLASS_GLOBAL_OBJECT:
+        /* global lexicals live as VARREF props of this hidden object */
+        if (tt_baseline_queue_value(ctx, bl, q,
+                                    p->u.global_object.uninitialized_vars))
+            return -1;
+        break;
+    default:
+        /* identity registered; contents either rebuilt identically by the
+           baseline program (typed arrays, regexps, ...) or unreachable from
+           flows */
+        break;
+    }
+    return tt_baseline_scan_props(ctx, bl, q, p);
+}
+
+void JS_TTBaselineFree(JSRuntime *rt)
+{
+    TTFlowBaseline *bl = rt->tt_flow_baseline;
+    uint32_t i;
+    if (!bl)
+        return;
+    rt->tt_flow_baseline = NULL;
+    for (i = 0; i < bl->count; i++) {
+        void *ptr = bl->tab[i].ptr;
+        switch (bl->tab[i].kind) {
+        case TT_BASE_OBJ:
+            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, ptr));
+            break;
+        case TT_BASE_FUNC_BC:
+            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, ptr));
+            break;
+        case TT_BASE_VARREF:
+            free_var_ref(rt, ptr);
+            break;
+        case TT_BASE_SYM:
+            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_SYMBOL, ptr));
+            break;
+        }
+    }
+    js_free_rt(rt, bl->tab);
+    js_free_rt(rt, bl->map.tab);
+    js_free_rt(rt, bl);
+}
+
+/* Deterministic breadth-first registration from 'roots'. Both processes run
+   this over identically built heaps and obtain identical id assignments;
+   the fingerprint guards against accidental drift. */
+int JS_TTBaselineCaptureRoots(JSContext *ctx, JSValueConst *roots, int count)
+{
+    JSRuntime *rt = ctx->rt;
+    TTFlowBaseline *bl;
+    TTBaseQ q = { NULL, 0, 0 };
+    uint32_t head = 0;
+    int i, ret = -1;
+
+    JS_TTBaselineFree(rt);
+    bl = js_mallocz(ctx, sizeof(*bl));
+    if (!bl)
+        return -1;
+    bl->ctx = ctx;
+    bl->fingerprint = 0xCBF29CE484222325ull;
+    rt->tt_flow_baseline = bl;
+
+    for (i = 0; i < count; i++)
+        if (tt_baseline_queue_value(ctx, bl, &q, roots[i]))
+            goto done;
+    while (head < q.count) {
+        void *ptr = q.tab[head].ptr;
+        int kind = q.tab[head].kind;
+        head++;
+        if (tt_ptrmap_get(&bl->map, ptr))
+            continue;
+        if (kind == TT_BASE_FUNC_BC) {
+            if (tt_baseline_add_bc(ctx, bl, &q, ptr))
+                goto done;
+            continue;
+        }
+        if (tt_baseline_add(ctx, bl, ptr, kind) < 0)
+            goto done;
+        if (kind == TT_BASE_OBJ &&
+            tt_baseline_scan_object(ctx, bl, &q, ptr))
+            goto done;
+    }
+    tt_baseline_fp(bl, bl->count, 0x51ab);
+    ret = 0;
+done:
+    js_free(ctx, q.tab);
+    if (ret)
+        JS_TTBaselineFree(rt);
+    return ret;
+}
+
+int JS_TTBaselineCapture(JSContext *ctx)
+{
+    JSValueConst root = ctx->global_obj;
+    return JS_TTBaselineCaptureRoots(ctx, &root, 1);
+}
+
+uint32_t JS_TTBaselineCount(JSRuntime *rt)
+{
+    return rt->tt_flow_baseline ? rt->tt_flow_baseline->count : 0;
+}
+
+uint64_t JS_TTBaselineFingerprint(JSRuntime *rt)
+{
+    return rt->tt_flow_baseline ? rt->tt_flow_baseline->fingerprint : 0;
+}
+
+/* -- the per-flow COW delta ------------------------------------------------ */
+
+/* One first-write record: 'target' is either a property slot (obj, atom) or
+   a closure cell (a detached JSVarRef). 'saved' always owns the value that
+   is NOT currently installed in the target:
+     checked-in  (flow view live in the heap): saved = the baseline pre-image
+     checked-out (flow parked):                saved = the flow's view
+   Check-in and check-out are pure swaps, so moving a flow between states --
+   and between processes -- is refcount-neutral by construction. */
+typedef struct TTFlowDeltaRec {
+    uint8_t kind;             /* TT_DELTA_* */
+    uint8_t holds;            /* PROPX: record holds the property value;
+                                 PRESOLVED: the displaced flag */
+    uint8_t prop_flags;       /* PROPX: shape flags for re-adding */
+    uint32_t next_prop;       /* +1 chain of this object's PROP/PROPX recs */
+    JSValue obj;              /* owned target object (undefined for CELL)   */
+    JSAtom atom;              /* PROP/PROPX: owned property key             */
+    JSVarRef *vr;             /* CELL: owned reference to the cell          */
+    JSValue saved;            /* owned: the displaced value (see above)     */
+    /* ARRAY: the displaced fast-array payload */
+    JSValue *avec;
+    uint32_t acount, asize;
+    JSValue alen;             /* the displaced `length` slot value */
+    /* PROMISE: JSPromiseData*; MAP: JSMapState*; ABUF: byte image */
+    void *snap;
+    uint32_t snap_len;
+} TTFlowDeltaRec;
+
+typedef struct TTFlowDelta {
+    TTFlowDeltaRec *tab;
+    uint32_t count, size;
+    BOOL checked_in;          /* TRUE while the flow's view is installed    */
+    /* O(1) capture dedup: (target ptr | TT_COWK_* tag) -> rec idx + 1.
+       PROPS entries head a next_prop chain of that object's records. */
+    TTPtrMap index;
+} TTFlowDelta;
+
+/* free a promise-payload snapshot (the shape js_promise_finalizer frees) */
+static void tt_snap_promise_free(JSRuntime *rt, JSPromiseData *pd)
+{
+    struct list_head *el, *el1;
+    int i;
+    for (i = 0; i < 2; i++) {
+        list_for_each_safe(el, el1, &pd->promise_reactions[i]) {
+            JSPromiseReactionData *rd =
+                list_entry(el, JSPromiseReactionData, link);
+            list_del(&rd->link);
+            JS_FreeValueRT(rt, rd->resolving_funcs[0]);
+            JS_FreeValueRT(rt, rd->resolving_funcs[1]);
+            JS_FreeValueRT(rt, rd->handler);
+            js_free_rt(rt, rd);
+        }
+    }
+    JS_FreeValueRT(rt, pd->promise_result);
+    js_free_rt(rt, pd);
+}
+
+static void tt_snap_promise_mark(JSRuntime *rt, JSPromiseData *pd,
+                                 JS_MarkFunc *mark_func)
+{
+    struct list_head *el;
+    int i;
+    for (i = 0; i < 2; i++) {
+        list_for_each(el, &pd->promise_reactions[i]) {
+            JSPromiseReactionData *rd =
+                list_entry(el, JSPromiseReactionData, link);
+            JS_MarkValue(rt, rd->resolving_funcs[0], mark_func);
+            JS_MarkValue(rt, rd->resolving_funcs[1], mark_func);
+            JS_MarkValue(rt, rd->handler, mark_func);
+        }
+    }
+    JS_MarkValue(rt, pd->promise_result, mark_func);
+}
+
+/* free a map-payload snapshot (non-weak records only ever land here) */
+static void tt_snap_map_free(JSRuntime *rt, JSMapState *ms)
+{
+    struct list_head *el, *el1;
+    list_for_each_safe(el, el1, &ms->records) {
+        JSMapRecord *mr = list_entry(el, JSMapRecord, link);
+        list_del(&mr->link);
+        JS_FreeValueRT(rt, mr->key);
+        JS_FreeValueRT(rt, mr->value);
+        js_free_rt(rt, mr);
+    }
+    js_free_rt(rt, ms->hash_table);
+    js_free_rt(rt, ms);
+}
+
+static void tt_snap_map_mark(JSRuntime *rt, JSMapState *ms,
+                             JS_MarkFunc *mark_func)
+{
+    struct list_head *el;
+    list_for_each(el, &ms->records) {
+        JSMapRecord *mr = list_entry(el, JSMapRecord, link);
+        JS_MarkValue(rt, mr->key, mark_func);
+        JS_MarkValue(rt, mr->value, mark_func);
+    }
+}
+
+/* clone a map payload: the snapshot owns duplicated keys/values in a
+   rebuilt hash (deleted-pending records are skipped -- value-equal view) */
+static JSMapState *tt_snap_map_clone(JSContext *ctx, JSMapState *src)
+{
+    JSMapState *ms = js_mallocz(ctx, sizeof(*ms));
+    struct list_head *el;
+    if (!ms)
+        return NULL;
+    init_list_head(&ms->records);
+    ms->hash_bits = src->hash_bits;
+    ms->hash_size = src->hash_size;
+    ms->record_count_threshold = src->record_count_threshold;
+    ms->hash_table = js_mallocz(ctx, sizeof(JSMapRecord *) * ms->hash_size);
+    if (!ms->hash_table) {
+        js_free(ctx, ms);
+        return NULL;
+    }
+    list_for_each(el, &src->records) {
+        JSMapRecord *mr = list_entry(el, JSMapRecord, link);
+        JSMapRecord *nr;
+        uint32_t h;
+        if (mr->empty)
+            continue;
+        nr = js_mallocz(ctx, sizeof(*nr));
+        if (!nr) {
+            tt_snap_map_free(ctx->rt, ms);
+            return NULL;
+        }
+        nr->ref_count = 1;
+        nr->key = JS_DupValue(ctx, mr->key);
+        nr->value = JS_DupValue(ctx, mr->value);
+        list_add_tail(&nr->link, &ms->records);
+        h = map_hash_key(nr->key, ms->hash_bits);
+        nr->hash_next = ms->hash_table[h];
+        ms->hash_table[h] = nr;
+        ms->record_count++;
+    }
+    return ms;
+}
+
+static void tt_flow_delta_free(JSRuntime *rt, TTFlowDelta *d)
+{
+    uint32_t i, k;
+    if (!d)
+        return;
+    for (i = 0; i < d->count; i++) {
+        TTFlowDeltaRec *rec = &d->tab[i];
+        JS_FreeValueRT(rt, rec->saved);
+        JS_FreeValueRT(rt, rec->obj);
+        if (rec->atom != JS_ATOM_NULL)
+            JS_FreeAtomRT(rt, rec->atom);
+        if (rec->vr)
+            free_var_ref(rt, rec->vr);
+        switch (rec->kind) {
+        case TT_DELTA_ARRAY:
+            for (k = 0; k < rec->acount; k++)
+                JS_FreeValueRT(rt, rec->avec[k]);
+            js_free_rt(rt, rec->avec);
+            JS_FreeValueRT(rt, rec->alen);
+            break;
+        case TT_DELTA_PROMISE:
+            if (rec->snap)
+                tt_snap_promise_free(rt, rec->snap);
+            break;
+        case TT_DELTA_MAP:
+            if (rec->snap)
+                tt_snap_map_free(rt, rec->snap);
+            break;
+        case TT_DELTA_ABUF:
+            js_free_rt(rt, rec->snap);
+            break;
+        }
+    }
+    tt_ptrmap_free_rt(rt, &d->index);
+    js_free_rt(rt, d->tab);
+    js_free_rt(rt, d);
+}
+
+static void tt_flow_delta_mark(JSRuntime *rt, TTFlowDelta *d,
+                               JS_MarkFunc *mark_func)
+{
+    uint32_t i, k;
+    for (i = 0; i < d->count; i++) {
+        TTFlowDeltaRec *rec = &d->tab[i];
+        JS_MarkValue(rt, rec->saved, mark_func);
+        JS_MarkValue(rt, rec->obj, mark_func);
+        if (rec->vr)
+            mark_func(rt, &rec->vr->header);
+        switch (rec->kind) {
+        case TT_DELTA_ARRAY:
+            for (k = 0; k < rec->acount; k++)
+                JS_MarkValue(rt, rec->avec[k], mark_func);
+            JS_MarkValue(rt, rec->alen, mark_func);
+            break;
+        case TT_DELTA_PROMISE:
+            if (rec->snap)
+                tt_snap_promise_mark(rt, rec->snap, mark_func);
+            break;
+        case TT_DELTA_MAP:
+            if (rec->snap)
+                tt_snap_map_mark(rt, rec->snap, mark_func);
+            break;
+        }
+    }
+}
+
+static TTFlowDelta *tt_flow_delta_get(JSContext *ctx, JSAsyncFunctionState *st,
+                                      BOOL create)
+{
+    if (!st->tt_delta && create) {
+        TTFlowDelta *d = js_mallocz(ctx, sizeof(*d));
+        if (!d)
+            return NULL;
+        d->checked_in = TRUE;
+        st->tt_delta = d;
+    }
+    return st->tt_delta;
+}
+
+static TTFlowDeltaRec *tt_flow_delta_push(JSContext *ctx, TTFlowDelta *d)
+{
+    if (d->count >= d->size) {
+        uint32_t nsize = d->size ? d->size * 2 : 8;
+        TTFlowDeltaRec *ntab = js_realloc(ctx, d->tab, sizeof(*ntab) * nsize);
+        if (!ntab)
+            return NULL;
+        d->tab = ntab;
+        d->size = nsize;
+    }
+    return &d->tab[d->count++];
+}
+
+/* resolve the live cell a record targets; NULL if the target vanished */
+static JSValue *tt_flow_delta_cell(TTFlowDeltaRec *rec)
+{
+    if (rec->kind == TT_DELTA_CELL)
+        return rec->vr->pvalue;
+    else {
+        JSProperty *pr;
+        JSShapeProperty *prs;
+        JSObject *p = JS_VALUE_GET_OBJ(rec->obj);
+        prs = find_own_property(&pr, p, rec->atom);
+        if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+            return NULL;
+        return &pr->u.value;
+    }
+}
+
+/* exchange one record's two views (checkout <-> checkin are the same
+   involution, applied newest-first / oldest-first). Runs with the COW
+   register CLEARED, so the toggles below never re-capture. */
+static int tt_flow_delta_swap_rec(JSContext *ctx, TTFlowDeltaRec *rec)
+{
+    switch (rec->kind) {
+    case TT_DELTA_PROP:
+    case TT_DELTA_CELL: {
+        JSValue *cell = tt_flow_delta_cell(rec);
+        JSValue tmp;
+        if (!cell)
+            goto vanished;
+        tmp = *cell;
+        *cell = rec->saved;
+        rec->saved = tmp;
+        return 0;
+    }
+    case TT_DELTA_PROPX: {
+        JSObject *p = JS_VALUE_GET_OBJ(rec->obj);
+        JSProperty *pr;
+        JSShapeProperty *prs;
+        prs = find_own_property(&pr, p, rec->atom);
+        if (prs && (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+            goto vanished;
+        if (rec->holds && prs) {
+            /* both views hold the property: a plain slot exchange */
+            JSValue tmp = pr->u.value;
+            pr->u.value = rec->saved;
+            rec->saved = tmp;
+        } else if (rec->holds) {
+            pr = add_property(ctx, p, rec->atom, rec->prop_flags);
+            if (!pr)
+                return -1;
+            pr->u.value = rec->saved;
+            rec->saved = JS_UNDEFINED;
+            rec->holds = FALSE;
+        } else if (prs) {
+            rec->prop_flags = prs->flags & 0x3f;
+            rec->saved = pr->u.value;
+            pr->u.value = JS_UNDEFINED;
+            if (delete_property(ctx, p, rec->atom) <= 0) {
+                pr = NULL;
+                prs = find_own_property(&pr, p, rec->atom);
+                if (prs)
+                    pr->u.value = rec->saved;   /* roll back */
+                rec->saved = JS_UNDEFINED;
+                goto vanished;
+            }
+            rec->holds = TRUE;
+        } else {
+            goto vanished;
+        }
+        return 0;
+    }
+    case TT_DELTA_ARRAY: {
+        JSObject *p = JS_VALUE_GET_OBJ(rec->obj);
+        JSProperty *pr;
+        JSShapeProperty *prs;
+        JSValue *tv;
+        uint32_t tc, ts;
+        if (!p->fast_array)
+            goto vanished;      /* converted under the flow: unsupported */
+        tv = p->u.array.u.values;
+        tc = p->u.array.count;
+        ts = p->u.array.u1.size;
+        p->u.array.u.values = rec->avec;
+        p->u.array.count = rec->acount;
+        p->u.array.u1.size = rec->asize;
+        rec->avec = tv;
+        rec->acount = tc;
+        rec->asize = ts;
+        prs = find_own_property(&pr, p, JS_ATOM_length);
+        if (prs) {
+            JSValue tl = pr->u.value;
+            pr->u.value = rec->alen;
+            rec->alen = tl;
+        }
+        return 0;
+    }
+    case TT_DELTA_PROMISE:
+    case TT_DELTA_MAP: {
+        JSObject *p = JS_VALUE_GET_OBJ(rec->obj);
+        void *cur = p->u.opaque;
+        if (!cur || !rec->snap)
+            goto vanished;
+        p->u.opaque = rec->snap;
+        rec->snap = cur;
+        return 0;
+    }
+    case TT_DELTA_PRESOLVED: {
+        JSObject *fp = JS_VALUE_GET_OBJ(rec->obj);
+        JSPromiseFunctionData *fd = fp->u.promise_function_data;
+        uint8_t t;
+        if (!fd)
+            goto vanished;
+        t = fd->presolved->already_resolved ? 1 : 0;
+        fd->presolved->already_resolved = rec->holds;
+        rec->holds = t;
+        return 0;
+    }
+    case TT_DELTA_ABUF: {
+        JSObject *p = JS_VALUE_GET_OBJ(rec->obj);
+        JSArrayBuffer *ab = p->u.array_buffer;
+        uint8_t *a, *b, tmpb;
+        uint32_t k;
+        if (!ab || ab->detached || !ab->data ||
+            (uint32_t)ab->byte_length != rec->snap_len)
+            goto vanished;
+        a = ab->data;
+        b = rec->snap;
+        for (k = 0; k < rec->snap_len; k++) {
+            tmpb = a[k];
+            a[k] = b[k];
+            b[k] = tmpb;
+        }
+        return 0;
+    }
+    case TT_DELTA_ODATA: {
+        JSObject *p = JS_VALUE_GET_OBJ(rec->obj);
+        JSValue tmp = p->u.object_data;
+        p->u.object_data = rec->saved;
+        rec->saved = tmp;
+        return 0;
+    }
+    case TT_DELTA_DEAD:
+        return 0;
+    }
+vanished:
+    JS_ThrowTypeError(ctx, "delta target vanished");
+    return -1;
+}
+
+/* register a fresh record in the dedup index (PROP-family records chain
+   per object; payload records key directly) */
+static int tt_flow_delta_index_rec(JSContext *ctx, TTFlowDelta *d,
+                                   uint32_t idx)
+{
+    TTFlowDeltaRec *rec = &d->tab[idx];
+    void *key;
+    uint32_t head;
+    switch (rec->kind) {
+    case TT_DELTA_PROP:
+    case TT_DELTA_PROPX:
+        key = (void *)((uintptr_t)JS_VALUE_GET_PTR(rec->obj) |
+                       TT_COWK_PROPS);
+        head = tt_ptrmap_get(&d->index, key);
+        rec->next_prop = head;      /* idx+1 of the previous head, 0 none */
+        return tt_ptrmap_put(ctx, &d->index, key, idx);  /* re-point head */
+    case TT_DELTA_CELL:
+        key = (void *)((uintptr_t)rec->vr | TT_COWK_CELL);
+        return tt_ptrmap_put(ctx, &d->index, key, idx);
+    case TT_DELTA_PRESOLVED:
+        key = (void *)((uintptr_t)JS_VALUE_GET_PTR(rec->obj) | TT_COWK_PRES);
+        return tt_ptrmap_put(ctx, &d->index, key, idx);
+    case TT_DELTA_DEAD:
+        return 0;
+    default:
+        key = (void *)((uintptr_t)JS_VALUE_GET_PTR(rec->obj) | TT_COWK_OBJ);
+        return tt_ptrmap_put(ctx, &d->index, key, idx);
+    }
+}
+
+/* -- automatic COW capture -------------------------------------------------
+   The engine's mutation chokepoints call these (behind TT_COW_HIT: the
+   checked-in-flow register plus the target's baseline birthmark) BEFORE
+   mutating a shared target. First write to a target allocates its record;
+   every later write is an index hit and allocates nothing. Flow-private
+   targets never get here: their birthmark bit is clear. */
+
+static uint32_t tt_flow_delta_find_prop(TTFlowDelta *d, JSObject *p,
+                                        JSAtom atom);
+
+static TTFlowDelta *tt_cow_delta(JSContext *ctx)
+{
+    return tt_flow_delta_get(ctx, ctx->rt->tt_cow_flow, TRUE);
+}
+
+static TTFlowDeltaRec *tt_cow_push(JSContext *ctx, TTFlowDelta *d,
+                                   uint8_t kind, JSObject *p)
+{
+    TTFlowDeltaRec *rec = tt_flow_delta_push(ctx, d);
+    if (!rec)
+        return NULL;
+    memset(rec, 0, sizeof(*rec));
+    rec->kind = kind;
+    rec->obj = p ? JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p))
+                 : JS_UNDEFINED;
+    rec->atom = JS_ATOM_NULL;
+    rec->saved = JS_UNDEFINED;
+    rec->alen = JS_UNDEFINED;
+    if (tt_flow_delta_index_rec(ctx, d, d->count - 1)) {
+        /* the record stays (freed with the delta) but unindexed capture
+           would miss dedup -- treat as OOM */
+        return NULL;
+    }
+    return rec;
+}
+
+/* an existing plain data property is about to be overwritten */
+static no_inline int tt_cow_prop(JSContext *ctx, JSObject *p, JSAtom atom)
+{
+    TTFlowDelta *d = tt_cow_delta(ctx);
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    TTFlowDeltaRec *rec;
+    if (!d)
+        return -1;
+    if (tt_flow_delta_find_prop(d, p, atom) != UINT32_MAX)
+        return 0;             /* already captured: nothing to do */
+    prs = find_own_property(&pr, p, atom);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+        return 0;             /* not a plain slot: nothing to snapshot */
+    rec = tt_cow_push(ctx, d, TT_DELTA_PROP, p);
+    if (!rec)
+        return -1;
+    rec->atom = JS_DupAtom(ctx, atom);
+    rec->saved = JS_DupValue(ctx, pr->u.value);
+    return 0;
+}
+
+/* a NEW property is about to be added */
+static no_inline int tt_cow_add(JSContext *ctx, JSObject *p, JSAtom atom,
+                                int prop_flags)
+{
+    TTFlowDelta *d = tt_cow_delta(ctx);
+    TTFlowDeltaRec *rec;
+    uint32_t idx;
+    if (!d)
+        return -1;
+    idx = tt_flow_delta_find_prop(d, p, atom);
+    if (idx != UINT32_MAX) {
+        rec = &d->tab[idx];
+        if (rec->kind == TT_DELTA_DEAD) {
+            /* flow deleted its own earlier add; revive as an add */
+            rec->kind = TT_DELTA_PROPX;
+            rec->holds = FALSE;
+            rec->prop_flags = prop_flags & 0x3f;
+        }
+        return 0;             /* PROPX toggle already models presence */
+    }
+    rec = tt_cow_push(ctx, d, TT_DELTA_PROPX, p);
+    if (!rec)
+        return -1;
+    rec->atom = JS_DupAtom(ctx, atom);
+    rec->holds = FALSE;       /* record empty: baseline view lacks it */
+    rec->prop_flags = prop_flags & 0x3f;
+    return 0;
+}
+
+/* an existing property is about to be deleted */
+static no_inline int tt_cow_del(JSContext *ctx, JSObject *p, JSAtom atom)
+{
+    TTFlowDelta *d = tt_cow_delta(ctx);
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    TTFlowDeltaRec *rec;
+    uint32_t idx;
+    if (!d)
+        return -1;
+    prs = find_own_property(&pr, p, atom);
+    if (!prs)
+        return 0;             /* deleting nothing */
+    idx = tt_flow_delta_find_prop(d, p, atom);
+    if (idx != UINT32_MAX) {
+        rec = &d->tab[idx];
+        if (rec->kind == TT_DELTA_PROP) {
+            /* written earlier, deleted now: upgrade the slot record to a
+               presence toggle -- it already holds the baseline pre-image */
+            rec->kind = TT_DELTA_PROPX;
+            rec->holds = TRUE;
+            rec->prop_flags = prs->flags & 0x3f;
+        } else if (rec->kind == TT_DELTA_PROPX && !rec->holds) {
+            /* flow added it, flow deletes it: both views agree again */
+            rec->kind = TT_DELTA_DEAD;
+        }
+        return 0;
+    }
+    if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL) {
+        JS_ThrowTypeError(ctx, "flow COW: deleting a baseline accessor/"
+                          "reference property is not capturable");
+        return -1;
+    }
+    rec = tt_cow_push(ctx, d, TT_DELTA_PROPX, p);
+    if (!rec)
+        return -1;
+    rec->atom = JS_DupAtom(ctx, atom);
+    rec->holds = TRUE;        /* record keeps the baseline pre-image */
+    rec->prop_flags = prs->flags & 0x3f;
+    rec->saved = JS_DupValue(ctx, pr->u.value);
+    return 0;
+}
+
+/* a fast array's payload (elements / count / length) is about to change */
+static no_inline int tt_cow_array(JSContext *ctx, JSObject *p)
+{
+    TTFlowDelta *d = tt_cow_delta(ctx);
+    TTFlowDeltaRec *rec;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    uint32_t k;
+    if (!d)
+        return -1;
+    if (tt_ptrmap_get(&d->index, (void *)((uintptr_t)p | TT_COWK_OBJ)))
+        return 0;
+    if (!p->fast_array) {
+        JS_ThrowTypeError(ctx, "flow COW: baseline array left the fast "
+                          "representation");
+        return -1;
+    }
+    rec = tt_cow_push(ctx, d, TT_DELTA_ARRAY, p);
+    if (!rec)
+        return -1;
+    rec->acount = p->u.array.count;
+    rec->asize = p->u.array.count;
+    if (rec->acount) {
+        rec->avec = js_malloc(ctx, sizeof(JSValue) * rec->acount);
+        if (!rec->avec) {
+            rec->acount = rec->asize = 0;
+            return -1;
+        }
+        for (k = 0; k < rec->acount; k++)
+            rec->avec[k] = JS_DupValue(ctx, p->u.array.u.values[k]);
+    }
+    prs = find_own_property(&pr, p, JS_ATOM_length);
+    if (prs)
+        rec->alen = JS_DupValue(ctx, pr->u.value);
+    return 0;
+}
+
+/* a baseline closure cell is about to be written through */
+static no_inline int tt_cow_cellw(JSContext *ctx, struct JSVarRef *vr)
+{
+    TTFlowDelta *d = tt_cow_delta(ctx);
+    TTFlowDeltaRec *rec;
+    if (!d)
+        return -1;
+    if (tt_ptrmap_get(&d->index, (void *)((uintptr_t)vr | TT_COWK_CELL)))
+        return 0;
+    rec = tt_cow_push(ctx, d, TT_DELTA_CELL, NULL);
+    if (!rec)
+        return -1;
+    rec->vr = vr;
+    js_rc(vr)->ref_count++;
+    rec->saved = JS_DupValue(ctx, *vr->pvalue);
+    return 0;
+}
+
+/* a baseline promise's payload (reactions / state / result) will change */
+static no_inline int tt_cow_promise(JSContext *ctx, JSObject *p)
+{
+    TTFlowDelta *d = tt_cow_delta(ctx);
+    TTFlowDeltaRec *rec;
+    JSPromiseData *spd, *pd;
+    struct list_head *el;
+    int i;
+    if (!d)
+        return -1;
+    if (tt_ptrmap_get(&d->index, (void *)((uintptr_t)p | TT_COWK_OBJ)))
+        return 0;
+    spd = JS_GetOpaque(JS_MKPTR(JS_TAG_OBJECT, p), JS_CLASS_PROMISE);
+    if (!spd)
+        return 0;
+    pd = js_mallocz(ctx, sizeof(*pd));
+    if (!pd)
+        return -1;
+    pd->promise_state = spd->promise_state;
+    pd->is_handled = spd->is_handled;
+    init_list_head(&pd->promise_reactions[0]);
+    init_list_head(&pd->promise_reactions[1]);
+    pd->promise_result = JS_DupValue(ctx, spd->promise_result);
+    for (i = 0; i < 2; i++) {
+        list_for_each(el, &spd->promise_reactions[i]) {
+            JSPromiseReactionData *srd =
+                list_entry(el, JSPromiseReactionData, link);
+            JSPromiseReactionData *drd = js_mallocz(ctx, sizeof(*drd));
+            int m;
+            if (!drd) {
+                tt_snap_promise_free(ctx->rt, pd);
+                return -1;
+            }
+            for (m = 0; m < 2; m++)
+                drd->resolving_funcs[m] =
+                    JS_DupValue(ctx, srd->resolving_funcs[m]);
+            drd->handler = JS_DupValue(ctx, srd->handler);
+            list_add_tail(&drd->link, &pd->promise_reactions[i]);
+        }
+    }
+    rec = tt_cow_push(ctx, d, TT_DELTA_PROMISE, p);
+    if (!rec) {
+        tt_snap_promise_free(ctx->rt, pd);
+        return -1;
+    }
+    rec->snap = pd;
+    return 0;
+}
+
+/* a baseline capability's shared already-resolved flag will flip */
+static no_inline int tt_cow_presolved(JSContext *ctx, JSObject *fp)
+{
+    TTFlowDelta *d = tt_cow_delta(ctx);
+    TTFlowDeltaRec *rec;
+    JSPromiseFunctionData *fd = fp->u.promise_function_data;
+    if (!d)
+        return -1;
+    if (!fd)
+        return 0;
+    if (tt_ptrmap_get(&d->index, (void *)((uintptr_t)fp | TT_COWK_PRES)))
+        return 0;
+    rec = tt_cow_push(ctx, d, TT_DELTA_PRESOLVED, fp);
+    if (!rec)
+        return -1;
+    rec->holds = fd->presolved->already_resolved ? 1 : 0;
+    return 0;
+}
+
+/* a baseline Map/Set's contents will change */
+static no_inline int tt_cow_map(JSContext *ctx, JSObject *p)
+{
+    TTFlowDelta *d = tt_cow_delta(ctx);
+    TTFlowDeltaRec *rec;
+    JSMapState *ms = p->u.map_state, *snap;
+    if (!d)
+        return -1;
+    if (!ms)
+        return 0;
+    if (tt_ptrmap_get(&d->index, (void *)((uintptr_t)p | TT_COWK_OBJ)))
+        return 0;
+    if (ms->is_weak) {
+        JS_ThrowTypeError(ctx, "flow COW: baseline WeakMap/WeakSet "
+                          "mutation is not capturable");
+        return -1;
+    }
+    snap = tt_snap_map_clone(ctx, ms);
+    if (!snap)
+        return -1;
+    rec = tt_cow_push(ctx, d, TT_DELTA_MAP, p);
+    if (!rec) {
+        tt_snap_map_free(ctx->rt, snap);
+        return -1;
+    }
+    rec->snap = snap;
+    return 0;
+}
+
+/* a baseline ArrayBuffer's bytes will change (typed array / DataView) */
+static no_inline int tt_cow_abuf(JSContext *ctx, JSObject *p)
+{
+    TTFlowDelta *d = tt_cow_delta(ctx);
+    TTFlowDeltaRec *rec;
+    JSArrayBuffer *ab = p->u.array_buffer;
+    if (!d)
+        return -1;
+    if (!ab || ab->detached || !ab->data)
+        return 0;             /* the write itself will throw */
+    if (tt_ptrmap_get(&d->index, (void *)((uintptr_t)p | TT_COWK_OBJ)))
+        return 0;
+    if (ab->shared) {
+        JS_ThrowTypeError(ctx, "flow COW: baseline SharedArrayBuffer "
+                          "mutation is not capturable");
+        return -1;
+    }
+    rec = tt_cow_push(ctx, d, TT_DELTA_ABUF, p);
+    if (!rec)
+        return -1;
+    rec->snap = js_malloc(ctx, ab->byte_length ? ab->byte_length : 1);
+    if (!rec->snap)
+        return -1;
+    rec->snap_len = ab->byte_length;
+    memcpy(rec->snap, ab->data, ab->byte_length);
+    return 0;
+}
+
+/* a typed-array/DataView write: capture the BACKING BUFFER (the mutated
+   storage), whichever view reached it -- a private view over a baseline
+   buffer must still capture */
+static no_inline int tt_cow_ta(JSContext *ctx, JSObject *p)
+{
+    JSTypedArray *ta;
+    if (ctx->rt->tt_cow_flow == NULL)
+        return 0;
+    if (p->class_id < JS_CLASS_UINT8C_ARRAY ||
+        p->class_id > JS_CLASS_DATAVIEW)
+        return 0;
+    ta = p->u.typed_array;
+    if (!ta || !ta->buffer || !ta->buffer->tt_baseline)
+        return 0;
+    return tt_cow_abuf(ctx, ta->buffer);
+}
+
+/* a baseline wrapper's u.object_data (Date time value, ...) will change */
+static no_inline int tt_cow_odata(JSContext *ctx, JSObject *p)
+{
+    TTFlowDelta *d = tt_cow_delta(ctx);
+    TTFlowDeltaRec *rec;
+    if (!d)
+        return -1;
+    if (tt_ptrmap_get(&d->index, (void *)((uintptr_t)p | TT_COWK_OBJ)))
+        return 0;
+    rec = tt_cow_push(ctx, d, TT_DELTA_ODATA, p);
+    if (!rec)
+        return -1;
+    rec->saved = JS_DupValue(ctx, p->u.object_data);
+    return 0;
+}
+
+/* find this object's PROP/PROPX record for 'atom'; UINT32_MAX if none */
+static uint32_t tt_flow_delta_find_prop(TTFlowDelta *d, JSObject *p,
+                                        JSAtom atom)
+{
+    void *key = (void *)((uintptr_t)p | TT_COWK_PROPS);
+    uint32_t i = tt_ptrmap_get(&d->index, key);
+    while (i) {
+        TTFlowDeltaRec *rec = &d->tab[i - 1];
+        if (rec->atom == atom)
+            return i - 1;
+        i = rec->next_prop;
+    }
+    return UINT32_MAX;
+}
+
+static BOOL tt_flow_base_is_parked(JSRuntime *rt, JSAsyncFunctionState *st);
+
+/* -- the per-flow pending job queue ---------------------------------------
+   A reaction, a microtask, an async resume is a JSJobEntry. While a flow is
+   CHECKED IN, the runtime's live job list is by convention that flow's
+   queue: new jobs its promises spawn land there and the pump drains them.
+   CHECKOUT captures the live list's entries into the flow (they ride its
+   delta discipline, serialize, fork); CHECKIN splices them back. Exactly
+   one flow's jobs are in flight at a time -- the same single-writer rule
+   the delta swaps already impose. */
+typedef struct TTFlowJobs {
+    struct list_head jobs;    /* JSJobEntry.link, oldest first */
+    int count;
+} TTFlowJobs;
+
+static void tt_flow_jobs_free(JSRuntime *rt, struct TTFlowJobs *q)
+{
+    struct list_head *el, *el1;
+    list_for_each_safe(el, el1, &q->jobs) {
+        JSJobEntry *e = list_entry(el, JSJobEntry, link);
+        int i;
+        list_del(&e->link);
+        for (i = 0; i < e->argc; i++)
+            JS_FreeValueRT(rt, e->argv[i]);
+        JS_FreeContext(e->realm);
+        js_free_rt(rt, e);
+    }
+    js_free_rt(rt, q);
+}
+
+static void tt_flow_jobs_mark(JSRuntime *rt, struct TTFlowJobs *q,
+                              JS_MarkFunc *mark_func)
+{
+    struct list_head *el;
+    list_for_each(el, &q->jobs) {
+        JSJobEntry *e = list_entry(el, JSJobEntry, link);
+        int i;
+        for (i = 0; i < e->argc; i++)
+            JS_MarkValue(rt, e->argv[i], mark_func);
+        mark_func(rt, &e->realm->header);
+    }
+}
+
+/* -- async flows: the result promise as the flow handle ------------------- */
+
+static JSAsyncFunctionState *tt_promise_flow_state(JSValueConst promise)
+{
+    JSPromiseData *pd = JS_GetOpaque(promise, JS_CLASS_PROMISE);
+    return pd ? pd->tt_flow_state : NULL;
+}
+
+static void tt_async_flow_link(JSContext *ctx, JSValueConst promise,
+                               JSAsyncFunctionState *s)
+{
+    JSPromiseData *pd = JS_GetOpaque(promise, JS_CLASS_PROMISE);
+    if (pd && !pd->tt_flow_state) {
+        pd->tt_flow_state = s;
+        js_rc(s)->ref_count++;
+    }
+}
+
+/* resolve a state's own result promise through its resolve capability
+   (undefined / a foreign capability class simply means no link) */
+static JSPromiseData *tt_async_flow_result_pd(JSAsyncFunctionState *s)
+{
+    JSObject *fp;
+    JSPromiseFunctionData *fd;
+    if (JS_VALUE_GET_TAG(s->resolving_funcs[0]) != JS_TAG_OBJECT)
+        return NULL;
+    fp = JS_VALUE_GET_OBJ(s->resolving_funcs[0]);
+    if (fp->class_id != JS_CLASS_PROMISE_RESOLVE_FUNCTION)
+        return NULL;
+    fd = fp->u.promise_function_data;
+    if (!fd)
+        return NULL;
+    return JS_GetOpaque(fd->promise, JS_CLASS_PROMISE);
+}
+
+static void tt_async_flow_unlink(JSContext *ctx, JSAsyncFunctionState *s)
+{
+    JSPromiseData *pd = tt_async_flow_result_pd(s);
+    if (pd && pd->tt_flow_state == s) {
+        pd->tt_flow_state = NULL;
+        async_func_free(ctx->rt, s);
+    }
+}
+
+/* rebuilt/cloned async states re-establish the handle link on their fresh
+   result promise (the deserializer's and the fork's post-pass) */
+static void tt_async_flow_link_from_state(JSContext *ctx,
+                                          JSAsyncFunctionState *s)
+{
+    JSPromiseData *pd;
+    if (s->is_completed)
+        return;
+    pd = tt_async_flow_result_pd(s);
+    if (pd && !pd->tt_flow_state) {
+        pd->tt_flow_state = s;
+        js_rc(s)->ref_count++;
+    }
+}
+
+/* flow handle (generator object) -> its suspended base state. A flow is
+   serializable/delta-addressable while suspended at a yield OR while it is
+   the machine-parked chain (EXECUTING with the park running through its
+   frame). */
+static JSAsyncFunctionState *tt_flow_state_of(JSContext *ctx, JSValueConst flow)
+{
+    JSGeneratorData *gd;
+    if (JS_VALUE_GET_TAG(flow) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(flow)->class_id == JS_CLASS_PROMISE) {
+        /* an async-function flow, addressed by its result promise */
+        JSAsyncFunctionState *st = tt_promise_flow_state(flow);
+        if (!st || st->is_completed ||
+            (st->frame.cur_sp == NULL &&
+             !tt_flow_base_is_parked(ctx->rt, st))) {
+            JS_ThrowTypeError(ctx, "promise is not an await-suspended flow");
+            return NULL;
+        }
+        return st;
+    }
+    if (JS_VALUE_GET_TAG(flow) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_OBJ(flow)->class_id != JS_CLASS_GENERATOR) {
+        JS_ThrowTypeError(ctx, "flow handle must be a generator object");
+        return NULL;
+    }
+    gd = JS_GetOpaque(flow, JS_CLASS_GENERATOR);
+    if (!gd || !gd->func_state ||
+        gd->state == JS_GENERATOR_STATE_COMPLETED ||
+        (gd->state == JS_GENERATOR_STATE_EXECUTING &&
+         !tt_flow_base_is_parked(ctx->rt, gd->func_state))) {
+        JS_ThrowTypeError(ctx, "flow is not suspended");
+        return NULL;
+    }
+    return gd->func_state;
+}
+
+/* First-write-through: record the pre-image once, then write 'val' into the
+   live property slot. The flow must be checked in. */
+int JS_TTFlowDeltaWriteProp(JSContext *ctx, JSValueConst flow,
+                            JSValueConst obj, JSAtom prop, JSValueConst val)
+{
+    JSAsyncFunctionState *st = tt_flow_state_of(ctx, flow);
+    TTFlowDelta *d;
+    TTFlowDeltaRec *rec;
+    JSObject *p;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    uint32_t i;
+
+    if (!st)
+        return -1;
+    d = tt_flow_delta_get(ctx, st, TRUE);
+    if (!d)
+        return -1;
+    if (!d->checked_in) {
+        JS_ThrowTypeError(ctx, "flow delta is checked out");
+        return -1;
+    }
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) {
+        JS_ThrowTypeError(ctx, "delta target must be an object");
+        return -1;
+    }
+    p = JS_VALUE_GET_OBJ(obj);
+    prs = find_own_property(&pr, p, prop);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL) {
+        JS_ThrowTypeError(ctx, "delta target is not a plain own property");
+        return -1;
+    }
+    i = tt_flow_delta_find_prop(d, p, prop);
+    if (i != UINT32_MAX && d->tab[i].kind == TT_DELTA_PROP) {
+        /* already recorded: write through */
+        JS_FreeValue(ctx, pr->u.value);
+        pr->u.value = JS_DupValue(ctx, val);
+        return 0;
+    }
+    rec = tt_flow_delta_push(ctx, d);
+    if (!rec)
+        return -1;
+    memset(rec, 0, sizeof(*rec));
+    rec->kind = TT_DELTA_PROP;
+    rec->obj = JS_DupValue(ctx, obj);
+    rec->atom = JS_DupAtom(ctx, prop);
+    rec->alen = JS_UNDEFINED;
+    rec->saved = pr->u.value;              /* pre-image moves into the record */
+    pr->u.value = JS_DupValue(ctx, val);
+    return tt_flow_delta_index_rec(ctx, d, d->count - 1);
+}
+
+/* Same, for a closure cell: 'func_obj' names a baseline closure, cv_idx one
+   of its captured cells (a detached JSVarRef). */
+int JS_TTFlowDeltaWriteCell(JSContext *ctx, JSValueConst flow,
+                            JSValueConst func_obj, int cv_idx,
+                            JSValueConst val)
+{
+    JSAsyncFunctionState *st = tt_flow_state_of(ctx, flow);
+    TTFlowDelta *d;
+    TTFlowDeltaRec *rec;
+    JSObject *p;
+    JSFunctionBytecode *b;
+    JSVarRef *vr;
+    uint32_t i;
+
+    if (!st)
+        return -1;
+    d = tt_flow_delta_get(ctx, st, TRUE);
+    if (!d)
+        return -1;
+    if (!d->checked_in) {
+        JS_ThrowTypeError(ctx, "flow delta is checked out");
+        return -1;
+    }
+    if (JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)
+        goto bad;
+    p = JS_VALUE_GET_OBJ(func_obj);
+    switch (p->class_id) {
+    case JS_CLASS_BYTECODE_FUNCTION:
+    case JS_CLASS_GENERATOR_FUNCTION:
+    case JS_CLASS_ASYNC_FUNCTION:
+    case JS_CLASS_ASYNC_GENERATOR_FUNCTION:
+        break;
+    default:
+        goto bad;
+    }
+    b = p->u.func.function_bytecode;
+    if (!b || !p->u.func.var_refs || cv_idx < 0 ||
+        cv_idx >= b->closure_var_count)
+        goto bad;
+    vr = p->u.func.var_refs[cv_idx];
+    if (!vr || !vr->is_detached)
+        goto bad;
+    if (tt_ptrmap_get(&d->index, (void *)((uintptr_t)vr | TT_COWK_CELL))) {
+        JS_FreeValue(ctx, *vr->pvalue);
+        *vr->pvalue = JS_DupValue(ctx, val);
+        return 0;
+    }
+    (void)i;
+    rec = tt_flow_delta_push(ctx, d);
+    if (!rec)
+        return -1;
+    memset(rec, 0, sizeof(*rec));
+    rec->kind = TT_DELTA_CELL;
+    rec->obj = JS_UNDEFINED;
+    rec->atom = JS_ATOM_NULL;
+    rec->alen = JS_UNDEFINED;
+    rec->vr = vr;
+    js_rc(vr)->ref_count++;
+    rec->saved = *vr->pvalue;              /* pre-image moves into the record */
+    *vr->pvalue = JS_DupValue(ctx, val);
+    return tt_flow_delta_index_rec(ctx, d, d->count - 1);
+bad:
+    JS_ThrowTypeError(ctx, "delta cell target must be a detached captured "
+                      "cell of a bytecode function");
+    return -1;
+}
+
+/* Park the flow's view: swap every record newest-first so the baseline shows
+   its pristine values again. Pure swaps: refcount-neutral. */
+int JS_TTFlowCheckout(JSContext *ctx, JSValueConst flow)
+{
+    JSAsyncFunctionState *st = tt_flow_state_of(ctx, flow);
+    TTFlowDelta *d;
+    uint32_t i;
+    if (!st)
+        return -1;
+    /* the flow's pending jobs: capture the live queue. While checked in,
+       the runtime list IS this flow's queue, so everything on it belongs
+       to the flow being parked. */
+    if (ctx->rt->tt_job_kind) {
+        JS_ThrowTypeError(ctx, "a job is parked mid-run; finish it "
+                          "(JS_TTCallResume) before checking out");
+        return -1;
+    }
+    while (!list_empty(&ctx->rt->job_list)) {
+        JSJobEntry *e = list_entry(ctx->rt->job_list.next, JSJobEntry, link);
+        if (!st->tt_jobs) {
+            st->tt_jobs = js_mallocz(ctx, sizeof(*st->tt_jobs));
+            if (!st->tt_jobs)
+                return -1;
+            init_list_head(&st->tt_jobs->jobs);
+        }
+        list_del(&e->link);
+        list_add_tail(&e->link, &st->tt_jobs->jobs);
+        st->tt_jobs->count++;
+    }
+    /* automatic COW disarms first: the swaps below must not re-capture */
+    if (ctx->rt->tt_cow_flow == st)
+        ctx->rt->tt_cow_flow = NULL;
+    d = st->tt_delta;
+    if (!d)
+        return 0;             /* no first-writes recorded: nothing to park */
+    if (!d->checked_in) {
+        JS_ThrowTypeError(ctx, "flow is not checked in");
+        return -1;
+    }
+    for (i = d->count; i > 0; i--) {
+        if (tt_flow_delta_swap_rec(ctx, &d->tab[i - 1]))
+            return -1;
+    }
+    d->checked_in = FALSE;
+    return 0;
+}
+
+/* Install the flow's view (oldest-first). In a fresh process this is what
+   turns pristine baseline cells into the suspended flow's view, capturing
+   the fresh pre-images into the records as it goes. */
+int JS_TTFlowCheckin(JSContext *ctx, JSValueConst flow)
+{
+    JSAsyncFunctionState *st = tt_flow_state_of(ctx, flow);
+    TTFlowDelta *d;
+    uint32_t i;
+    if (!st)
+        return -1;
+    /* one flow's view (and queue) is live at a time */
+    if (ctx->rt->tt_cow_flow && ctx->rt->tt_cow_flow != st) {
+        JS_ThrowTypeError(ctx, "another flow is checked in");
+        return -1;
+    }
+    /* the flow's captured jobs go live again: the pump drains them */
+    if (st->tt_jobs) {
+        while (!list_empty(&st->tt_jobs->jobs)) {
+            JSJobEntry *e = list_entry(st->tt_jobs->jobs.next, JSJobEntry,
+                                       link);
+            list_del(&e->link);
+            list_add_tail(&e->link, &ctx->rt->job_list);
+        }
+        js_free_rt(ctx->rt, st->tt_jobs);
+        st->tt_jobs = NULL;
+    }
+    d = st->tt_delta;
+    if (d) {
+        if (d->checked_in) {
+            JS_ThrowTypeError(ctx, "flow is not checked out");
+            return -1;
+        }
+        for (i = 0; i < d->count; i++) {
+            if (tt_flow_delta_swap_rec(ctx, &d->tab[i]))
+                return -1;
+        }
+        d->checked_in = TRUE;
+    }
+    /* arm automatic COW: from here, this flow's first write to any
+       baseline target snapshots the pre-image transparently */
+    ctx->rt->tt_cow_flow = st;
+    return 0;
+}
+
+int JS_TTFlowDeltaCount(JSContext *ctx, JSValueConst flow)
+{
+    JSAsyncFunctionState *st = tt_flow_state_of(ctx, flow);
+    if (!st)
+        return -1;
+    return st->tt_delta ? (int)st->tt_delta->count : 0;
+}
+
+/* -- per-flow suspended machines ------------------------------------------ */
+
+/* A suspended machine as a first-class value: one flow's parked TrampFrame
+   chain with its OWN segmented frame arena, so any number of machines can
+   be suspended in a runtime at once and resumed in any order (a shared
+   bump arena would be clobbered by out-of-LIFO resumes). The arena starts
+   empty and grows by demand-sized segments -- a suspended machine costs
+   what its chain actually occupies. The runtime's arena/park fields act
+   as the ACTIVE machine's registers -- installed around a resume, captured
+   back at a park. The legacy host-entered machine (JS_TTCallStart/Args/
+   Resume) keeps using the runtime fields directly, unchanged. */
+typedef struct TTMachine {
+    JSStackFrame *parked_frame;    /* innermost parked frame */
+    JSStackFrame *base_frame;      /* the flow base's frame (outermost) */
+    TTArenaSeg *arena_seg;         /* segment holding arena_top (NULL for
+                                      an all-heap chain: no arena frames) */
+    uint8_t *arena_top;
+    size_t arena_total;            /* Σ segment storage bytes */
+} TTMachine;
+
+typedef struct TTMachineSaved {
+    TTArenaSeg *arena_seg;
+    uint8_t *arena_base, *arena_top, *arena_limit;
+    BOOL arena_grow;
+    size_t arena_total;
+    JSStackFrame *parked_frame, *stack_frame;
+} TTMachineSaved;
+
+static TTMachine *tt_machine_new(JSContext *ctx)
+{
+    /* segments arrive on first demand, sized to it */
+    return js_mallocz(ctx, sizeof(TTMachine));
+}
+
+/* make the machine's arena and chain the runtime's active ones */
+static void tt_machine_install(JSRuntime *rt, TTMachine *m, TTMachineSaved *sv)
+{
+    sv->arena_seg = rt->tt_arena_seg;
+    sv->arena_base = rt->tt_arena_base;
+    sv->arena_top = rt->tt_arena_top;
+    sv->arena_limit = rt->tt_arena_limit;
+    sv->arena_grow = rt->tt_arena_grow;
+    sv->arena_total = rt->tt_arena_total;
+    sv->parked_frame = rt->tt_parked_frame;
+    sv->stack_frame = rt->current_stack_frame;
+    rt->tt_arena_seg = m->arena_seg;
+    if (m->arena_seg) {
+        rt->tt_arena_base = m->arena_seg->base;
+        rt->tt_arena_top = m->arena_top;
+        rt->tt_arena_limit = m->arena_seg->limit;
+    } else {
+        rt->tt_arena_base = rt->tt_arena_top = rt->tt_arena_limit = NULL;
+    }
+    rt->tt_arena_grow = TRUE;
+    rt->tt_arena_total = m->arena_total;
+    rt->tt_parked_frame = m->parked_frame;
+    rt->current_stack_frame = m->parked_frame;
+}
+
+/* capture the (possibly re-parked) machine back out of the runtime and
+   restore what the host had. Empty reuse segments beyond the captured top
+   are dropped: a suspended machine's footprint is its actual chain. */
+static void tt_machine_capture(JSRuntime *rt, TTMachine *m, TTMachineSaved *sv)
+{
+    m->arena_seg = rt->tt_arena_seg;
+    m->arena_top = rt->tt_arena_top;
+    m->arena_total = rt->tt_arena_total;
+    m->parked_frame = rt->tt_parked_frame;
+    if (m->arena_seg && m->arena_seg->next)
+        tt_arena_seg_free_tail(rt, m->arena_seg, &m->arena_total);
+    rt->tt_arena_seg = sv->arena_seg;
+    rt->tt_arena_base = sv->arena_base;
+    rt->tt_arena_top = sv->arena_top;
+    rt->tt_arena_limit = sv->arena_limit;
+    rt->tt_arena_grow = sv->arena_grow;
+    rt->tt_arena_total = sv->arena_total;
+    rt->tt_parked_frame = sv->parked_frame;
+    rt->current_stack_frame = sv->stack_frame;
+}
+
+/* bump-allocate one frame in the machine's own segmented arena
+   (tt_arena_push's twin for chains built OUTSIDE a run: the deserializer
+   and the fork). Segments append on demand, sized to it. */
+static JSStackFrame *tt_machine_arena_push(JSContext *ctx, TTMachine *m,
+                                           size_t val_count, size_t ref_count,
+                                           JSValue **pvals)
+{
+    size_t size = sizeof(JSStackFrame) + sizeof(JSValue) * val_count +
+        sizeof(JSVarRef *) * ref_count;
+    uint8_t *base;
+    JSStackFrame *sf;
+    size = (size + 15) & ~(size_t)15;
+    if (!m->arena_seg ||
+        size > (size_t)(m->arena_seg->limit - m->arena_top)) {
+        TTArenaSeg *seg = tt_arena_seg_append(ctx->rt, m->arena_seg, size,
+                                              &m->arena_total);
+        if (!seg) {
+            JS_ThrowStackOverflow(ctx);
+            return NULL;
+        }
+        m->arena_seg = seg;
+        m->arena_top = seg->base;
+    }
+    base = m->arena_top;
+    m->arena_top = base + size;
+    sf = (JSStackFrame *)base;
+    *pvals = (JSValue *)(sf + 1);
+    return sf;
+}
+
+/* dismantle an un-resumed parked chain: mirror the engine's pop for each
+   arena frame, innermost first -- close its cells (close_var_ref dups, so
+   the range free below stays balanced), free its owned values -- then
+   release the arena segments. Heap frames belong to their states and free
+   through the normal state teardown.
+
+   During REMOVE_CYCLES the rules change, exactly as __async_func_free's
+   own: closing cells would dup values -- mutating the dying graph -- so a
+   still-attached cell has its value MOVED out instead (refcount-neutral),
+   keeping any cell that outlives this machine valid. A zombie cur_func
+   (the closure died earlier in the same pass; its bytecode pointer is
+   cleared) means the frame's cells are dying in this very pass too: leave
+   them to unlink themselves. Either way the segments go to the graveyard,
+   not free(): those unlinks still write into the frames. */
+static void tt_machine_free(JSRuntime *rt, TTMachine *m,
+                            JSStackFrame *base_frame)
+{
+    BOOL in_gc = (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES);
+    JSStackFrame *sf = m->parked_frame;
+    while (sf && sf != base_frame) {
+        JSStackFrame *prev = sf->prev_frame;
+        if (!(sf->js_mode & JS_MODE_ASYNC)) {
+            JSObject *fo = JS_VALUE_GET_OBJ(sf->cur_func);
+            JSFunctionBytecode *b = fo->u.func.function_bytecode;
+            JSValue *pval;
+            if (b && b->var_ref_count) {
+                if (!in_gc) {
+                    close_var_refs(rt, b, sf);
+                } else {
+                    int i;
+                    for (i = 0; i < b->var_ref_count; i++) {
+                        JSVarRef *vr = sf->var_refs[i];
+                        if (!vr)
+                            continue;
+                        vr->value = *vr->pvalue;
+                        *vr->pvalue = JS_UNDEFINED;
+                        vr->pvalue = &vr->value;
+                        vr->is_detached = TRUE;
+                        sf->var_refs[i] = NULL;
+                    }
+                }
+            }
+            for (pval = sf->tt_frame_base; pval < sf->cur_sp; pval++)
+                JS_FreeValueRT(rt, *pval);
+        }
+        sf = prev;
+    }
+    if (in_gc)
+        tt_arena_segs_to_graveyard(rt, m->arena_seg);
+    else
+        tt_arena_segs_free(rt, m->arena_seg);
+    js_free_rt(rt, m);
+}
+
+/* the aligned arena block size of a parked chain frame -- the exact bytes
+   its push took (geometry re-derives from the bytecode, as everywhere) */
+static size_t tt_chain_frame_size(JSStackFrame *f)
+{
+    JSObject *fo = JS_VALUE_GET_OBJ(f->cur_func);
+    JSFunctionBytecode *fb = fo->u.func.function_bytecode;
+    size_t val_count =
+        (f->arg_buf == f->tt_frame_base ? (size_t)fb->arg_count : 0) +
+        fb->var_count + fb->stack_size;
+    size_t size = sizeof(JSStackFrame) + sizeof(JSValue) * val_count +
+        sizeof(JSVarRef *) * fb->var_ref_count;
+    return (size + 15) & ~(size_t)15;
+}
+
+/* GC edge enumeration for a suspended machine: every owned slot of its
+   arena frames is a reference the base state holds (heap frames in the
+   chain mark through their own states; cur_func borrows the parent's
+   callee slot; frame var_refs[] stay weak, as on live frames). While the
+   machine is INSTALLED and running, parked_frame is cleared and nothing
+   marks -- a running chain is C-stack rooted, exactly like the legacy
+   host-entered machine. */
+static void tt_machine_mark(JSRuntime *rt, struct TTMachine *m,
+                            JSStackFrame *base_frame, JS_MarkFunc *mark_func)
+{
+    JSStackFrame *sf = m->parked_frame;
+    while (sf && sf != base_frame) {
+        if (!(sf->js_mode & JS_MODE_ASYNC) && sf->cur_sp) {
+            JSValue *pval;
+            for (pval = sf->tt_frame_base; pval < sf->cur_sp; pval++)
+                JS_MarkValue(rt, *pval, mark_func);
+        }
+        sf = sf->prev_frame;
+    }
+}
+
+/* -- serializer (write side) ---------------------------------------------- */
+
+typedef struct TTFlowWrRec {
+    uint8_t kind;             /* TT_REC_* */
+    void *ptr;                /* identity of the live entity */
+} TTFlowWrRec;
+
+/* one entry of the flow's TrampFrame chain (or of a detached suspended
+   nested state discovered through the value graph) */
+typedef struct TTFlowWrFrame {
+    JSStackFrame *sf;
+    uint8_t owner;            /* 0 = state-owned heap frame, 1 = arena frame */
+    uint8_t chained;          /* part of the machine-parked chain */
+} TTFlowWrFrame;
+
+typedef struct TTFlowWr {
+    JSContext *ctx;
+    TTFlowBaseline *bl;
+    TTPtrMap map;             /* entity ptr -> record idx + 1 */
+    TTFlowWrRec *recs;
+    uint32_t rec_count, rec_size;
+    TTFlowWrFrame *frames;    /* the frame table: base first, chain order */
+    uint32_t frame_count, frame_size;
+    TTPtrMap frame_map;       /* JSStackFrame* -> frame idx + 1 */
+    BOOL machine;             /* a parked chain travels in these bytes */
+    BOOL forking;             /* in-heap clone: bytecode shares by refcount,
+                                 so baseline membership is not required */
+    /* chain override: a fork taken from the RUNNING machine (JS_TTForkHere)
+       walks from the live innermost frame instead of a parked handle */
+    JSStackFrame *chain_innermost;
+    uint8_t *chain_arena_top;
+    TTArenaSeg *chain_seg;
+    JSAtom *atoms;            /* private atom table (borrowed from heap) */
+    uint32_t atom_count, atom_size;
+    TTPtrMap atom_map;        /* JSAtomStruct* -> atom-table idx + 1 */
+    /* work queue of records whose children still need scanning */
+    uint32_t scan_head;
+} TTFlowWr;
+
+/* a frame's owned value range: [start, cur_sp). Heap (state) frames own
+   everything from arg_buf; arena frames own their allocation block only --
+   an aliased argument window belongs to the parent frame. */
+static JSValue *wr_frame_owned_start(TTFlowWrFrame *f)
+{
+    return f->owner ? f->sf->tt_frame_base : f->sf->arg_buf;
+}
+
+/* TRUE if the flow is suspended mid-call (EXECUTING) with its chain intact:
+   either it owns a first-class machine handle, or the legacy host-entered
+   machine's parked chain runs through its frame */
+static BOOL tt_flow_base_is_parked(JSRuntime *rt, JSAsyncFunctionState *st)
+{
+    JSStackFrame *sf;
+    if (st->tt_machine)
+        return TRUE;
+    sf = rt->tt_parked_frame;
+    while (sf) {
+        if (sf == &st->frame)
+            return TRUE;
+        sf = sf->prev_frame;
+    }
+    return FALSE;
+}
+
+static int wr_enum_value(TTFlowWr *w, JSValueConst v);
+static int wr_enum_varref(TTFlowWr *w, JSVarRef *vr);
+
+static int wr_add_rec(TTFlowWr *w, int kind, void *ptr, uint32_t *pidx)
+{
+    if (w->rec_count >= w->rec_size) {
+        uint32_t nsize = w->rec_size ? w->rec_size * 2 : 32;
+        TTFlowWrRec *ntab = js_realloc(w->ctx, w->recs, sizeof(*ntab) * nsize);
+        if (!ntab)
+            return -1;
+        w->recs = ntab;
+        w->rec_size = nsize;
+    }
+    if (tt_ptrmap_put(w->ctx, &w->map, ptr, w->rec_count))
+        return -1;
+    w->recs[w->rec_count].kind = kind;
+    w->recs[w->rec_count].ptr = ptr;
+    if (pidx)
+        *pidx = w->rec_count;
+    w->rec_count++;
+    return 0;
+}
+
+static int wr_enum_atom(TTFlowWr *w, JSAtom atom)
+{
+    JSAtomStruct *p;
+    if (__JS_AtomIsTaggedInt(atom) || atom < JS_ATOM_END)
+        return 0;             /* process-stable by the baseline contract */
+    p = w->ctx->rt->atom_array[atom];
+    if (p->atom_type != JS_ATOM_TYPE_STRING)
+        return wr_enum_value(w, JS_MKPTR(JS_TAG_SYMBOL, p));
+    if (tt_ptrmap_get(&w->atom_map, p))
+        return 0;
+    if (w->atom_count >= w->atom_size) {
+        uint32_t nsize = w->atom_size ? w->atom_size * 2 : 16;
+        JSAtom *ntab = js_realloc(w->ctx, w->atoms, sizeof(*ntab) * nsize);
+        if (!ntab)
+            return -1;
+        w->atoms = ntab;
+        w->atom_size = nsize;
+    }
+    if (tt_ptrmap_put(w->ctx, &w->atom_map, p, w->atom_count))
+        return -1;
+    w->atoms[w->atom_count++] = atom;
+    return 0;
+}
+
+static int wr_unsupported(TTFlowWr *w, JSObject *p)
+{
+    const char *name = JS_AtomToCString(w->ctx,
+                                        w->ctx->rt->class_array[p->class_id].class_name);
+    JS_ThrowTypeError(w->ctx,
+                      "flow serialization: unsupported flow-private object of "
+                      "class %s (%d) (baseline objects of any class pass by "
+                      "id)", name ? name : "?", p->class_id);
+    JS_FreeCString(w->ctx, name);
+    return -1;
+}
+
+/* the baseline function-bytecode id of 'b', or -1 (error thrown) */
+static int wr_fn_id(TTFlowWr *w, JSFunctionBytecode *b)
+{
+    uint32_t v = tt_ptrmap_get(&w->bl->map, b);
+    if (!v || w->bl->tab[v - 1].kind != TT_BASE_FUNC_BC) {
+        JS_ThrowTypeError(w->ctx, "flow serialization: function bytecode "
+                          "outside the shared baseline (eval'd code?)");
+        return -1;
+    }
+    return (int)(v - 1);
+}
+
+static int wr_add_frame(TTFlowWr *w, JSStackFrame *sf, int owner, int chained)
+{
+    if (tt_ptrmap_get(&w->frame_map, sf))
+        return 0;
+    if (w->frame_count >= w->frame_size) {
+        uint32_t nsize = w->frame_size ? w->frame_size * 2 : 8;
+        TTFlowWrFrame *ntab =
+            js_realloc(w->ctx, w->frames, sizeof(*ntab) * nsize);
+        if (!ntab)
+            return -1;
+        w->frames = ntab;
+        w->frame_size = nsize;
+    }
+    if (tt_ptrmap_put(w->ctx, &w->frame_map, sf, w->frame_count))
+        return -1;
+    w->frames[w->frame_count].sf = sf;
+    w->frames[w->frame_count].owner = (uint8_t)owner;
+    w->frames[w->frame_count].chained = (uint8_t)chained;
+    w->frame_count++;
+    return 0;
+}
+
+static int wr_enum_state(TTFlowWr *w, JSAsyncFunctionState *st)
+{
+    uint32_t idx;
+    if (tt_ptrmap_get(&w->map, st))
+        return 0;
+    if (st->is_completed) {
+        JS_ThrowTypeError(w->ctx, "flow serialization: completed state still "
+                          "referenced");
+        return -1;
+    }
+    if (st->frame.cur_sp == NULL) {
+        JS_ThrowTypeError(w->ctx, "flow serialization: flow is running");
+        return -1;
+    }
+    if (wr_add_rec(w, TT_REC_STATE, st, &idx))
+        return -1;
+    /* an async-function state's result-promise capability travels with it:
+       the whole promise graph classifies baseline/private like any value */
+    if (wr_enum_value(w, st->resolving_funcs[0]) ||
+        wr_enum_value(w, st->resolving_funcs[1]))
+        return -1;
+    /* chained frames were pre-registered by the chain walk; a state found
+       only through the value graph is a detached suspended nested flow */
+    return wr_add_frame(w, &st->frame, 0, 0);
+}
+
+/* Walk the machine's parked chain from rt->tt_parked_frame down to the flow
+   base and register it as the flow's TrampFrame chain (base first). Every
+   frame is validated against the transplantable subset: plain inlined calls
+   and in-loop generator splices, whose pops touch no side arena blocks. The
+   arena extent must be exactly the chain's frames, contiguously -- foreign
+   blocks (pump descriptors, iterator blocks, ...) refuse loudly. */
+static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
+{
+    JSRuntime *rt = w->ctx->rt;
+    JSStackFrame *chain[256];
+    int n = 0, i;
+    JSStackFrame *sf;
+    uint8_t *chain_top;
+    TTArenaSeg *chain_seg;
+
+    /* where this flow's chain lives: an explicit override (forking the
+       RUNNING machine from the step hook), the flow's own machine handle,
+       or the legacy host-entered machine on the runtime registers */
+    if (w->chain_innermost) {
+        sf = w->chain_innermost;
+        chain_top = w->chain_arena_top;
+        chain_seg = w->chain_seg;
+    } else if (base->tt_machine) {
+        sf = base->tt_machine->parked_frame;
+        chain_top = base->tt_machine->arena_top;
+        chain_seg = base->tt_machine->arena_seg;
+    } else {
+        sf = rt->tt_parked_frame;
+        chain_top = rt->tt_arena_top;
+        chain_seg = rt->tt_arena_seg;
+    }
+
+    while (sf && sf != &base->frame) {
+        if (n >= (int)countof(chain)) {
+            JS_ThrowTypeError(w->ctx, "flow serialization: parked chain too "
+                              "deep");
+            return -1;
+        }
+        chain[n++] = sf;
+        sf = sf->prev_frame;
+    }
+    if (sf != &base->frame) {
+        JS_ThrowTypeError(w->ctx, "flow serialization: flow is running but "
+                          "is not the parked machine");
+        return -1;
+    }
+    chain[n++] = sf;
+    /* base first */
+    for (i = n - 1; i >= 0; i--) {
+        JSStackFrame *f = chain[i];
+        if (f->js_mode & JS_MODE_ASYNC) {
+            JSAsyncFunctionState *st =
+                container_of(f, JSAsyncFunctionState, frame);
+            int kind = f->tt_frame_kind;
+            if (i != n - 1) {
+                /* a nested in-loop generator splice: its pop protocol
+                   travels; APPEND smuggles an arena block, refuse it */
+                int gshape;
+                if (kind != TT_FRAME_GEN) {
+                    JS_ThrowTypeError(w->ctx, "flow serialization: "
+                                      "unsupported chained state frame kind "
+                                      "%d", kind);
+                    return -1;
+                }
+                gshape = (f->tt_aux_i >> 8) & 0xff;
+                if (gshape != TT_GENSHAPE_METHOD &&
+                    gshape != TT_GENSHAPE_FOROF &&
+                    gshape != TT_GENSHAPE_ITERNEXT &&
+                    gshape != TT_GENSHAPE_ITERCALL) {
+                    JS_ThrowTypeError(w->ctx, "flow serialization: "
+                                      "unsupported generator splice shape %d",
+                                      gshape);
+                    return -1;
+                }
+                if (!JS_IsUndefined(f->tt_ctor_this)) {
+                    JS_ThrowTypeError(w->ctx, "flow serialization: chained "
+                                      "frame carries a side block");
+                    return -1;
+                }
+            } else if (kind != TT_FRAME_GEN && kind != TT_FRAME_ENTRY) {
+                JS_ThrowTypeError(w->ctx, "flow serialization: base frame "
+                                  "kind %d is not transplantable", kind);
+                return -1;
+            }
+            if (wr_add_frame(w, f, 0, 1))
+                return -1;
+            if (wr_enum_state(w, st))
+                return -1;
+        } else {
+            int kind = f->tt_frame_kind;
+            if (kind != TT_FRAME_CALL && kind != TT_FRAME_CALL_METHOD &&
+                kind != TT_FRAME_TAIL && kind != TT_FRAME_TAIL_METHOD) {
+                JS_ThrowTypeError(w->ctx, "flow serialization: arena frame "
+                                  "kind %d is not transplantable (reflective "
+                                  "machinery in the chain)", kind);
+                return -1;
+            }
+            if (f->tt_aux != NULL || !JS_IsUndefined(f->tt_ctor_this) ||
+                !JS_IsUndefined(f->tt_new_target)) {
+                JS_ThrowTypeError(w->ctx, "flow serialization: arena frame "
+                                  "carries continuation state");
+                return -1;
+            }
+            if (f->cur_sp == NULL) {
+                JS_ThrowInternalError(w->ctx, "flow serialization: parked "
+                                      "frame without a saved sp");
+                return -1;
+            }
+            if (wr_add_frame(w, f, 1, 1))
+                return -1;
+            if (wr_enum_value(w, f->cur_func))
+                return -1;
+        }
+    }
+    /* contiguity: the arena extent must hold exactly the chain's arena
+       frames, in allocation order across the segment chain -- each next
+       frame starts where the previous allocation ends, or at the base of
+       the NEXT segment when (and only when) it could not have fit in the
+       remaining tail; the innermost one ends at the arena top. Foreign
+       blocks (pump descriptors, iterator blocks, ...) refuse loudly. */
+    {
+        TTArenaSeg *first = chain_seg;
+        TTArenaSeg *cs = NULL;
+        uint8_t *expect = NULL;
+        while (first && first->prev)
+            first = first->prev;
+        for (i = 0; i < n; i++) {
+            JSStackFrame *f = chain[n - 1 - i]; /* base first */
+            size_t size;
+            TTArenaSeg *seg;
+            if (f->js_mode & JS_MODE_ASYNC)
+                continue;
+            size = tt_chain_frame_size(f);
+            for (seg = first; seg; seg = seg->next) {
+                if ((uint8_t *)f >= seg->base && (uint8_t *)f < seg->limit)
+                    break;
+            }
+            if (!seg) {
+                JS_ThrowTypeError(w->ctx, "flow serialization: chain frame "
+                                  "outside the machine's arena");
+                return -1;
+            }
+            if (expect &&
+                !((seg == cs && (uint8_t *)f == expect) ||
+                  (seg == cs->next && (uint8_t *)f == seg->base &&
+                   size > (size_t)(cs->limit - expect)))) {
+                JS_ThrowTypeError(w->ctx, "flow serialization: foreign arena "
+                                  "blocks inside the parked chain");
+                return -1;
+            }
+            cs = seg;
+            expect = (uint8_t *)f + size;
+        }
+        if (expect && (expect != chain_top || cs != chain_seg)) {
+            JS_ThrowTypeError(w->ctx, "flow serialization: arena extent does "
+                              "not end at the parked top");
+            return -1;
+        }
+    }
+    w->machine = TRUE;
+    return 0;
+}
+
+static int wr_enum_varref(TTFlowWr *w, JSVarRef *vr)
+{
+    if (tt_ptrmap_get(&w->bl->map, vr))
+        return 0;             /* baseline cell: by reference */
+    if (tt_ptrmap_get(&w->map, vr))
+        return 0;
+    if (vr->is_detached) {
+        if (wr_add_rec(w, TT_REC_VARREF_CLOSED, vr, NULL))
+            return -1;
+        return wr_enum_value(w, *vr->pvalue);
+    }
+    /* open: must point into one of the flow's frames; validated at emission
+       once every frame is known */
+    return wr_add_rec(w, TT_REC_VARREF_OPEN, vr, NULL);
+}
+
+static int wr_enum_object(TTFlowWr *w, JSObject *p)
+{
+    switch (p->class_id) {
+    case JS_CLASS_OBJECT:
+    case JS_CLASS_ERROR:
+        return wr_add_rec(w, TT_REC_PLAIN, p, NULL);
+    case JS_CLASS_ARRAY:
+        if (!p->fast_array)
+            return wr_unsupported(w, p);
+        return wr_add_rec(w, TT_REC_ARRAY, p, NULL);
+    case JS_CLASS_BYTECODE_FUNCTION:
+    case JS_CLASS_GENERATOR_FUNCTION:
+    case JS_CLASS_ASYNC_FUNCTION:
+    case JS_CLASS_ASYNC_GENERATOR_FUNCTION:
+        return wr_add_rec(w, TT_REC_CLOSURE, p, NULL);
+    case JS_CLASS_GENERATOR:
+        return wr_add_rec(w, TT_REC_GENOBJ, p, NULL);
+    case JS_CLASS_NUMBER:
+    case JS_CLASS_STRING:
+    case JS_CLASS_BOOLEAN:
+    case JS_CLASS_SYMBOL:
+    case JS_CLASS_DATE:
+        return wr_add_rec(w, TT_REC_DATAOBJ, p, NULL);
+    case JS_CLASS_PROMISE:
+        return wr_add_rec(w, TT_REC_PROMISE, p, NULL);
+    case JS_CLASS_PROMISE_RESOLVE_FUNCTION:
+    case JS_CLASS_PROMISE_REJECT_FUNCTION:
+        return wr_add_rec(w, TT_REC_PROMISE_FUNC, p, NULL);
+    case JS_CLASS_ASYNC_FUNCTION_RESOLVE:
+    case JS_CLASS_ASYNC_FUNCTION_REJECT:
+        return wr_add_rec(w, TT_REC_ASYNC_RESOLVE, p, NULL);
+    default:
+        return wr_unsupported(w, p);
+    }
+}
+
+static int wr_enum_value(TTFlowWr *w, JSValueConst v)
+{
+    switch (JS_VALUE_GET_TAG(v)) {
+    case JS_TAG_OBJECT: {
+        JSObject *p = JS_VALUE_GET_OBJ(v);
+        if (tt_ptrmap_get(&w->bl->map, p))
+            return 0;         /* baseline: by reference */
+        if (tt_ptrmap_get(&w->map, p))
+            return 0;
+        return wr_enum_object(w, p);
+    }
+    case JS_TAG_STRING: {
+        JSString *p = JS_VALUE_GET_STRING(v);
+        if (tt_ptrmap_get(&w->map, p))
+            return 0;
+        return wr_add_rec(w, TT_REC_STRING, p, NULL);
+    }
+    case JS_TAG_STRING_ROPE:
+        /* ropes are value-identical to their flattened form; emission writes
+           them as inline strings, so no record is needed */
+        return 0;
+    case JS_TAG_SYMBOL: {
+        JSAtomStruct *p = JS_VALUE_GET_PTR(v);
+        if (tt_ptrmap_get(&w->bl->map, p))
+            return 0;
+        if (tt_ptrmap_get(&w->map, p))
+            return 0;
+        if (p->atom_type != JS_ATOM_TYPE_SYMBOL) {
+            JS_ThrowTypeError(w->ctx, "flow serialization: unsupported "
+                              "symbol kind (Symbol.for/private)");
+            return -1;
+        }
+        return wr_add_rec(w, TT_REC_SYMBOL, p, NULL);
+    }
+    case JS_TAG_BIG_INT:
+        JS_ThrowTypeError(w->ctx, "flow serialization: heap bigints are not "
+                          "supported yet (short bigints pass inline)");
+        return -1;
+    case JS_TAG_MODULE:
+    case JS_TAG_FUNCTION_BYTECODE:
+        JS_ThrowTypeError(w->ctx, "flow serialization: raw bytecode/module "
+                          "value on a frame");
+        return -1;
+    default:
+        return 0;             /* immediates pass inline */
+    }
+}
+
+/* scan the children of record 'idx' (queued-BFS: no C recursion depth) */
+static int wr_scan_props(TTFlowWr *w, JSObject *p, BOOL skip_length)
+{
+    JSShape *sh = p->shape;
+    JSShapeProperty *prs = get_shape_prop(sh);
+    int i;
+    for (i = 0; i < sh->prop_count; i++, prs++) {
+        JSProperty *pr;
+        if (prs->atom == JS_ATOM_NULL)
+            continue;
+        if (skip_length && prs->atom == JS_ATOM_length)
+            continue;
+        if (wr_enum_atom(w, prs->atom))
+            return -1;
+        pr = &p->prop[i];
+        switch (prs->flags & JS_PROP_TMASK) {
+        case JS_PROP_NORMAL:
+            if (wr_enum_value(w, pr->u.value))
+                return -1;
+            break;
+        case JS_PROP_GETSET:
+            if (pr->u.getset.getter &&
+                wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter)))
+                return -1;
+            if (pr->u.getset.setter &&
+                wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.setter)))
+                return -1;
+            break;
+        case JS_PROP_VARREF:
+            if (wr_enum_varref(w, pr->u.var_ref))
+                return -1;
+            break;
+        default: {            /* autoinit: only the lazy .prototype survives */
+            if (js_autoinit_get_id(pr) != JS_AUTOINIT_ID_PROTOTYPE) {
+                JS_ThrowTypeError(w->ctx, "flow serialization: unsupported "
+                                  "autoinit property");
+                return -1;
+            }
+            break;
+        }
+        }
+    }
+    return 0;
+}
+
+static int wr_scan_children(TTFlowWr *w, TTFlowWrRec *rec)
+{
+    switch (rec->kind) {
+    case TT_REC_PLAIN: {
+        JSObject *p = rec->ptr;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_PROMISE: {
+        JSObject *p = rec->ptr;
+        JSPromiseData *pd = JS_GetOpaque(JS_MKPTR(JS_TAG_OBJECT, p),
+                                         JS_CLASS_PROMISE);
+        struct list_head *el;
+        int i;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        if (!pd) {
+            JS_ThrowTypeError(w->ctx, "flow serialization: promise without "
+                              "data");
+            return -1;
+        }
+        if (wr_enum_value(w, pd->promise_result))
+            return -1;
+        for (i = 0; i < 2; i++) {
+            list_for_each(el, &pd->promise_reactions[i]) {
+                JSPromiseReactionData *rd =
+                    list_entry(el, JSPromiseReactionData, link);
+                if (wr_enum_value(w, rd->resolving_funcs[0]) ||
+                    wr_enum_value(w, rd->resolving_funcs[1]) ||
+                    wr_enum_value(w, rd->handler))
+                    return -1;
+            }
+        }
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_PROMISE_FUNC: {
+        JSObject *p = rec->ptr;
+        JSPromiseFunctionData *fd = p->u.promise_function_data;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        if (!fd) {
+            JS_ThrowTypeError(w->ctx, "flow serialization: capability "
+                              "without data");
+            return -1;
+        }
+        if (wr_enum_value(w, fd->promise))
+            return -1;
+        if (!tt_ptrmap_get(&w->map, fd->presolved) &&
+            wr_add_rec(w, TT_REC_PRESOLVED, fd->presolved, NULL))
+            return -1;
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_ASYNC_RESOLVE: {
+        JSObject *p = rec->ptr;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        if (!p->u.async_function_data) {
+            JS_ThrowTypeError(w->ctx, "flow serialization: await "
+                              "continuation without a state");
+            return -1;
+        }
+        if (wr_enum_state(w, p->u.async_function_data))
+            return -1;
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_ARRAY: {
+        JSObject *p = rec->ptr;
+        uint32_t i;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        for (i = 0; i < p->u.array.count; i++)
+            if (wr_enum_value(w, p->u.array.u.values[i]))
+                return -1;
+        return wr_scan_props(w, p, TRUE);
+    }
+    case TT_REC_CLOSURE: {
+        JSObject *p = rec->ptr;
+        JSFunctionBytecode *b = p->u.func.function_bytecode;
+        int i;
+        if (!w->forking && wr_fn_id(w, b) < 0)
+            return -1;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        if (p->u.func.home_object &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->u.func.home_object)))
+            return -1;
+        if (p->u.func.var_refs) {
+            for (i = 0; i < b->closure_var_count; i++)
+                if (p->u.func.var_refs[i] &&
+                    wr_enum_varref(w, p->u.func.var_refs[i]))
+                    return -1;
+        }
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_GENOBJ: {
+        JSObject *p = rec->ptr;
+        JSGeneratorData *gd = p->u.generator_data;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        if (gd && gd->func_state &&
+            gd->state != JS_GENERATOR_STATE_COMPLETED) {
+            if (gd->state == JS_GENERATOR_STATE_EXECUTING) {
+                /* legal only when the generator's frame is part of the
+                   flow's machine-parked chain (registered before the BFS) */
+                uint32_t fi = tt_ptrmap_get(&w->frame_map,
+                                            &gd->func_state->frame);
+                if (!fi || !w->frames[fi - 1].chained) {
+                    JS_ThrowTypeError(w->ctx, "flow serialization: nested "
+                                      "generator is running outside the "
+                                      "flow's parked chain");
+                    return -1;
+                }
+            }
+            if (wr_enum_state(w, gd->func_state))
+                return -1;
+        }
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_STATE: {
+        JSAsyncFunctionState *st = rec->ptr;
+        JSStackFrame *sf = &st->frame;
+        JSValue *sp;
+        int i;
+        JSObject *fp = JS_VALUE_GET_OBJ(sf->cur_func);
+        JSFunctionBytecode *b = fp->u.func.function_bytecode;
+        if (!w->forking && wr_fn_id(w, b) < 0)
+            return -1;
+        if (wr_enum_value(w, sf->cur_func))
+            return -1;
+        if (wr_enum_value(w, st->this_val))
+            return -1;
+        for (sp = sf->arg_buf; sp < sf->cur_sp; sp++)
+            if (wr_enum_value(w, *sp))
+                return -1;
+        for (i = 0; i < b->var_ref_count; i++)
+            if (sf->var_refs[i] && wr_enum_varref(w, sf->var_refs[i]))
+                return -1;
+        return 0;
+    }
+    case TT_REC_VARREF_CLOSED: {
+        JSVarRef *vr = rec->ptr;
+        return wr_enum_value(w, *vr->pvalue);
+    }
+    case TT_REC_DATAOBJ: {
+        JSObject *p = rec->ptr;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        if (wr_enum_value(w, p->u.object_data))
+            return -1;
+        return wr_scan_props(w, p, FALSE);
+    }
+    default:                  /* STRING / SYMBOL / VARREF_OPEN: no children */
+        return 0;
+    }
+}
+
+/* -- emission -------------------------------------------------------------- */
+
+static void wr_put_string(DynBuf *db, JSString *p)
+{
+    uint32_t i;
+    dbuf_put_leb128(db, ((uint32_t)p->len << 1) | p->is_wide_char);
+    if (p->is_wide_char) {
+        for (i = 0; i < p->len; i++) {
+            dbuf_putc(db, (uint8_t)p->u.str16[i]);
+            dbuf_putc(db, (uint8_t)(p->u.str16[i] >> 8));
+        }
+    } else {
+        dbuf_put(db, p->u.str8, p->len);
+    }
+}
+
+static int wr_put_vref(TTFlowWr *w, DynBuf *db, JSValueConst v)
+{
+    uint32_t idx;
+    switch (JS_VALUE_GET_TAG(v)) {
+    case JS_TAG_UNDEFINED:
+        dbuf_put_leb128(db, TT_VR_UNDEFINED << 2);
+        return 0;
+    case JS_TAG_NULL:
+        dbuf_put_leb128(db, TT_VR_NULL << 2);
+        return 0;
+    case JS_TAG_BOOL:
+        dbuf_put_leb128(db, (JS_VALUE_GET_BOOL(v) ? TT_VR_TRUE : TT_VR_FALSE) << 2);
+        return 0;
+    case JS_TAG_UNINITIALIZED:
+        dbuf_put_leb128(db, TT_VR_UNINITIALIZED << 2);
+        return 0;
+    case JS_TAG_INT:
+        dbuf_put_leb128(db, TT_VR_INT << 2);
+        dbuf_put_sleb128(db, JS_VALUE_GET_INT(v));
+        return 0;
+    case JS_TAG_FLOAT64:
+        dbuf_put_leb128(db, TT_VR_FLOAT64 << 2);
+        tt_wr_f64(db, JS_VALUE_GET_FLOAT64(v));
+        return 0;
+    case JS_TAG_CATCH_OFFSET:
+        dbuf_put_leb128(db, TT_VR_CATCH_OFFSET << 2);
+        dbuf_put_leb128(db, (uint32_t)JS_VALUE_GET_INT(v));
+        return 0;
+    case JS_TAG_SHORT_BIG_INT:
+        dbuf_put_leb128(db, TT_VR_SHORT_BIGINT << 2);
+        dbuf_put_sleb128(db, (int32_t)JS_VALUE_GET_SHORT_BIG_INT(v));
+        return 0;
+    case JS_TAG_STRING_ROPE: {
+        /* flatten: rope shape is unobservable, the copy is value-equal */
+        JSValue flat = JS_ToString(w->ctx, v);
+        if (JS_IsException(flat))
+            return -1;
+        dbuf_put_leb128(db, TT_VR_INLINE_STR << 2);
+        wr_put_string(db, JS_VALUE_GET_STRING(flat));
+        JS_FreeValue(w->ctx, flat);
+        return 0;
+    }
+    case JS_TAG_OBJECT:
+    case JS_TAG_SYMBOL:
+    case JS_TAG_STRING: {
+        void *ptr = JS_VALUE_GET_PTR(v);
+        uint32_t bid = tt_ptrmap_get(&w->bl->map, ptr);
+        if (bid) {
+            dbuf_put_leb128(db, ((bid - 1) << 2) | 1);
+            return 0;
+        }
+        idx = tt_ptrmap_get(&w->map, ptr);
+        if (!idx) {
+            JS_ThrowInternalError(w->ctx, "flow serialization: value escaped "
+                                  "the enumeration pass");
+            return -1;
+        }
+        dbuf_put_leb128(db, ((idx - 1) << 2) | 2);
+        return 0;
+    }
+    default:
+        JS_ThrowTypeError(w->ctx, "flow serialization: unsupported value tag "
+                          "%d", (int)JS_VALUE_GET_TAG(v));
+        return -1;
+    }
+}
+
+static int wr_put_atomref(TTFlowWr *w, DynBuf *db, JSAtom atom)
+{
+    if (__JS_AtomIsTaggedInt(atom)) {
+        dbuf_put_leb128(db, (__JS_AtomToUInt32(atom) << 2) | 2);
+        return 0;
+    }
+    if (atom < JS_ATOM_END) {
+        dbuf_put_leb128(db, ((uint32_t)atom << 2) | 0);
+        return 0;
+    }
+    {
+        JSAtomStruct *p = w->ctx->rt->atom_array[atom];
+        if (p->atom_type != JS_ATOM_TYPE_STRING) {
+            dbuf_put_leb128(db, 3);
+            return wr_put_vref(w, db, JS_MKPTR(JS_TAG_SYMBOL, p));
+        } else {
+            uint32_t ai = tt_ptrmap_get(&w->atom_map, p);
+            if (!ai) {
+                JS_ThrowInternalError(w->ctx, "flow serialization: atom "
+                                      "escaped the enumeration pass");
+                return -1;
+            }
+            dbuf_put_leb128(db, ((ai - 1) << 2) | 1);
+        }
+    }
+    return 0;
+}
+
+static int wr_put_props(TTFlowWr *w, DynBuf *db, JSObject *p, BOOL skip_length)
+{
+    JSShape *sh = p->shape;
+    JSShapeProperty *prs = get_shape_prop(sh);
+    uint32_t n = 0;
+    int i;
+    for (i = 0; i < sh->prop_count; i++) {
+        JSShapeProperty *e = &get_shape_prop(sh)[i];
+        if (e->atom == JS_ATOM_NULL)
+            continue;
+        if (skip_length && e->atom == JS_ATOM_length)
+            continue;
+        n++;
+    }
+    dbuf_put_leb128(db, n);
+    for (i = 0; i < sh->prop_count; i++, prs++) {
+        JSProperty *pr;
+        if (prs->atom == JS_ATOM_NULL)
+            continue;
+        if (skip_length && prs->atom == JS_ATOM_length)
+            continue;
+        if (wr_put_atomref(w, db, prs->atom))
+            return -1;
+        dbuf_put_leb128(db, prs->flags & 0x3f);
+        pr = &p->prop[i];
+        switch (prs->flags & JS_PROP_TMASK) {
+        case JS_PROP_NORMAL:
+            if (wr_put_vref(w, db, pr->u.value))
+                return -1;
+            break;
+        case JS_PROP_GETSET:
+            if (wr_put_vref(w, db, pr->u.getset.getter ?
+                            JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter)
+                            : JS_UNDEFINED))
+                return -1;
+            if (wr_put_vref(w, db, pr->u.getset.setter ?
+                            JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.setter)
+                            : JS_UNDEFINED))
+                return -1;
+            break;
+        case JS_PROP_VARREF: {
+            JSVarRef *vr = pr->u.var_ref;
+            uint32_t bid = tt_ptrmap_get(&w->bl->map, vr);
+            if (bid) {
+                dbuf_put_leb128(db, ((bid - 1) << 1) | 1);
+            } else {
+                uint32_t idx = tt_ptrmap_get(&w->map, vr);
+                if (!idx) {
+                    JS_ThrowInternalError(w->ctx, "flow serialization: varref "
+                                          "escaped enumeration");
+                    return -1;
+                }
+                dbuf_put_leb128(db, ((idx - 1) << 1) | 0);
+            }
+            break;
+        }
+        default:
+            dbuf_put_leb128(db, (uint32_t)js_autoinit_get_id(pr));
+            break;
+        }
+    }
+    return 0;
+}
+
+/* emit a varref operand (0 = NULL | (baseline id << 1 | 1) + 1 …): helper
+   for closure tables and frame slots */
+static int wr_put_varref_opt(TTFlowWr *w, DynBuf *db, JSVarRef *vr)
+{
+    if (!vr) {
+        dbuf_put_leb128(db, 0);
+        return 0;
+    }
+    {
+        uint32_t bid = tt_ptrmap_get(&w->bl->map, vr);
+        if (bid) {
+            dbuf_put_leb128(db, 1 + (((bid - 1) << 1) | 1));
+        } else {
+            uint32_t idx = tt_ptrmap_get(&w->map, vr);
+            if (!idx) {
+                JS_ThrowInternalError(w->ctx, "flow serialization: varref "
+                                      "escaped enumeration");
+                return -1;
+            }
+            dbuf_put_leb128(db, 1 + (((idx - 1) << 1) | 0));
+        }
+    }
+    return 0;
+}
+
+/* Pass A of both the serializer and the fork: classify and index every
+   reachable entity. A machine-parked base registers its TrampFrame chain
+   first (base frame = frame 0); then a queued BFS from the base state and
+   the root handle; wr_scan_children() of each record enumerates every
+   reachable JSValue exactly once; per-state deltas join the reachable set.
+   Requires every delta checked out (cells pristine, records hold views). */
+static int wr_enumerate(TTFlowWr *w, JSAsyncFunctionState *base,
+                        JSValueConst root, int root_kind)
+{
+    JSContext *ctx = w->ctx;
+    uint32_t i, k;
+
+    if (w->chain_innermost || tt_flow_base_is_parked(ctx->rt, base)) {
+        if (wr_register_chain(w, base))
+            return -1;
+    }
+    if (wr_enum_state(w, base))
+        return -1;
+    if (root_kind == 1 && wr_enum_value(w, root))
+        return -1;
+    while (w->scan_head < w->rec_count) {
+        if (wr_scan_children(w, &w->recs[w->scan_head]))
+            return -1;
+        w->scan_head++;
+    }
+    /* delta targets and values are part of the reachable set too; every
+       reached state must be checked out */
+    for (k = 0; k < w->rec_count; k++) {
+        JSAsyncFunctionState *st;
+        TTFlowDelta *delta;
+        if (w->recs[k].kind != TT_REC_STATE)
+            continue;
+        st = w->recs[k].ptr;
+        delta = st->tt_delta;
+        if (!delta)
+            continue;
+        if (delta->checked_in) {
+            JS_ThrowTypeError(ctx, "flow serialization: check the flow out "
+                              "first (JS_TTFlowCheckout)");
+            return -1;
+        }
+        for (i = 0; i < delta->count; i++) {
+            TTFlowDeltaRec *rec = &delta->tab[i];
+            uint32_t k2;
+            if (!JS_IsUndefined(rec->obj) && wr_enum_value(w, rec->obj))
+                return -1;
+            if (rec->atom != JS_ATOM_NULL && wr_enum_atom(w, rec->atom))
+                return -1;
+            if (rec->vr && wr_enum_varref(w, rec->vr))
+                return -1;
+            if (wr_enum_value(w, rec->saved))
+                return -1;
+            switch (rec->kind) {
+            case TT_DELTA_ARRAY:
+                for (k2 = 0; k2 < rec->acount; k2++)
+                    if (wr_enum_value(w, rec->avec[k2]))
+                        return -1;
+                if (wr_enum_value(w, rec->alen))
+                    return -1;
+                break;
+            case TT_DELTA_PROMISE: {
+                JSPromiseData *pd = rec->snap;
+                struct list_head *el;
+                int m;
+                if (wr_enum_value(w, pd->promise_result))
+                    return -1;
+                for (m = 0; m < 2; m++) {
+                    list_for_each(el, &pd->promise_reactions[m]) {
+                        JSPromiseReactionData *rd2 =
+                            list_entry(el, JSPromiseReactionData, link);
+                        if (wr_enum_value(w, rd2->resolving_funcs[0]) ||
+                            wr_enum_value(w, rd2->resolving_funcs[1]) ||
+                            wr_enum_value(w, rd2->handler))
+                            return -1;
+                    }
+                }
+                break;
+            }
+            }
+            while (w->scan_head < w->rec_count) {
+                if (wr_scan_children(w, &w->recs[w->scan_head]))
+                    return -1;
+                w->scan_head++;
+            }
+        }
+    }
+    /* the flow's captured pending jobs are part of the reachable set */
+    if (base->tt_jobs) {
+        struct list_head *el;
+        list_for_each(el, &base->tt_jobs->jobs) {
+            JSJobEntry *e = list_entry(el, JSJobEntry, link);
+            int j;
+            if (e->job_func != promise_reaction_job &&
+                e->job_func != js_promise_resolve_thenable_job) {
+                JS_ThrowTypeError(ctx, "flow serialization: unsupported "
+                                  "pending job kind in the flow queue");
+                return -1;
+            }
+            for (j = 0; j < e->argc; j++)
+                if (wr_enum_value(w, e->argv[j]))
+                    return -1;
+            while (w->scan_head < w->rec_count) {
+                if (wr_scan_children(w, &w->recs[w->scan_head]))
+                    return -1;
+                w->scan_head++;
+            }
+        }
+    }
+    if (w->frame_count == 0 || w->frames[0].sf != &base->frame) {
+        JS_ThrowInternalError(ctx, "flow serialization: base frame not "
+                              "first");
+        return -1;
+    }
+    return 0;
+}
+
+/* serialize_flow(): the task-level entry point. 'base' is the flow's root
+   JSAsyncFunctionState; 'root' the host-facing handle (the generator object,
+   or the state itself). Returns js_malloc'd bytes. */
+static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
+                               JSValueConst root, int root_kind, size_t *plen)
+{
+    TTFlowWr w_s, *w = &w_s;
+    DynBuf db;
+    uint32_t i;
+    uint8_t *out = NULL;
+    TTFlowDelta *delta;
+
+    *plen = 0;
+    if (!ctx->rt->tt_flow_baseline) {
+        JS_ThrowTypeError(ctx, "flow serialization: no baseline captured");
+        return NULL;
+    }
+    memset(w, 0, sizeof(*w));
+    w->ctx = ctx;
+    w->bl = ctx->rt->tt_flow_baseline;
+    dbuf_init2(&db, ctx->rt, (DynBufReallocFunc *)js_realloc_rt);
+
+    delta = base->tt_delta;
+    if (wr_enumerate(w, base, root, root_kind))
+        goto fail;
+
+    /* pass B (relink as ids): emit everything against the completed maps */
+    dbuf_put(&db, (const uint8_t *)TT_FLOW_MAGIC, TT_FLOW_MAGIC_LEN);
+    {
+        uint64_t fp = w->bl->fingerprint;
+        for (i = 0; i < 8; i++)
+            dbuf_putc(&db, (uint8_t)(fp >> (i * 8)));
+    }
+    dbuf_put_leb128(&db, w->bl->count);
+    dbuf_put_leb128(&db, w->machine ? TT_FLOWF_MACHINE : 0);
+
+    /* private atom table */
+    dbuf_put_leb128(&db, w->atom_count);
+    for (i = 0; i < w->atom_count; i++)
+        wr_put_string(&db, ctx->rt->atom_array[w->atoms[i]]);
+
+    /* record shells */
+    dbuf_put_leb128(&db, w->rec_count);
+    for (i = 0; i < w->rec_count; i++) {
+        TTFlowWrRec *rec = &w->recs[i];
+        dbuf_putc(&db, rec->kind);
+        switch (rec->kind) {
+        case TT_REC_PLAIN:
+            dbuf_put_leb128(&db, ((JSObject *)rec->ptr)->class_id);
+            break;
+        case TT_REC_ARRAY:
+            dbuf_put_leb128(&db, ((JSObject *)rec->ptr)->u.array.count);
+            break;
+        case TT_REC_CLOSURE: {
+            JSObject *p = rec->ptr;
+            int fid = wr_fn_id(w, p->u.func.function_bytecode);
+            if (fid < 0)
+                goto fail;
+            dbuf_put_leb128(&db, (uint32_t)fid);
+            break;
+        }
+        case TT_REC_GENOBJ: {
+            JSObject *p = rec->ptr;
+            JSGeneratorData *gd = p->u.generator_data;
+            uint32_t srec = 0;
+            uint8_t gstate = gd ? (uint8_t)gd->state
+                                : (uint8_t)JS_GENERATOR_STATE_COMPLETED;
+            if (gd && gd->func_state &&
+                gd->state != JS_GENERATOR_STATE_COMPLETED)
+                srec = tt_ptrmap_get(&w->map, gd->func_state);
+            dbuf_putc(&db, gstate);
+            dbuf_put_leb128(&db, srec);     /* rec idx + 1, 0 = none */
+            break;
+        }
+        case TT_REC_STATE: {
+            JSAsyncFunctionState *st = rec->ptr;
+            JSObject *fp = JS_VALUE_GET_OBJ(st->frame.cur_func);
+            int fid = wr_fn_id(w, fp->u.func.function_bytecode);
+            if (fid < 0)
+                goto fail;
+            dbuf_put_leb128(&db, (uint32_t)fid);
+            dbuf_put_leb128(&db, (uint32_t)st->argc);
+            dbuf_putc(&db, st->throw_flag ? 1 : 0);
+            break;
+        }
+        case TT_REC_PROMISE_FUNC:
+            dbuf_putc(&db, (uint8_t)(((JSObject *)rec->ptr)->class_id -
+                                     JS_CLASS_PROMISE_RESOLVE_FUNCTION));
+            break;
+        case TT_REC_PRESOLVED:
+            dbuf_putc(&db, ((JSPromiseFunctionDataResolved *)rec->ptr)
+                      ->already_resolved ? 1 : 0);
+            break;
+        case TT_REC_ASYNC_RESOLVE:
+            dbuf_putc(&db, (uint8_t)(((JSObject *)rec->ptr)->class_id -
+                                     JS_CLASS_ASYNC_FUNCTION_RESOLVE));
+            break;
+        case TT_REC_VARREF_OPEN: {
+            JSVarRef *vr = rec->ptr;
+            JSStackFrame *sf = vr->stack_frame;
+            uint32_t fidx = tt_ptrmap_get(&w->frame_map, sf);
+            uint32_t k, mem_frame = 0;
+            JSValue *mem_start = NULL;
+            if (!fidx) {
+                JS_ThrowTypeError(ctx, "flow serialization: open cell "
+                                  "belongs to a frame outside the flow");
+                goto fail;
+            }
+            /* the cell's storage may live in a DIFFERENT frame than the one
+               it is registered on: an aliased argument window puts a
+               captured arg's slot in the parent's block */
+            for (k = 0; k < w->frame_count; k++) {
+                JSValue *s0 = wr_frame_owned_start(&w->frames[k]);
+                if (vr->pvalue >= s0 && vr->pvalue < w->frames[k].sf->cur_sp) {
+                    mem_frame = k + 1;
+                    mem_start = s0;
+                    break;
+                }
+            }
+            if (!mem_frame) {
+                JS_ThrowInternalError(ctx, "flow serialization: open cell "
+                                      "points outside the flow's frames");
+                goto fail;
+            }
+            dbuf_put_leb128(&db, fidx - 1);
+            dbuf_put_leb128(&db, vr->var_ref_idx);
+            dbuf_put_leb128(&db, mem_frame - 1);
+            dbuf_put_leb128(&db, (uint32_t)(vr->pvalue - mem_start));
+            dbuf_putc(&db, (vr->is_lexical ? 1 : 0) | (vr->is_const ? 2 : 0));
+            break;
+        }
+        case TT_REC_VARREF_CLOSED: {
+            JSVarRef *vr = rec->ptr;
+            dbuf_putc(&db, (vr->is_lexical ? 1 : 0) | (vr->is_const ? 2 : 0));
+            break;
+        }
+        case TT_REC_STRING:
+            wr_put_string(&db, (JSString *)rec->ptr);
+            break;
+        case TT_REC_SYMBOL: {
+            JSAtomStruct *p = rec->ptr;
+            wr_put_string(&db, p);          /* the description */
+            break;
+        }
+        case TT_REC_DATAOBJ:
+            dbuf_put_leb128(&db, ((JSObject *)rec->ptr)->class_id);
+            break;
+        }
+    }
+
+    /* frame table: the parked TrampFrame chain, base first (detached
+       suspended nested states follow). cur_pc travels as a byte offset
+       against the frame's function; every frame carries its live extent
+       and step-cache so a stepping host resumes byte-identically. */
+    dbuf_put_leb128(&db, w->frame_count);
+    for (i = 0; i < w->frame_count; i++) {
+        TTFlowWrFrame *fe = &w->frames[i];
+        JSStackFrame *sf = fe->sf;
+        JSObject *fp = JS_VALUE_GET_OBJ(sf->cur_func);
+        JSFunctionBytecode *b = fp->u.func.function_bytecode;
+        uint32_t pc_off = (uint32_t)(sf->cur_pc - b->byte_code_buf);
+        uint32_t stack_len =
+            (uint32_t)(sf->cur_sp - wr_frame_owned_start(fe));
+        if (pc_off > (uint32_t)b->byte_code_len) {
+            JS_ThrowInternalError(ctx, "flow serialization: pc outside its "
+                                  "function");
+            goto fail;
+        }
+        dbuf_putc(&db, fe->owner);
+        if (fe->owner == 0) {
+            JSAsyncFunctionState *st =
+                container_of(sf, JSAsyncFunctionState, frame);
+            uint32_t rec_idx = tt_ptrmap_get(&w->map, st);
+            dbuf_put_leb128(&db, rec_idx - 1);
+            dbuf_put_leb128(&db, pc_off);
+            dbuf_put_leb128(&db, stack_len);
+            dbuf_putc(&db, fe->chained);
+            if (fe->chained) {
+                /* the in-loop splice linkage; normalized to zero for the
+                   base frame, which is rebuilt as a C-entry (its result
+                   returns to the host in the fresh process) */
+                if (i == 0) {
+                    dbuf_put_leb128(&db, 0);
+                    dbuf_put_leb128(&db, 0);
+                    dbuf_put_leb128(&db, 0);
+                } else {
+                    JSGeneratorData *gs = sf->tt_aux;
+                    uint32_t gobj_rec = 0;
+                    uint32_t k;
+                    /* the generator object owning this splice: find the
+                       GENOBJ record whose data is sf->tt_aux */
+                    for (k = 0; k < w->rec_count; k++) {
+                        if (w->recs[k].kind == TT_REC_GENOBJ &&
+                            ((JSObject *)w->recs[k].ptr)->u.generator_data == gs) {
+                            gobj_rec = k + 1;
+                            break;
+                        }
+                    }
+                    if (!gobj_rec) {
+                        JS_ThrowTypeError(ctx, "flow serialization: chained "
+                                          "generator object escaped the "
+                                          "flow graph");
+                        goto fail;
+                    }
+                    dbuf_put_leb128(&db, (uint32_t)sf->tt_aux_i);
+                    dbuf_put_leb128(&db, sf->tt_call_argc);
+                    dbuf_put_leb128(&db, gobj_rec);
+                }
+            }
+        } else {
+            /* arena TrampFrame: geometry re-derives from cur_func's
+               bytecode; the argument window and `this` are parent-relative
+               so aliasing rebuilds exactly */
+            TTFlowWrFrame *pe = &w->frames[i - 1];
+            JSValue *pstart = wr_frame_owned_start(pe);
+            uint32_t plive = (uint32_t)(pe->sf->cur_sp - pstart);
+            uint32_t argv_off;
+            if (sf->tt_orig_argv < pstart ||
+                sf->tt_orig_argv + sf->tt_orig_argc > pe->sf->cur_sp) {
+                JS_ThrowInternalError(ctx, "flow serialization: argument "
+                                      "window outside the parent frame");
+                goto fail;
+            }
+            argv_off = (uint32_t)(sf->tt_orig_argv - pstart);
+            if (wr_put_vref(w, &db, sf->cur_func))
+                goto fail;
+            dbuf_put_leb128(&db, pc_off);
+            dbuf_putc(&db, sf->tt_frame_kind);
+            dbuf_put_leb128(&db, (uint32_t)sf->tt_orig_argc);
+            dbuf_put_leb128(&db, sf->tt_call_argc);
+            dbuf_put_leb128(&db, stack_len);
+            dbuf_put_leb128(&db, argv_off);
+            if (JS_IsUndefined(sf->tt_this)) {
+                dbuf_putc(&db, 0);
+            } else {
+                /* a method receiver: the value below the callee on the
+                   parent's stack (bit-identical by construction) */
+                uint32_t toff = argv_off - 2;
+                if (argv_off < 2 || toff >= plive ||
+                    memcmp(&pstart[toff], &sf->tt_this,
+                           sizeof(JSValue)) != 0) {
+                    JS_ThrowInternalError(ctx, "flow serialization: `this` "
+                                          "is not the parent receiver slot");
+                    goto fail;
+                }
+                dbuf_putc(&db, 1);
+                dbuf_put_leb128(&db, toff);
+            }
+        }
+        /* step-hook line cache: byte-identical resume under stepping */
+        dbuf_put_leb128(&db, (uint32_t)sf->tt_last_line);
+        dbuf_put_leb128(&db, sf->tt_pc_lo);
+        dbuf_put_leb128(&db, sf->tt_pc_hi);
+        dbuf_put_leb128(&db, sf->tt_prev_off);
+    }
+
+    /* record payloads (the reader's pass-2 stream) */
+    for (i = 0; i < w->rec_count; i++) {
+        TTFlowWrRec *rec = &w->recs[i];
+        switch (rec->kind) {
+        case TT_REC_PLAIN: {
+            JSObject *p = rec->ptr;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_ARRAY: {
+            JSObject *p = rec->ptr;
+            uint32_t k;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            for (k = 0; k < p->u.array.count; k++)
+                if (wr_put_vref(w, &db, p->u.array.u.values[k]))
+                    goto fail;
+            if (wr_put_props(w, &db, p, TRUE))
+                goto fail;
+            break;
+        }
+        case TT_REC_CLOSURE: {
+            JSObject *p = rec->ptr;
+            JSFunctionBytecode *b = p->u.func.function_bytecode;
+            int k;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            if (wr_put_vref(w, &db, p->u.func.home_object ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->u.func.home_object)
+                            : JS_UNDEFINED))
+                goto fail;
+            dbuf_put_leb128(&db, (uint32_t)b->closure_var_count);
+            for (k = 0; k < b->closure_var_count; k++) {
+                JSVarRef *vr = p->u.func.var_refs ? p->u.func.var_refs[k]
+                                                  : NULL;
+                if (wr_put_varref_opt(w, &db, vr))
+                    goto fail;
+            }
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_GENOBJ: {
+            JSObject *p = rec->ptr;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_STATE: {
+            JSAsyncFunctionState *st = rec->ptr;
+            if (wr_put_vref(w, &db, st->frame.cur_func))
+                goto fail;
+            if (wr_put_vref(w, &db, st->this_val))
+                goto fail;
+            if (wr_put_vref(w, &db, st->resolving_funcs[0]) ||
+                wr_put_vref(w, &db, st->resolving_funcs[1]))
+                goto fail;
+            break;
+        }
+        case TT_REC_PROMISE: {
+            JSObject *p = rec->ptr;
+            JSPromiseData *pd = JS_GetOpaque(JS_MKPTR(JS_TAG_OBJECT, p),
+                                             JS_CLASS_PROMISE);
+            struct list_head *el;
+            int k;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            dbuf_putc(&db, (uint8_t)pd->promise_state);
+            dbuf_putc(&db, pd->is_handled ? 1 : 0);
+            if (wr_put_vref(w, &db, pd->promise_result))
+                goto fail;
+            for (k = 0; k < 2; k++) {
+                uint32_t n = 0;
+                list_for_each(el, &pd->promise_reactions[k])
+                    n++;
+                dbuf_put_leb128(&db, n);
+                list_for_each(el, &pd->promise_reactions[k]) {
+                    JSPromiseReactionData *rd =
+                        list_entry(el, JSPromiseReactionData, link);
+                    if (wr_put_vref(w, &db, rd->resolving_funcs[0]) ||
+                        wr_put_vref(w, &db, rd->resolving_funcs[1]) ||
+                        wr_put_vref(w, &db, rd->handler))
+                        goto fail;
+                }
+            }
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_PROMISE_FUNC: {
+            JSObject *p = rec->ptr;
+            JSPromiseFunctionData *fd = p->u.promise_function_data;
+            uint32_t pidx = tt_ptrmap_get(&w->map, fd->presolved);
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            if (wr_put_vref(w, &db, fd->promise))
+                goto fail;
+            dbuf_put_leb128(&db, pidx - 1);
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_ASYNC_RESOLVE: {
+            JSObject *p = rec->ptr;
+            uint32_t sidx = tt_ptrmap_get(&w->map, p->u.async_function_data);
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            dbuf_put_leb128(&db, sidx - 1);
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_VARREF_CLOSED: {
+            JSVarRef *vr = rec->ptr;
+            if (wr_put_vref(w, &db, *vr->pvalue))
+                goto fail;
+            break;
+        }
+        case TT_REC_DATAOBJ: {
+            JSObject *p = rec->ptr;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            if (wr_put_vref(w, &db, p->u.object_data))
+                goto fail;
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    /* frame payloads: each parked frame's owned live JSValue range
+       (aliased argument windows belong to -- and travel with -- the
+       parent frame) */
+    for (i = 0; i < w->frame_count; i++) {
+        JSStackFrame *sf = w->frames[i].sf;
+        JSValue *sp;
+        for (sp = wr_frame_owned_start(&w->frames[i]); sp < sf->cur_sp; sp++)
+            if (wr_put_vref(w, &db, *sp))
+                goto fail;
+    }
+
+    /* the per-flow COW delta: per-kind pre-image records */
+    dbuf_put_leb128(&db, delta ? delta->count : 0);
+    if (delta) {
+        for (i = 0; i < delta->count; i++) {
+            TTFlowDeltaRec *rec = &delta->tab[i];
+            dbuf_putc(&db, rec->kind);
+            if (rec->kind != TT_DELTA_CELL &&
+                wr_put_vref(w, &db, rec->obj))
+                goto fail;
+            switch (rec->kind) {
+            case TT_DELTA_PROP:
+            case TT_DELTA_PROPX:
+                if (wr_put_atomref(w, &db, rec->atom))
+                    goto fail;
+                if (rec->kind == TT_DELTA_PROPX) {
+                    dbuf_putc(&db, rec->holds ? 1 : 0);
+                    dbuf_putc(&db, rec->prop_flags);
+                }
+                if (wr_put_vref(w, &db, rec->saved))
+                    goto fail;
+                break;
+            case TT_DELTA_CELL:
+                if (wr_put_varref_opt(w, &db, rec->vr))
+                    goto fail;
+                if (wr_put_vref(w, &db, rec->saved))
+                    goto fail;
+                break;
+            case TT_DELTA_ARRAY: {
+                uint32_t k;
+                dbuf_put_leb128(&db, rec->acount);
+                for (k = 0; k < rec->acount; k++)
+                    if (wr_put_vref(w, &db, rec->avec[k]))
+                        goto fail;
+                if (wr_put_vref(w, &db, rec->alen))
+                    goto fail;
+                break;
+            }
+            case TT_DELTA_PROMISE: {
+                JSPromiseData *pd = rec->snap;
+                struct list_head *el;
+                int m;
+                dbuf_putc(&db, (uint8_t)pd->promise_state);
+                dbuf_putc(&db, pd->is_handled ? 1 : 0);
+                if (wr_put_vref(w, &db, pd->promise_result))
+                    goto fail;
+                for (m = 0; m < 2; m++) {
+                    uint32_t nr2 = 0;
+                    list_for_each(el, &pd->promise_reactions[m])
+                        nr2++;
+                    dbuf_put_leb128(&db, nr2);
+                    list_for_each(el, &pd->promise_reactions[m]) {
+                        JSPromiseReactionData *rd2 =
+                            list_entry(el, JSPromiseReactionData, link);
+                        if (wr_put_vref(w, &db, rd2->resolving_funcs[0]) ||
+                            wr_put_vref(w, &db, rd2->resolving_funcs[1]) ||
+                            wr_put_vref(w, &db, rd2->handler))
+                            goto fail;
+                    }
+                }
+                break;
+            }
+            case TT_DELTA_PRESOLVED:
+                dbuf_putc(&db, rec->holds ? 1 : 0);
+                break;
+            case TT_DELTA_ODATA:
+                if (wr_put_vref(w, &db, rec->saved))
+                    goto fail;
+                break;
+            case TT_DELTA_DEAD:
+                break;
+            default:
+                JS_ThrowTypeError(ctx, "flow serialization: Map/ArrayBuffer "
+                                  "delta records do not serialize yet");
+                goto fail;
+            }
+        }
+    }
+
+    /* the flow's pending job queue (captured at checkout) */
+    {
+        uint32_t nj = base->tt_jobs ? (uint32_t)base->tt_jobs->count : 0;
+        struct list_head *el;
+        dbuf_put_leb128(&db, nj);
+        if (base->tt_jobs) {
+            list_for_each(el, &base->tt_jobs->jobs) {
+                JSJobEntry *e = list_entry(el, JSJobEntry, link);
+                int j;
+                dbuf_putc(&db, e->job_func == promise_reaction_job ? 0 : 1);
+                dbuf_put_leb128(&db, (uint32_t)e->argc);
+                for (j = 0; j < e->argc; j++)
+                    if (wr_put_vref(w, &db, e->argv[j]))
+                        goto fail;
+            }
+        }
+    }
+
+    /* root */
+    dbuf_putc(&db, (uint8_t)root_kind);
+    if (root_kind == 1) {
+        if (wr_put_vref(w, &db, root))
+            goto fail;
+    } else {
+        uint32_t idx = tt_ptrmap_get(&w->map, base);
+        dbuf_put_leb128(&db, idx - 1);
+    }
+
+    if (db.error)
+        goto fail;
+    out = js_malloc(ctx, db.size ? db.size : 1);
+    if (!out)
+        goto fail;
+    memcpy(out, db.buf, db.size);
+    *plen = db.size;
+fail:
+    dbuf_free(&db);
+    tt_ptrmap_free(ctx, &w->map);
+    tt_ptrmap_free(ctx, &w->frame_map);
+    tt_ptrmap_free(ctx, &w->atom_map);
+    js_free(ctx, w->recs);
+    js_free(ctx, w->frames);
+    js_free(ctx, w->atoms);
+    return out;
+}
+
+/* -- deserializer (read side) --------------------------------------------- */
+
+typedef struct TTFlowRdRec {
+    uint8_t kind;
+    JSValue v;                /* OBJ/STRING/SYMBOL construction reference */
+    JSVarRef *vr;             /* VARREF construction reference */
+    void *raw;                /* PRESOLVED flag struct; PROMISE_FUNC's data
+                                 until its object adopts it in pass 2 */
+    JSAsyncFunctionState *st; /* STATE construction reference */
+    uint32_t fn_id, argc, aux_a, aux_b, aux_c, aux_d;
+    uint8_t u8a;
+} TTFlowRdRec;
+
+/* one rebuilt frame of the TrampFrame chain */
+typedef struct TTFlowRdFrame {
+    JSStackFrame *sf;
+    JSFunctionBytecode *b;
+    JSValue *start;           /* owned value range start */
+    uint32_t live;            /* owned live count ([start, cur_sp)) */
+    uint32_t aux_i, cargc;    /* chained splice linkage (heap frames) */
+    uint32_t genobj_rec;      /* +1; 0 = none */
+    int32_t this_off;         /* arena: parent slot of tt_this, -1 = none */
+    uint8_t owner;            /* 0 = state-owned heap frame, 1 = arena */
+    uint8_t chained;
+} TTFlowRdFrame;
+
+typedef struct TTFlowRd {
+    JSContext *ctx;
+    JSRuntime *rt;
+    TTFlowBaseline *bl;
+    TTRdBuf rd;
+    JSAtom *atoms;            /* interned private atoms (owned) */
+    uint32_t atom_count;
+    TTFlowRdRec *recs;
+    uint32_t rec_count;
+    TTFlowRdFrame *frames;    /* rebuilt TrampFrame chain, base first */
+    uint32_t frame_count;
+    uint32_t chain_count;     /* leading chained frames (machine extent) */
+    uint8_t machine;
+    TTMachine *m;             /* the rebuilt chain's own machine (owned until
+                                 the base state adopts it) */
+} TTFlowRd;
+
+static JSFunctionBytecode *rd_fn(TTFlowRd *r, uint32_t fn_id)
+{
+    if (fn_id >= r->bl->count || r->bl->tab[fn_id].kind != TT_BASE_FUNC_BC) {
+        JS_ThrowTypeError(r->ctx, "flow bytes: bad function id");
+        return NULL;
+    }
+    return r->bl->tab[fn_id].ptr;
+}
+
+static JSValue rd_read_string(TTFlowRd *r)
+{
+    uint32_t h = tt_rd_leb(&r->rd);
+    uint32_t len = h >> 1;
+    if (h & 1) {
+        const uint8_t *bytes = tt_rd_bytes(&r->rd, (size_t)len * 2);
+        JSString *str;
+        uint32_t i;
+        if (!bytes)
+            goto trunc;
+        str = js_alloc_string(r->ctx, len, 1);
+        if (!str)
+            return JS_EXCEPTION;
+        for (i = 0; i < len; i++)
+            str->u.str16[i] = bytes[i * 2] | (bytes[i * 2 + 1] << 8);
+        return JS_MKPTR(JS_TAG_STRING, str);
+    } else {
+        const uint8_t *bytes = tt_rd_bytes(&r->rd, len);
+        JSString *str;
+        if (!bytes)
+            goto trunc;
+        str = js_alloc_string(r->ctx, len, 0);
+        if (!str)
+            return JS_EXCEPTION;
+        memcpy(str->u.str8, bytes, len);
+        str->u.str8[len] = '\0';
+        return JS_MKPTR(JS_TAG_STRING, str);
+    }
+trunc:
+    return JS_ThrowTypeError(r->ctx, "flow bytes: truncated string");
+}
+
+/* decode a vref into an owned JSValue against the completed tables */
+static JSValue rd_get_vref(TTFlowRd *r)
+{
+    uint32_t h = tt_rd_leb(&r->rd);
+    if (r->rd.err)
+        goto trunc;
+    switch (h & 3) {
+    case 0:
+        switch (h >> 2) {
+        case TT_VR_UNDEFINED:     return JS_UNDEFINED;
+        case TT_VR_NULL:          return JS_NULL;
+        case TT_VR_FALSE:         return JS_FALSE;
+        case TT_VR_TRUE:          return JS_TRUE;
+        case TT_VR_UNINITIALIZED: return JS_UNINITIALIZED;
+        case TT_VR_INT:           return JS_NewInt32(r->ctx, tt_rd_sleb(&r->rd));
+        case TT_VR_FLOAT64:       return JS_NewFloat64(r->ctx, tt_rd_f64(&r->rd));
+        case TT_VR_CATCH_OFFSET:
+            return JS_MKVAL(JS_TAG_CATCH_OFFSET, (int)tt_rd_leb(&r->rd));
+        case TT_VR_SHORT_BIGINT:
+            return __JS_NewShortBigInt(r->ctx, tt_rd_sleb(&r->rd));
+        case TT_VR_INLINE_STR:
+            return rd_read_string(r);
+        default:
+            return JS_ThrowTypeError(r->ctx, "flow bytes: bad inline subtag");
+        }
+    case 1: {                 /* baseline id: BY REFERENCE */
+        uint32_t id = h >> 2;
+        if (id >= r->bl->count)
+            goto bad;
+        switch (r->bl->tab[id].kind) {
+        case TT_BASE_OBJ:
+            return JS_DupValue(r->ctx, JS_MKPTR(JS_TAG_OBJECT,
+                                                r->bl->tab[id].ptr));
+        case TT_BASE_SYM:
+            return JS_DupValue(r->ctx, JS_MKPTR(JS_TAG_SYMBOL,
+                                                r->bl->tab[id].ptr));
+        default:
+            goto bad;
+        }
+    }
+    case 2: {                 /* private record: BY VALUE */
+        uint32_t idx = h >> 2;
+        TTFlowRdRec *rec;
+        if (idx >= r->rec_count)
+            goto bad;
+        rec = &r->recs[idx];
+        switch (rec->kind) {
+        case TT_REC_VARREF_OPEN:
+        case TT_REC_VARREF_CLOSED:
+        case TT_REC_STATE:
+            goto bad;         /* not first-class values */
+        default:
+            return JS_DupValue(r->ctx, rec->v);
+        }
+    }
+    default:
+        goto bad;
+    }
+bad:
+    return JS_ThrowTypeError(r->ctx, "flow bytes: bad value reference");
+trunc:
+    return JS_ThrowTypeError(r->ctx, "flow bytes: truncated");
+}
+
+/* decode a varref operand (borrowed pointer; caller takes its own ref) */
+static JSVarRef *rd_get_varref_pair(TTFlowRd *r, uint32_t enc)
+{
+    if (enc & 1) {
+        uint32_t id = enc >> 1;
+        if (id >= r->bl->count || r->bl->tab[id].kind != TT_BASE_VARREF) {
+            JS_ThrowTypeError(r->ctx, "flow bytes: bad baseline cell id");
+            return NULL;
+        }
+        return r->bl->tab[id].ptr;
+    } else {
+        uint32_t idx = enc >> 1;
+        if (idx >= r->rec_count ||
+            (r->recs[idx].kind != TT_REC_VARREF_OPEN &&
+             r->recs[idx].kind != TT_REC_VARREF_CLOSED)) {
+            JS_ThrowTypeError(r->ctx, "flow bytes: bad cell record");
+            return NULL;
+        }
+        return r->recs[idx].vr;
+    }
+}
+
+static JSVarRef *rd_get_varref_opt(TTFlowRd *r, BOOL *pnull)
+{
+    uint32_t enc = tt_rd_leb(&r->rd);
+    if (r->rd.err) {
+        JS_ThrowTypeError(r->ctx, "flow bytes: truncated");
+        return NULL;
+    }
+    if (enc == 0) {
+        *pnull = TRUE;
+        return NULL;
+    }
+    *pnull = FALSE;
+    return rd_get_varref_pair(r, enc - 1);
+}
+
+static JSAtom rd_get_atomref(TTFlowRd *r)
+{
+    uint32_t a = tt_rd_leb(&r->rd);
+    if (r->rd.err)
+        goto trunc;
+    switch (a & 3) {
+    case 0:
+        if ((a >> 2) >= JS_ATOM_END)
+            goto bad;
+        return JS_DupAtom(r->ctx, a >> 2);
+    case 1:
+        if ((a >> 2) >= r->atom_count)
+            goto bad;
+        return JS_DupAtom(r->ctx, r->atoms[a >> 2]);
+    case 2:
+        if ((a >> 2) > JS_ATOM_MAX_INT)
+            goto bad;
+        return __JS_AtomFromUInt32(a >> 2);
+    default: {                /* symbol-keyed */
+        JSValue sym = rd_get_vref(r);
+        JSAtom atom;
+        if (JS_IsException(sym))
+            return JS_ATOM_NULL;
+        atom = JS_ValueToAtom(r->ctx, sym);
+        JS_FreeValue(r->ctx, sym);
+        return atom;          /* JS_ATOM_NULL on error */
+    }
+    }
+bad:
+    JS_ThrowTypeError(r->ctx, "flow bytes: bad atom reference");
+    return JS_ATOM_NULL;
+trunc:
+    JS_ThrowTypeError(r->ctx, "flow bytes: truncated");
+    return JS_ATOM_NULL;
+}
+
+/* allocate a STATE shell with async_func_init() geometry but no contents */
+static JSAsyncFunctionState *rd_alloc_state(JSContext *ctx,
+                                            JSFunctionBytecode *b,
+                                            uint32_t argc)
+{
+    JSAsyncFunctionState *s;
+    JSStackFrame *sf;
+    int arg_buf_len, i, n;
+
+    if (argc > 65535) {
+        JS_ThrowTypeError(ctx, "flow bytes: bad argc");
+        return NULL;
+    }
+    arg_buf_len = max_int(b->arg_count, (int)argc);
+    s = js_malloc(ctx, sizeof(*s) + sizeof(JSValue) *
+                  (arg_buf_len + b->var_count + b->stack_size) +
+                  sizeof(JSVarRef *) * b->var_ref_count);
+    if (!s)
+        return NULL;
+    memset(s, 0, sizeof(*s));
+    js_rc(s)->ref_count = 1;
+    add_gc_object(ctx->rt, &s->header, JS_GC_OBJ_TYPE_ASYNC_FUNCTION);
+    sf = &s->frame;
+    sf->js_mode = b->js_mode | JS_MODE_ASYNC;
+    sf->cur_pc = b->byte_code_buf;
+    sf->arg_buf = (JSValue *)(s + 1);
+    sf->cur_func = JS_UNDEFINED;
+    s->this_val = JS_UNDEFINED;
+    s->argc = (int)argc;
+    sf->arg_count = arg_buf_len;
+    sf->var_buf = sf->arg_buf + arg_buf_len;
+    sf->cur_sp = sf->var_buf + b->var_count;
+    sf->tt_this = s->this_val;
+    sf->tt_new_target = JS_UNDEFINED;
+    sf->tt_orig_argv = sf->arg_buf;
+    sf->tt_orig_argc = (int)argc;
+    sf->tt_frame_base = sf->arg_buf;
+    sf->tt_frame_kind = TT_FRAME_ENTRY;
+    sf->tt_call_argc = 0;
+    sf->tt_ctor_this = JS_UNDEFINED;
+    sf->tt_aux = NULL;
+    sf->tt_aux_i = 0;
+    sf->var_refs = (JSVarRef **)(sf->arg_buf + arg_buf_len + b->var_count +
+                                 b->stack_size);
+    for (i = 0; i < b->var_ref_count; i++)
+        sf->var_refs[i] = NULL;
+    n = arg_buf_len + b->var_count + b->stack_size;
+    for (i = 0; i < n; i++)
+        sf->arg_buf[i] = JS_UNDEFINED;
+    s->resolving_funcs[0] = JS_UNDEFINED;
+    s->resolving_funcs[1] = JS_UNDEFINED;
+    s->is_completed = FALSE;
+    return s;
+}
+
+/* release every construction reference; the relinked graph keeps what it
+   reached, everything else frees -- the refcount reconciliation step */
+static void rd_release(TTFlowRd *r)
+{
+    uint32_t i;
+    for (i = 0; i < r->rec_count; i++) {
+        TTFlowRdRec *rec = &r->recs[i];
+        switch (rec->kind) {
+        case 0:
+            break;            /* never materialized (early failure) */
+        case TT_REC_STATE:
+            if (rec->st)
+                async_func_free(r->rt, rec->st);
+            break;
+        case TT_REC_VARREF_OPEN:
+        case TT_REC_VARREF_CLOSED:
+            if (rec->vr)
+                free_var_ref(r->rt, rec->vr);
+            break;
+        case TT_REC_PRESOLVED:
+            if (rec->raw)
+                js_promise_resolve_function_free_resolved(r->rt, rec->raw);
+            break;
+        case TT_REC_PROMISE_FUNC:
+            if (rec->raw) {
+                /* the object never adopted its data (early failure) */
+                JSPromiseFunctionData *fd = rec->raw;
+                JS_FreeValue(r->ctx, fd->promise);
+                js_free(r->ctx, fd);
+            }
+            JS_FreeValue(r->ctx, rec->v);
+            break;
+        default:
+            JS_FreeValue(r->ctx, rec->v);
+            break;
+        }
+    }
+    for (i = 0; i < r->atom_count; i++)
+        JS_FreeAtom(r->ctx, r->atoms[i]);
+    js_free(r->ctx, r->atoms);
+    js_free(r->ctx, r->recs);
+    js_free(r->ctx, r->frames);
+}
+
+/* read one prop list onto 'obj' */
+static int rd_read_props(TTFlowRd *r, JSValueConst obj)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(obj);
+    uint32_t n = tt_rd_leb(&r->rd);
+    uint32_t k;
+    if (r->rd.err)
+        return -1;
+    for (k = 0; k < n; k++) {
+        JSAtom atom = rd_get_atomref(r);
+        uint32_t flags = tt_rd_leb(&r->rd);
+        JSProperty *pr;
+        if (atom == JS_ATOM_NULL || r->rd.err) {
+            JS_FreeAtom(r->ctx, atom);
+            return -1;
+        }
+        switch (flags & JS_PROP_TMASK) {
+        case JS_PROP_NORMAL: {
+            JSValue v = rd_get_vref(r);
+            if (JS_IsException(v)) {
+                JS_FreeAtom(r->ctx, atom);
+                return -1;
+            }
+            pr = add_property(r->ctx, p, atom, (int)flags);
+            if (!pr) {
+                JS_FreeAtom(r->ctx, atom);
+                JS_FreeValue(r->ctx, v);
+                return -1;
+            }
+            pr->u.value = v;
+            break;
+        }
+        case JS_PROP_GETSET: {
+            JSValue g = rd_get_vref(r);
+            JSValue s;
+            if (JS_IsException(g)) {
+                JS_FreeAtom(r->ctx, atom);
+                return -1;
+            }
+            s = rd_get_vref(r);
+            if (JS_IsException(s)) {
+                JS_FreeAtom(r->ctx, atom);
+                JS_FreeValue(r->ctx, g);
+                return -1;
+            }
+            if (!(JS_IsUndefined(g) || JS_VALUE_GET_TAG(g) == JS_TAG_OBJECT) ||
+                !(JS_IsUndefined(s) || JS_VALUE_GET_TAG(s) == JS_TAG_OBJECT)) {
+                JS_FreeAtom(r->ctx, atom);
+                JS_FreeValue(r->ctx, g);
+                JS_FreeValue(r->ctx, s);
+                JS_ThrowTypeError(r->ctx, "flow bytes: bad accessor");
+                return -1;
+            }
+            pr = add_property(r->ctx, p, atom, (int)flags);
+            if (!pr) {
+                JS_FreeAtom(r->ctx, atom);
+                JS_FreeValue(r->ctx, g);
+                JS_FreeValue(r->ctx, s);
+                return -1;
+            }
+            pr->u.getset.getter = JS_IsUndefined(g) ? NULL
+                                  : JS_VALUE_GET_OBJ(g);
+            pr->u.getset.setter = JS_IsUndefined(s) ? NULL
+                                  : JS_VALUE_GET_OBJ(s);
+            break;
+        }
+        case JS_PROP_VARREF: {
+            uint32_t enc = tt_rd_leb(&r->rd);
+            JSVarRef *vr;
+            if (r->rd.err) {
+                JS_FreeAtom(r->ctx, atom);
+                return -1;
+            }
+            vr = rd_get_varref_pair(r, enc);
+            if (!vr) {
+                JS_FreeAtom(r->ctx, atom);
+                return -1;
+            }
+            pr = add_property(r->ctx, p, atom, (int)flags);
+            if (!pr) {
+                JS_FreeAtom(r->ctx, atom);
+                return -1;
+            }
+            js_rc(vr)->ref_count++;
+            pr->u.var_ref = vr;
+            break;
+        }
+        default: {            /* autoinit */
+            uint32_t id = tt_rd_leb(&r->rd);
+            int base_flags = (int)flags & (JS_PROP_CONFIGURABLE |
+                                           JS_PROP_WRITABLE |
+                                           JS_PROP_ENUMERABLE);
+            if (id != JS_AUTOINIT_ID_PROTOTYPE) {
+                JS_FreeAtom(r->ctx, atom);
+                JS_ThrowTypeError(r->ctx, "flow bytes: bad autoinit id");
+                return -1;
+            }
+            if (JS_DefineAutoInitProperty(r->ctx, obj, atom,
+                                          JS_AUTOINIT_ID_PROTOTYPE, NULL,
+                                          base_flags) < 0) {
+                JS_FreeAtom(r->ctx, atom);
+                return -1;
+            }
+            break;
+        }
+        }
+        JS_FreeAtom(r->ctx, atom);
+    }
+    return 0;
+}
+
+static int rd_set_proto(TTFlowRd *r, JSValueConst obj)
+{
+    JSValue proto = rd_get_vref(r);
+    int ret;
+    if (JS_IsException(proto))
+        return -1;
+    if (!JS_IsNull(proto) && JS_VALUE_GET_TAG(proto) != JS_TAG_OBJECT) {
+        JS_FreeValue(r->ctx, proto);
+        JS_ThrowTypeError(r->ctx, "flow bytes: bad prototype");
+        return -1;
+    }
+    ret = JS_SetPrototypeInternal(r->ctx, obj, proto, TRUE);
+    JS_FreeValue(r->ctx, proto);
+    return ret < 0 ? -1 : 0;
+}
+
+/* error path: dismantle the arena frames built so far -- their owned live
+   slots plus any cur_func not yet converted to the engine's borrow. The
+   machine's arena memory stays mapped until after rd_release: late
+   free_var_ref calls clear weak slots inside these frames. */
+static void rd_unwind_arena(TTFlowRd *r)
+{
+    uint32_t i;
+    if (r->frames) {
+        for (i = 0; i < r->frame_count; i++) {
+            TTFlowRdFrame *fe = &r->frames[i];
+            uint32_t k;
+            if (fe->owner != 1 || !fe->sf)
+                continue;
+            for (k = 0; k < fe->live; k++)
+                JS_FreeValue(r->ctx, fe->start[k]);
+            if (!fe->aux_i)   /* aux_i = 1 once cur_func became a borrow */
+                JS_FreeValue(r->ctx, fe->sf->cur_func);
+        }
+    }
+}
+
+/* deserialize_flow(): rebuild a suspended flow in the (fresh) runtime that
+   owns the identically rebuilt baseline. Returns the base state with one
+   reference for the caller; *proot (optional) receives the root handle. */
+static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
+                                              const uint8_t *buf, size_t len,
+                                              JSValue *proot)
+{
+    TTFlowBaseline *bl = rt->tt_flow_baseline;
+    TTFlowRd r_s, *r = &r_s;
+    JSContext *ctx;
+    uint32_t i;
+    uint64_t fp = 0;
+    JSAsyncFunctionState *base = NULL;
+    JSValue root_val = JS_UNDEFINED;
+    uint8_t root_kind;
+
+    if (proot)
+        *proot = JS_UNDEFINED;
+    if (!bl)
+        return NULL;
+    ctx = bl->ctx;
+    memset(r, 0, sizeof(*r));
+    r->ctx = ctx;
+    r->rt = rt;
+    r->bl = bl;
+    r->rd.ptr = buf;
+    r->rd.end = buf + len;
+
+    /* ---- header ---- */
+    {
+        const uint8_t *magic = tt_rd_bytes(&r->rd, TT_FLOW_MAGIC_LEN);
+        if (!magic || memcmp(magic, TT_FLOW_MAGIC, TT_FLOW_MAGIC_LEN)) {
+            JS_ThrowTypeError(ctx, "flow bytes: bad magic");
+            goto fail;
+        }
+    }
+    for (i = 0; i < 8; i++)
+        fp |= (uint64_t)tt_rd_u8(&r->rd) << (i * 8);
+    if (fp != bl->fingerprint || tt_rd_leb(&r->rd) != bl->count) {
+        JS_ThrowTypeError(ctx, "flow bytes: baseline mismatch (rebuild "
+                          "drift?)");
+        goto fail;
+    }
+    r->machine = (tt_rd_leb(&r->rd) & TT_FLOWF_MACHINE) != 0;
+    /* a machine chain rebuilds into its OWN per-flow arena: any number of
+       parked machines coexist in one runtime, so there is no busy-guard */
+
+    /* ---- private atoms ---- */
+    r->atom_count = tt_rd_leb(&r->rd);
+    if (r->rd.err || r->atom_count > (uint32_t)(len / 2) + 16)
+        goto trunc;
+    if (r->atom_count) {
+        r->atoms = js_mallocz(ctx, sizeof(JSAtom) * r->atom_count);
+        if (!r->atoms)
+            goto fail;
+    }
+    for (i = 0; i < r->atom_count; i++) {
+        JSValue s = rd_read_string(r);
+        if (JS_IsException(s))
+            goto fail;
+        r->atoms[i] = JS_NewAtomStr(ctx, JS_VALUE_GET_STRING(s));
+        if (r->atoms[i] == JS_ATOM_NULL)
+            goto fail;
+    }
+
+    /* ---- pass 1: allocate every record shell, assign indices ---- */
+    r->rec_count = tt_rd_leb(&r->rd);
+    if (r->rd.err || r->rec_count > (uint32_t)len + 16)
+        goto trunc;
+    if (r->rec_count) {
+        r->recs = js_mallocz(ctx, sizeof(TTFlowRdRec) * r->rec_count);
+        if (!r->recs)
+            goto fail;
+    }
+    for (i = 0; i < r->rec_count; i++) {
+        TTFlowRdRec *rec = &r->recs[i];
+        uint32_t kind = tt_rd_u8(&r->rd);
+        if (r->rd.err || kind < 1 || kind > TT_REC_LAST)
+            goto trunc;
+        rec->kind = (uint8_t)kind;
+        rec->v = JS_UNDEFINED;
+        switch (kind) {
+        case TT_REC_PLAIN: {
+            uint32_t class_id = tt_rd_leb(&r->rd);
+            if (class_id != JS_CLASS_OBJECT && class_id != JS_CLASS_ERROR) {
+                JS_ThrowTypeError(ctx, "flow bytes: bad plain class");
+                goto fail;
+            }
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL, class_id);
+            if (JS_IsException(rec->v))
+                goto fail;
+            break;
+        }
+        case TT_REC_ARRAY: {
+            rec->aux_a = tt_rd_leb(&r->rd);     /* fast element count */
+            if (r->rd.err || rec->aux_a > (uint32_t)len + 16)
+                goto trunc;
+            rec->v = JS_NewArray(ctx);
+            if (JS_IsException(rec->v))
+                goto fail;
+            break;
+        }
+        case TT_REC_CLOSURE: {
+            JSFunctionBytecode *b;
+            JSObject *p;
+            rec->fn_id = tt_rd_leb(&r->rd);
+            b = rd_fn(r, rec->fn_id);
+            if (!b)
+                goto fail;
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                            func_kind_to_class_id[b->func_kind]);
+            if (JS_IsException(rec->v))
+                goto fail;
+            p = JS_VALUE_GET_OBJ(rec->v);
+            p->u.func.function_bytecode = b;
+            JS_DupValue(ctx, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b));
+            p->u.func.home_object = NULL;
+            p->u.func.var_refs = NULL;
+            if (b->closure_var_count) {
+                p->u.func.var_refs = js_mallocz(ctx, sizeof(JSVarRef *) *
+                                                b->closure_var_count);
+                if (!p->u.func.var_refs)
+                    goto fail;
+            }
+            break;
+        }
+        case TT_REC_GENOBJ: {
+            JSGeneratorData *gd;
+            rec->u8a = (uint8_t)tt_rd_u8(&r->rd);   /* generator state */
+            rec->aux_a = tt_rd_leb(&r->rd);         /* state rec + 1 */
+            if (r->rd.err)
+                goto trunc;
+            switch (rec->u8a) {
+            case JS_GENERATOR_STATE_SUSPENDED_START:
+            case JS_GENERATOR_STATE_SUSPENDED_YIELD:
+            case JS_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
+            case JS_GENERATOR_STATE_COMPLETED:
+                break;
+            case JS_GENERATOR_STATE_EXECUTING:
+                /* legal only for states whose frame is in the machine-parked
+                   chain; cross-checked once the frame table is read */
+                if (r->machine)
+                    break;
+                /* fall through */
+            default:
+                JS_ThrowTypeError(ctx, "flow bytes: bad generator state");
+                goto fail;
+            }
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_GENERATOR);
+            if (JS_IsException(rec->v))
+                goto fail;
+            gd = js_mallocz(ctx, sizeof(*gd));
+            if (!gd)
+                goto fail;
+            gd->state = rec->u8a;
+            gd->func_state = NULL;              /* linked in pass 2 */
+            JS_SetOpaque(rec->v, gd);
+            break;
+        }
+        case TT_REC_STATE: {
+            JSFunctionBytecode *b;
+            rec->fn_id = tt_rd_leb(&r->rd);
+            rec->argc = tt_rd_leb(&r->rd);
+            rec->u8a = (uint8_t)tt_rd_u8(&r->rd);   /* throw_flag */
+            if (r->rd.err)
+                goto trunc;
+            b = rd_fn(r, rec->fn_id);
+            if (!b)
+                goto fail;
+            rec->st = rd_alloc_state(ctx, b, rec->argc);
+            if (!rec->st)
+                goto fail;
+            rec->st->throw_flag = (rec->u8a & 1) != 0;
+            break;
+        }
+        case TT_REC_VARREF_OPEN:
+        case TT_REC_VARREF_CLOSED: {
+            JSVarRef *vr;
+            if (kind == TT_REC_VARREF_OPEN) {
+                rec->aux_a = tt_rd_leb(&r->rd);     /* registration frame */
+                rec->aux_b = tt_rd_leb(&r->rd);     /* var_ref_idx */
+                rec->aux_c = tt_rd_leb(&r->rd);     /* storage frame */
+                rec->aux_d = tt_rd_leb(&r->rd);     /* slot in owned range */
+            }
+            rec->u8a = (uint8_t)tt_rd_u8(&r->rd);   /* lexical/const bits */
+            if (r->rd.err)
+                goto trunc;
+            vr = js_malloc(ctx, sizeof(*vr));
+            if (!vr)
+                goto fail;
+            js_rc(vr)->ref_count = 1;
+            add_gc_object(rt, &vr->header, JS_GC_OBJ_TYPE_VAR_REF);
+            vr->is_lexical = (rec->u8a & 1) != 0;
+            vr->is_const = (rec->u8a & 2) != 0;
+            if (kind == TT_REC_VARREF_CLOSED) {
+                vr->is_detached = TRUE;
+                vr->value = JS_UNDEFINED;
+                vr->pvalue = &vr->value;
+            } else {
+                /* provisionally detached: attached to its frame in the
+                   fixup step once frames exist */
+                vr->is_detached = TRUE;
+                vr->value = JS_UNDEFINED;
+                vr->pvalue = &vr->value;
+            }
+            rec->vr = vr;
+            break;
+        }
+        case TT_REC_STRING:
+            rec->v = rd_read_string(r);
+            if (JS_IsException(rec->v))
+                goto fail;
+            break;
+        case TT_REC_SYMBOL: {
+            JSValue descr = rd_read_string(r);
+            if (JS_IsException(descr))
+                goto fail;
+            rec->v = JS_NewSymbol(ctx, JS_VALUE_GET_STRING(descr),
+                                  JS_ATOM_TYPE_SYMBOL);
+            if (JS_IsException(rec->v))
+                goto fail;
+            break;
+        }
+        case TT_REC_DATAOBJ: {
+            uint32_t class_id = tt_rd_leb(&r->rd);
+            switch (class_id) {
+            case JS_CLASS_NUMBER:
+            case JS_CLASS_STRING:
+            case JS_CLASS_BOOLEAN:
+            case JS_CLASS_SYMBOL:
+            case JS_CLASS_DATE:
+                break;
+            default:
+                JS_ThrowTypeError(ctx, "flow bytes: bad data class");
+                goto fail;
+            }
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL, class_id);
+            if (JS_IsException(rec->v))
+                goto fail;
+            JS_VALUE_GET_OBJ(rec->v)->u.object_data = JS_UNDEFINED;
+            break;
+        }
+        case TT_REC_PROMISE: {
+            JSPromiseData *pd;
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_PROMISE);
+            if (JS_IsException(rec->v))
+                goto fail;
+            pd = js_mallocz(ctx, sizeof(*pd));
+            if (!pd)
+                goto fail;
+            pd->promise_state = JS_PROMISE_PENDING;
+            init_list_head(&pd->promise_reactions[0]);
+            init_list_head(&pd->promise_reactions[1]);
+            pd->promise_result = JS_UNDEFINED;
+            JS_SetOpaque(rec->v, pd);
+            break;
+        }
+        case TT_REC_PROMISE_FUNC: {
+            uint32_t which = tt_rd_u8(&r->rd);
+            JSPromiseFunctionData *fd;
+            if (r->rd.err || which > 1)
+                goto trunc;
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                            JS_CLASS_PROMISE_RESOLVE_FUNCTION
+                                            + which);
+            if (JS_IsException(rec->v))
+                goto fail;
+            fd = js_mallocz(ctx, sizeof(*fd));
+            if (!fd)
+                goto fail;
+            fd->promise = JS_UNDEFINED;
+            rec->raw = fd;    /* the object adopts it once linked */
+            break;
+        }
+        case TT_REC_PRESOLVED: {
+            uint32_t ar = tt_rd_u8(&r->rd);
+            JSPromiseFunctionDataResolved *sr;
+            if (r->rd.err || ar > 1)
+                goto trunc;
+            sr = js_malloc(ctx, sizeof(*sr));
+            if (!sr)
+                goto fail;
+            sr->ref_count = 1;
+            sr->already_resolved = ar;
+            rec->raw = sr;
+            break;
+        }
+        case TT_REC_ASYNC_RESOLVE: {
+            uint32_t which = tt_rd_u8(&r->rd);
+            if (r->rd.err || which > 1)
+                goto trunc;
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                            JS_CLASS_ASYNC_FUNCTION_RESOLVE
+                                            + which);
+            if (JS_IsException(rec->v))
+                goto fail;
+            JS_VALUE_GET_OBJ(rec->v)->u.async_function_data = NULL;
+            break;
+        }
+        }
+    }
+
+    /* ---- frame table: rebuild the TrampFrame chain ---- */
+    r->frame_count = tt_rd_leb(&r->rd);
+    if (r->rd.err || r->frame_count > (uint32_t)len + 16)
+        goto trunc;
+    if (r->frame_count) {
+        r->frames = js_mallocz(ctx, sizeof(TTFlowRdFrame) * r->frame_count);
+        if (!r->frames)
+            goto fail;
+    }
+    for (i = 0; i < r->frame_count; i++) {
+        TTFlowRdFrame *fe = &r->frames[i];
+        uint32_t owner = tt_rd_u8(&r->rd);
+        if (r->rd.err || owner > 1)
+            goto trunc;
+        fe->owner = (uint8_t)owner;
+        fe->this_off = -1;
+        if (owner == 0) {
+            uint32_t rec_idx = tt_rd_leb(&r->rd);
+            uint32_t pc_off = tt_rd_leb(&r->rd);
+            uint32_t stack_len = tt_rd_leb(&r->rd);
+            TTFlowRdRec *rec;
+            JSAsyncFunctionState *st;
+            JSFunctionBytecode *b;
+            uint32_t min_len, max_len;
+            fe->chained = (uint8_t)tt_rd_u8(&r->rd);
+            if (r->rd.err || rec_idx >= r->rec_count ||
+                r->recs[rec_idx].kind != TT_REC_STATE || fe->chained > 1)
+                goto trunc;
+            if (fe->chained) {
+                if (!r->machine)
+                    goto trunc;
+                fe->aux_i = tt_rd_leb(&r->rd);
+                fe->cargc = tt_rd_leb(&r->rd);
+                fe->genobj_rec = tt_rd_leb(&r->rd);
+                if (r->rd.err || fe->cargc > 65535)
+                    goto trunc;
+            }
+            rec = &r->recs[rec_idx];
+            st = rec->st;
+            if (rec->aux_b) {
+                JS_ThrowTypeError(ctx, "flow bytes: duplicate frame owner");
+                goto fail;
+            }
+            rec->aux_b = 1;          /* this state's frame is claimed */
+            rec->aux_c = i + 1;      /* frame index, for cross-validation */
+            b = rd_fn(r, rec->fn_id);
+            /* cur_pc relocation: function id + byte offset into the fresh
+               process's identical bytecode */
+            if (pc_off > (uint32_t)b->byte_code_len) {
+                JS_ThrowTypeError(ctx, "flow bytes: pc offset outside "
+                                  "function");
+                goto fail;
+            }
+            min_len = (uint32_t)st->frame.arg_count + b->var_count;
+            max_len = min_len + b->stack_size;
+            if (stack_len < min_len || stack_len > max_len) {
+                JS_ThrowTypeError(ctx, "flow bytes: bad stack extent");
+                goto fail;
+            }
+            st->frame.cur_pc = b->byte_code_buf + pc_off;
+            st->frame.cur_sp = st->frame.arg_buf + stack_len;
+            fe->sf = &st->frame;
+            fe->b = b;
+            fe->start = st->frame.arg_buf;
+            fe->live = stack_len;
+        } else {
+            /* an arena TrampFrame: geometry re-derives from its function's
+               bytecode; the argument window (and a method receiver) alias
+               the PARENT frame's owned slots, exactly as the push made
+               them. cur_func is validated now and converted to the
+               engine's borrow once the parent's slots are decoded. */
+            JSValue f = rd_get_vref(r);
+            JSObject *fo;
+            JSFunctionBytecode *b;
+            uint32_t pc_off, kindb, orig_argc, cargc, stack_len, argv_off;
+            uint32_t this_mode, this_off = 0;
+            uint32_t aas, val_count, min_len, k;
+            TTFlowRdFrame *pe;
+            JSValue *vals;
+            JSStackFrame *sf;
+            if (JS_IsException(f))
+                goto fail;
+            if (JS_VALUE_GET_TAG(f) != JS_TAG_OBJECT ||
+                JS_VALUE_GET_OBJ(f)->class_id != JS_CLASS_BYTECODE_FUNCTION) {
+                JS_FreeValue(ctx, f);
+                JS_ThrowTypeError(ctx, "flow bytes: bad arena frame "
+                                  "function");
+                goto fail;
+            }
+            fo = JS_VALUE_GET_OBJ(f);
+            b = fo->u.func.function_bytecode;
+            pc_off = tt_rd_leb(&r->rd);
+            kindb = tt_rd_u8(&r->rd);
+            orig_argc = tt_rd_leb(&r->rd);
+            cargc = tt_rd_leb(&r->rd);
+            stack_len = tt_rd_leb(&r->rd);
+            argv_off = tt_rd_leb(&r->rd);
+            this_mode = tt_rd_u8(&r->rd);
+            if (!r->rd.err && this_mode == 1)
+                this_off = tt_rd_leb(&r->rd);
+            if (r->rd.err || i == 0 || !r->machine || this_mode > 1 ||
+                orig_argc > 65535 || cargc > 65535) {
+                JS_FreeValue(ctx, f);
+                goto trunc;
+            }
+            if (kindb != TT_FRAME_CALL && kindb != TT_FRAME_CALL_METHOD &&
+                kindb != TT_FRAME_TAIL && kindb != TT_FRAME_TAIL_METHOD) {
+                JS_FreeValue(ctx, f);
+                JS_ThrowTypeError(ctx, "flow bytes: bad arena frame kind");
+                goto fail;
+            }
+            pe = &r->frames[i - 1];
+            if (!pe->chained ||
+                pc_off > (uint32_t)b->byte_code_len ||
+                argv_off < 1 || argv_off + orig_argc > pe->live ||
+                (this_mode == 1 &&
+                 (argv_off < 2 || this_off != argv_off - 2))) {
+                JS_FreeValue(ctx, f);
+                JS_ThrowTypeError(ctx, "flow bytes: bad arena frame extent");
+                goto fail;
+            }
+            aas = (orig_argc < (uint32_t)b->arg_count) ? (uint32_t)b->arg_count
+                                                       : 0;
+            val_count = aas + b->var_count + b->stack_size;
+            min_len = aas + b->var_count;
+            if (stack_len < min_len || stack_len > val_count) {
+                JS_FreeValue(ctx, f);
+                JS_ThrowTypeError(ctx, "flow bytes: bad stack extent");
+                goto fail;
+            }
+            if (!r->m) {
+                /* the chain's frames live in this flow's own arena */
+                r->m = tt_machine_new(ctx);
+                if (!r->m) {
+                    JS_FreeValue(ctx, f);
+                    goto fail;
+                }
+            }
+            sf = tt_machine_arena_push(ctx, r->m, val_count, b->var_ref_count,
+                                       &vals);
+            if (!sf) {
+                JS_FreeValue(ctx, f);
+                goto fail;
+            }
+            sf->js_mode = b->js_mode;
+            sf->cur_func = f;         /* owned until the borrow fixup */
+            sf->cur_pc = b->byte_code_buf + pc_off;
+            sf->cur_sp = vals + stack_len;
+            sf->tt_frame_kind = (uint8_t)kindb;
+            sf->tt_call_argc = (uint16_t)cargc;
+            sf->tt_this = JS_UNDEFINED;   /* receiver bound post-payload */
+            sf->tt_new_target = JS_UNDEFINED;
+            sf->tt_orig_argv = pe->start + argv_off;
+            sf->tt_orig_argc = (int)orig_argc;
+            sf->tt_frame_base = vals;
+            sf->tt_ctor_this = JS_UNDEFINED;
+            sf->tt_aux = NULL;
+            sf->tt_aux_i = 0;
+            sf->arg_buf = aas ? vals : pe->start + argv_off;
+            sf->arg_count = aas ? b->arg_count : (int)orig_argc;
+            sf->var_buf = vals + aas;
+            sf->var_refs = (JSVarRef **)(vals + val_count);
+            for (k = 0; k < (uint32_t)b->var_ref_count; k++)
+                sf->var_refs[k] = NULL;
+            for (k = 0; k < val_count; k++)
+                vals[k] = JS_UNDEFINED;
+            sf->prev_frame = pe->sf;
+            fe->sf = sf;
+            fe->b = b;
+            fe->start = vals;
+            fe->live = stack_len;
+            fe->chained = 1;
+            fe->this_off = (this_mode == 1) ? (int32_t)this_off : -1;
+        }
+        {   /* step-hook line cache, for byte-identical stepping */
+            uint32_t l0 = tt_rd_leb(&r->rd), l1 = tt_rd_leb(&r->rd);
+            uint32_t l2 = tt_rd_leb(&r->rd), l3 = tt_rd_leb(&r->rd);
+            if (r->rd.err)
+                goto trunc;
+            fe->sf->tt_last_line = (int)l0;
+            fe->sf->tt_pc_lo = l1;
+            fe->sf->tt_pc_hi = l2;
+            fe->sf->tt_prev_off = l3;
+        }
+    }
+    /* chain shape: chained frames form a non-empty prefix iff a machine
+       travels; every STATE record owns exactly one frame */
+    {
+        uint32_t nstates = 0, nchained = 0;
+        BOOL in_prefix = TRUE;
+        for (i = 0; i < r->frame_count; i++) {
+            if (r->frames[i].chained) {
+                if (!in_prefix)
+                    goto badchain;
+                nchained++;
+            } else {
+                in_prefix = FALSE;
+            }
+        }
+        if (r->machine != (nchained != 0) ||
+            (r->machine && !r->frames[0].chained)) {
+        badchain:
+            JS_ThrowTypeError(ctx, "flow bytes: malformed frame chain");
+            goto fail;
+        }
+        r->chain_count = nchained;
+        for (i = 0; i < r->rec_count; i++)
+            if (r->recs[i].kind == TT_REC_STATE)
+                nstates++;
+        {
+            uint32_t nheap = 0;
+            for (i = 0; i < r->frame_count; i++)
+                if (r->frames[i].owner == 0)
+                    nheap++;
+            if (nstates != nheap) {
+                JS_ThrowTypeError(ctx, "flow bytes: state/frame count "
+                                  "mismatch");
+                goto fail;
+            }
+        }
+    }
+
+    /* ---- var_ref fixups: reattach open cells over the rebuilt stacks ---- */
+    for (i = 0; i < r->rec_count; i++) {
+        TTFlowRdRec *rec = &r->recs[i];
+        TTFlowRdFrame *rf, *mf;
+        JSVarRef *vr;
+        if (rec->kind != TT_REC_VARREF_OPEN)
+            continue;
+        vr = rec->vr;
+        if (rec->aux_a >= r->frame_count || rec->aux_c >= r->frame_count)
+            goto trunc;
+        rf = &r->frames[rec->aux_a];      /* frame the cell registers on */
+        mf = &r->frames[rec->aux_c];      /* frame owning the cell's slot */
+        if (rec->aux_b >= (uint32_t)rf->b->var_ref_count) {
+            JS_ThrowTypeError(ctx, "flow bytes: bad var_ref index");
+            goto fail;
+        }
+        if (rec->aux_d >= mf->live) {
+            JS_ThrowTypeError(ctx, "flow bytes: open cell slot out of "
+                              "range");
+            goto fail;
+        }
+        if (rf->sf->var_refs[rec->aux_b]) {
+            JS_ThrowTypeError(ctx, "flow bytes: duplicate open cell");
+            goto fail;
+        }
+        /* mirror get_var_ref(): the frame slot stays weak; a cell on a
+           heap (async-state) frame pins its owner */
+        vr->is_detached = FALSE;
+        vr->var_ref_idx = (uint16_t)rec->aux_b;
+        vr->stack_frame = rf->sf;
+        vr->pvalue = mf->start + rec->aux_d;
+        rf->sf->var_refs[rec->aux_b] = vr;
+        if (rf->sf->js_mode & JS_MODE_ASYNC) {
+            JSAsyncFunctionState *owner =
+                container_of(rf->sf, JSAsyncFunctionState, frame);
+            js_rc(owner)->ref_count++;
+        }
+    }
+
+    /* ---- pass 2: relink every payload against the complete map ---- */
+    for (i = 0; i < r->rec_count; i++) {
+        TTFlowRdRec *rec = &r->recs[i];
+        switch (rec->kind) {
+        case TT_REC_PLAIN:
+            if (rd_set_proto(r, rec->v) || rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        case TT_REC_ARRAY: {
+            uint32_t k;
+            JSObject *p = JS_VALUE_GET_OBJ(rec->v);
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            if (rec->aux_a &&
+                expand_fast_array(ctx, p, rec->aux_a) < 0)
+                goto fail;
+            for (k = 0; k < rec->aux_a; k++) {
+                JSValue v = rd_get_vref(r);
+                if (JS_IsException(v))
+                    goto fail;
+                if (add_fast_array_element(ctx, p, v, 0) < 0)
+                    goto fail;
+            }
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        }
+        case TT_REC_CLOSURE: {
+            JSObject *p = JS_VALUE_GET_OBJ(rec->v);
+            JSFunctionBytecode *b = p->u.func.function_bytecode;
+            JSValue home;
+            uint32_t ncv, k;
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            home = rd_get_vref(r);
+            if (JS_IsException(home))
+                goto fail;
+            if (JS_VALUE_GET_TAG(home) == JS_TAG_OBJECT) {
+                p->u.func.home_object = JS_VALUE_GET_OBJ(home);
+            } else if (!JS_IsUndefined(home)) {
+                JS_FreeValue(ctx, home);
+                JS_ThrowTypeError(ctx, "flow bytes: bad home object");
+                goto fail;
+            }
+            ncv = tt_rd_leb(&r->rd);
+            if (r->rd.err || ncv != (uint32_t)b->closure_var_count) {
+                JS_ThrowTypeError(ctx, "flow bytes: closure arity mismatch");
+                goto fail;
+            }
+            for (k = 0; k < ncv; k++) {
+                BOOL is_null;
+                JSVarRef *vr = rd_get_varref_opt(r, &is_null);
+                if (!vr && !is_null)
+                    goto fail;
+                if (vr) {
+                    js_rc(vr)->ref_count++;
+                    p->u.func.var_refs[k] = vr;
+                }
+            }
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        }
+        case TT_REC_GENOBJ: {
+            JSGeneratorData *gd = JS_GetOpaque(rec->v, JS_CLASS_GENERATOR);
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            if (rec->aux_a) {
+                uint32_t sidx = rec->aux_a - 1;
+                if (sidx >= r->rec_count ||
+                    r->recs[sidx].kind != TT_REC_STATE) {
+                    JS_ThrowTypeError(ctx, "flow bytes: bad generator state "
+                                      "record");
+                    goto fail;
+                }
+                gd->func_state = r->recs[sidx].st;
+                js_rc(gd->func_state)->ref_count++;
+            } else if (gd->state != JS_GENERATOR_STATE_COMPLETED) {
+                JS_ThrowTypeError(ctx, "flow bytes: suspended generator "
+                                  "without a state");
+                goto fail;
+            }
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        }
+        case TT_REC_STATE: {
+            JSAsyncFunctionState *st = rec->st;
+            JSValue f = rd_get_vref(r);
+            JSValue t;
+            JSObject *fo;
+            if (JS_IsException(f))
+                goto fail;
+            if (JS_VALUE_GET_TAG(f) != JS_TAG_OBJECT)
+                goto badfunc;
+            fo = JS_VALUE_GET_OBJ(f);
+            switch (fo->class_id) {
+            case JS_CLASS_BYTECODE_FUNCTION:
+            case JS_CLASS_GENERATOR_FUNCTION:
+            case JS_CLASS_ASYNC_FUNCTION:
+            case JS_CLASS_ASYNC_GENERATOR_FUNCTION:
+                break;
+            default:
+                goto badfunc;
+            }
+            /* the frame's function must be the same bytecode its pc was
+               relocated against */
+            if (fo->u.func.function_bytecode != rd_fn(r, rec->fn_id)) {
+            badfunc:
+                JS_FreeValue(ctx, f);
+                JS_ThrowTypeError(ctx, "flow bytes: frame function mismatch");
+                goto fail;
+            }
+            st->frame.cur_func = f;
+            t = rd_get_vref(r);
+            if (JS_IsException(t))
+                goto fail;
+            st->this_val = t;
+            st->frame.tt_this = st->this_val;
+            t = rd_get_vref(r);
+            if (JS_IsException(t))
+                goto fail;
+            st->resolving_funcs[0] = t;
+            t = rd_get_vref(r);
+            if (JS_IsException(t))
+                goto fail;
+            st->resolving_funcs[1] = t;
+            break;
+        }
+        case TT_REC_VARREF_CLOSED: {
+            JSValue v = rd_get_vref(r);
+            if (JS_IsException(v))
+                goto fail;
+            rec->vr->value = v;
+            break;
+        }
+        case TT_REC_PROMISE: {
+            JSPromiseData *pd = JS_GetOpaque(rec->v, JS_CLASS_PROMISE);
+            uint32_t st8, hd8, k;
+            JSValue v;
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            st8 = tt_rd_u8(&r->rd);
+            hd8 = tt_rd_u8(&r->rd);
+            if (r->rd.err || st8 > JS_PROMISE_REJECTED || hd8 > 1)
+                goto trunc;
+            pd->promise_state = st8;
+            pd->is_handled = hd8;
+            v = rd_get_vref(r);
+            if (JS_IsException(v))
+                goto fail;
+            pd->promise_result = v;
+            for (k = 0; k < 2; k++) {
+                uint32_t n = tt_rd_leb(&r->rd), j;
+                if (r->rd.err || n > (uint32_t)len)
+                    goto trunc;
+                for (j = 0; j < n; j++) {
+                    JSPromiseReactionData *rdd =
+                        js_mallocz(ctx, sizeof(*rdd));
+                    int m;
+                    if (!rdd)
+                        goto fail;
+                    for (m = 0; m < 2; m++)
+                        rdd->resolving_funcs[m] = JS_UNDEFINED;
+                    rdd->handler = JS_UNDEFINED;
+                    list_add_tail(&rdd->link, &pd->promise_reactions[k]);
+                    for (m = 0; m < 2; m++) {
+                        v = rd_get_vref(r);
+                        if (JS_IsException(v))
+                            goto fail;
+                        rdd->resolving_funcs[m] = v;
+                    }
+                    v = rd_get_vref(r);
+                    if (JS_IsException(v))
+                        goto fail;
+                    rdd->handler = v;
+                }
+            }
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        }
+        case TT_REC_PROMISE_FUNC: {
+            JSPromiseFunctionData *fd = rec->raw;
+            JSValue pv;
+            uint32_t pidx;
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            pv = rd_get_vref(r);
+            if (JS_IsException(pv))
+                goto fail;
+            fd->promise = pv;
+            if (JS_VALUE_GET_TAG(pv) != JS_TAG_OBJECT ||
+                JS_VALUE_GET_OBJ(pv)->class_id != JS_CLASS_PROMISE) {
+                JS_ThrowTypeError(ctx, "flow bytes: capability without a "
+                                  "promise");
+                goto fail;
+            }
+            pidx = tt_rd_leb(&r->rd);
+            if (r->rd.err || pidx >= r->rec_count ||
+                r->recs[pidx].kind != TT_REC_PRESOLVED)
+                goto trunc;
+            fd->presolved = r->recs[pidx].raw;
+            fd->presolved->ref_count++;
+            JS_VALUE_GET_OBJ(rec->v)->u.promise_function_data = fd;
+            rec->raw = NULL;  /* owned by the object now */
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        }
+        case TT_REC_ASYNC_RESOLVE: {
+            uint32_t sidx;
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            sidx = tt_rd_leb(&r->rd);
+            if (r->rd.err || sidx >= r->rec_count ||
+                r->recs[sidx].kind != TT_REC_STATE)
+                goto trunc;
+            /* the continuation handler pins its state, as the engine's
+               js_async_function_resolve_create does */
+            JS_VALUE_GET_OBJ(rec->v)->u.async_function_data =
+                r->recs[sidx].st;
+            js_rc(r->recs[sidx].st)->ref_count++;
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        }
+        case TT_REC_DATAOBJ: {
+            JSValue v;
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            v = rd_get_vref(r);
+            if (JS_IsException(v))
+                goto fail;
+            switch (JS_VALUE_GET_TAG(v)) {
+            case JS_TAG_INT:
+            case JS_TAG_FLOAT64:
+            case JS_TAG_BOOL:
+            case JS_TAG_STRING:
+            case JS_TAG_SYMBOL:
+            case JS_TAG_UNDEFINED:
+                break;
+            default:
+                JS_FreeValue(ctx, v);
+                JS_ThrowTypeError(ctx, "flow bytes: bad wrapped data");
+                goto fail;
+            }
+            JS_VALUE_GET_OBJ(rec->v)->u.object_data = v;
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    /* ---- frame payloads: each frame's owned JSValue range ---- */
+    for (i = 0; i < r->frame_count; i++) {
+        TTFlowRdFrame *fe = &r->frames[i];
+        JSValue *sp;
+        for (sp = fe->start; sp < fe->start + fe->live; sp++) {
+            JSValue v = rd_get_vref(r);
+            if (JS_IsException(v))
+                goto fail;
+            *sp = v;          /* overwrites the UNDEFINED placeholder */
+        }
+    }
+
+    /* ---- machine fixups: now that parent slots hold real values, bind
+       the borrows and the in-loop splice linkage, and cross-validate the
+       chain against the generator records ---- */
+    for (i = 0; i < r->frame_count; i++) {
+        TTFlowRdFrame *fe = &r->frames[i];
+        TTFlowRdFrame *pe = i ? &r->frames[i - 1] : NULL;
+        if (fe->owner == 1) {
+            JSStackFrame *sf = fe->sf;
+            uint32_t argv_off = (uint32_t)(sf->tt_orig_argv - pe->start);
+            /* the function below the argument window must be the same
+               closure the frame was built from; then the frame keeps the
+               engine's borrow and the parent slot keeps the reference */
+            if (memcmp(&pe->start[argv_off - 1], &sf->cur_func,
+                       sizeof(JSValue)) != 0) {
+                JS_ThrowTypeError(ctx, "flow bytes: arena frame function "
+                                  "does not match its call site");
+                goto fail;
+            }
+            JS_FreeValue(ctx, sf->cur_func);   /* convert to borrow */
+            fe->aux_i = 1;
+            if (fe->this_off >= 0)
+                sf->tt_this = pe->start[fe->this_off];
+        } else if (fe->chained && i > 0) {
+            /* a nested in-loop generator splice */
+            JSStackFrame *sf = fe->sf;
+            JSGeneratorData *gd;
+            JSAsyncFunctionState *st =
+                container_of(sf, JSAsyncFunctionState, frame);
+            uint32_t gshape = (fe->aux_i >> 8) & 0xff;
+            if (!fe->genobj_rec || fe->genobj_rec - 1 >= r->rec_count ||
+                r->recs[fe->genobj_rec - 1].kind != TT_REC_GENOBJ)
+                goto trunc;
+            gd = JS_GetOpaque(r->recs[fe->genobj_rec - 1].v,
+                              JS_CLASS_GENERATOR);
+            if (!gd || gd->func_state != st ||
+                gd->state != JS_GENERATOR_STATE_EXECUTING ||
+                !pe->chained) {
+                JS_ThrowTypeError(ctx, "flow bytes: chained generator "
+                                  "record mismatch");
+                goto fail;
+            }
+            if (gshape != TT_GENSHAPE_METHOD && gshape != TT_GENSHAPE_FOROF &&
+                gshape != TT_GENSHAPE_ITERNEXT &&
+                gshape != TT_GENSHAPE_ITERCALL) {
+                JS_ThrowTypeError(ctx, "flow bytes: bad generator splice "
+                                  "shape");
+                goto fail;
+            }
+            sf->tt_frame_kind = TT_FRAME_GEN;
+            sf->tt_aux = gd;
+            sf->tt_aux_i = (int)fe->aux_i;
+            sf->tt_call_argc = (uint16_t)fe->cargc;
+            sf->prev_frame = pe->sf;
+        } else if (fe->chained) {
+            /* the base frame of a machine-parked flow: rebuilt as a C
+               entry so its yields/returns come back to the host */
+            JSAsyncFunctionState *st =
+                container_of(fe->sf, JSAsyncFunctionState, frame);
+            JSGeneratorData *gd = NULL;
+            uint32_t k;
+            for (k = 0; k < r->rec_count; k++) {
+                if (r->recs[k].kind == TT_REC_GENOBJ) {
+                    JSGeneratorData *g2 =
+                        JS_GetOpaque(r->recs[k].v, JS_CLASS_GENERATOR);
+                    if (g2 && g2->func_state == st) {
+                        gd = g2;
+                        break;
+                    }
+                }
+            }
+            if (!gd || gd->state != JS_GENERATOR_STATE_EXECUTING) {
+                JS_ThrowTypeError(ctx, "flow bytes: machine-parked base "
+                                  "without an executing generator record");
+                goto fail;
+            }
+        }
+    }
+    /* every EXECUTING generator record must sit on the parked chain */
+    for (i = 0; i < r->rec_count; i++) {
+        TTFlowRdRec *rec = &r->recs[i];
+        JSGeneratorData *gd;
+        uint32_t fidx;
+        if (rec->kind != TT_REC_GENOBJ ||
+            rec->u8a != JS_GENERATOR_STATE_EXECUTING)
+            continue;
+        gd = JS_GetOpaque(rec->v, JS_CLASS_GENERATOR);
+        if (!gd || !gd->func_state)
+            goto trunc;
+        /* its state's frame index was stamped at claim time */
+        {
+            uint32_t k, srec = 0;
+            for (k = 0; k < r->rec_count; k++) {
+                if (r->recs[k].kind == TT_REC_STATE &&
+                    r->recs[k].st == gd->func_state) {
+                    srec = k + 1;
+                    break;
+                }
+            }
+            if (!srec)
+                goto trunc;
+            fidx = r->recs[srec - 1].aux_c;
+            if (!fidx || !r->frames[fidx - 1].chained) {
+                JS_ThrowTypeError(ctx, "flow bytes: executing generator "
+                                  "outside the parked chain");
+                goto fail;
+            }
+        }
+    }
+
+    /* ---- the delta: rebuilt checked-out, ready for JS_TTFlowCheckin ---- */
+    {
+        uint32_t n = tt_rd_leb(&r->rd);
+        TTFlowDelta *d = NULL;
+        if (r->rd.err || n > (uint32_t)len + 16)
+            goto trunc;
+        base = (r->frame_count && r->frames[0].owner == 0) ?
+            container_of(r->frames[0].sf, JSAsyncFunctionState, frame) : NULL;
+        if (!base) {
+            JS_ThrowTypeError(ctx, "flow bytes: no base frame");
+            goto fail;
+        }
+        if (n) {
+            d = js_mallocz(ctx, sizeof(*d));
+            if (!d)
+                goto fail;
+            d->checked_in = FALSE;
+            base->tt_delta = d;
+            for (i = 0; i < n; i++) {
+                TTFlowDeltaRec *rec;
+                uint32_t kind = tt_rd_u8(&r->rd);
+                if (r->rd.err || kind < TT_DELTA_PROP ||
+                    kind > TT_DELTA_ODATA ||
+                    kind == TT_DELTA_MAP || kind == TT_DELTA_ABUF)
+                    goto trunc;
+                rec = tt_flow_delta_push(ctx, d);
+                if (!rec)
+                    goto fail;
+                memset(rec, 0, sizeof(*rec));
+                rec->kind = (uint8_t)kind;
+                rec->obj = JS_UNDEFINED;
+                rec->saved = JS_UNDEFINED;
+                rec->alen = JS_UNDEFINED;
+                if (kind != TT_DELTA_CELL) {
+                    JSValue o = rd_get_vref(r);
+                    if (JS_IsException(o))
+                        goto fail;
+                    if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT) {
+                        JS_FreeValue(ctx, o);
+                        JS_ThrowTypeError(ctx, "flow bytes: bad delta target");
+                        goto fail;
+                    }
+                    rec->obj = o;
+                }
+                switch (kind) {
+                case TT_DELTA_PROP:
+                case TT_DELTA_PROPX: {
+                    JSAtom a = rd_get_atomref(r);
+                    if (a == JS_ATOM_NULL)
+                        goto fail;
+                    rec->atom = a;
+                    if (kind == TT_DELTA_PROPX) {
+                        uint32_t h = tt_rd_u8(&r->rd);
+                        uint32_t fl = tt_rd_u8(&r->rd);
+                        if (r->rd.err || h > 1 || fl > 0x3f)
+                            goto trunc;
+                        rec->holds = (uint8_t)h;
+                        rec->prop_flags = (uint8_t)fl;
+                    }
+                    rec->saved = rd_get_vref(r);
+                    if (JS_IsException(rec->saved)) {
+                        rec->saved = JS_UNDEFINED;
+                        goto fail;
+                    }
+                    break;
+                }
+                case TT_DELTA_CELL: {
+                    BOOL is_null;
+                    JSVarRef *vr = rd_get_varref_opt(r, &is_null);
+                    if (!vr) {
+                        JS_ThrowTypeError(ctx, "flow bytes: bad delta cell");
+                        goto fail;
+                    }
+                    js_rc(vr)->ref_count++;
+                    rec->vr = vr;
+                    rec->saved = rd_get_vref(r);
+                    if (JS_IsException(rec->saved)) {
+                        rec->saved = JS_UNDEFINED;
+                        goto fail;
+                    }
+                    break;
+                }
+                case TT_DELTA_ARRAY: {
+                    uint32_t ac = tt_rd_leb(&r->rd), k2;
+                    if (r->rd.err || ac > (uint32_t)len + 16)
+                        goto trunc;
+                    if (ac) {
+                        rec->avec = js_mallocz(ctx, sizeof(JSValue) * ac);
+                        if (!rec->avec)
+                            goto fail;
+                        for (k2 = 0; k2 < ac; k2++)
+                            rec->avec[k2] = JS_UNDEFINED;
+                        rec->acount = rec->asize = ac;
+                        for (k2 = 0; k2 < ac; k2++) {
+                            JSValue v = rd_get_vref(r);
+                            if (JS_IsException(v))
+                                goto fail;
+                            rec->avec[k2] = v;
+                        }
+                    }
+                    rec->alen = rd_get_vref(r);
+                    if (JS_IsException(rec->alen)) {
+                        rec->alen = JS_UNDEFINED;
+                        goto fail;
+                    }
+                    break;
+                }
+                case TT_DELTA_PROMISE: {
+                    JSPromiseData *pd = js_mallocz(ctx, sizeof(*pd));
+                    uint32_t st8, hd8, k2;
+                    int m;
+                    if (!pd)
+                        goto fail;
+                    init_list_head(&pd->promise_reactions[0]);
+                    init_list_head(&pd->promise_reactions[1]);
+                    pd->promise_result = JS_UNDEFINED;
+                    rec->snap = pd;
+                    st8 = tt_rd_u8(&r->rd);
+                    hd8 = tt_rd_u8(&r->rd);
+                    if (r->rd.err || st8 > JS_PROMISE_REJECTED || hd8 > 1)
+                        goto trunc;
+                    pd->promise_state = st8;
+                    pd->is_handled = hd8;
+                    pd->promise_result = rd_get_vref(r);
+                    if (JS_IsException(pd->promise_result)) {
+                        pd->promise_result = JS_UNDEFINED;
+                        goto fail;
+                    }
+                    for (m = 0; m < 2; m++) {
+                        uint32_t nr2 = tt_rd_leb(&r->rd);
+                        if (r->rd.err || nr2 > (uint32_t)len)
+                            goto trunc;
+                        for (k2 = 0; k2 < nr2; k2++) {
+                            JSPromiseReactionData *rdd =
+                                js_mallocz(ctx, sizeof(*rdd));
+                            int m2;
+                            if (!rdd)
+                                goto fail;
+                            for (m2 = 0; m2 < 2; m2++)
+                                rdd->resolving_funcs[m2] = JS_UNDEFINED;
+                            rdd->handler = JS_UNDEFINED;
+                            list_add_tail(&rdd->link,
+                                          &pd->promise_reactions[m]);
+                            for (m2 = 0; m2 < 2; m2++) {
+                                JSValue v = rd_get_vref(r);
+                                if (JS_IsException(v))
+                                    goto fail;
+                                rdd->resolving_funcs[m2] = v;
+                            }
+                            rdd->handler = rd_get_vref(r);
+                            if (JS_IsException(rdd->handler)) {
+                                rdd->handler = JS_UNDEFINED;
+                                goto fail;
+                            }
+                        }
+                    }
+                    break;
+                }
+                case TT_DELTA_PRESOLVED: {
+                    uint32_t h = tt_rd_u8(&r->rd);
+                    if (r->rd.err || h > 1)
+                        goto trunc;
+                    rec->holds = (uint8_t)h;
+                    break;
+                }
+                case TT_DELTA_ODATA:
+                case TT_DELTA_DEAD:
+                    if (kind == TT_DELTA_ODATA) {
+                        rec->saved = rd_get_vref(r);
+                        if (JS_IsException(rec->saved)) {
+                            rec->saved = JS_UNDEFINED;
+                            goto fail;
+                        }
+                    }
+                    break;
+                }
+                if (tt_flow_delta_index_rec(ctx, d, d->count - 1))
+                    goto fail;
+            }
+        }
+    }
+
+    /* ---- the flow's pending job queue ---- */
+    {
+        uint32_t nj = tt_rd_leb(&r->rd), i2;
+        if (r->rd.err || nj > (uint32_t)len)
+            goto trunc;
+        for (i2 = 0; i2 < nj; i2++) {
+            uint32_t kind = tt_rd_u8(&r->rd);
+            uint32_t argc2 = tt_rd_leb(&r->rd), j;
+            JSJobEntry *e;
+            if (r->rd.err || kind > 1 || argc2 > 16)
+                goto trunc;
+            if (!base->tt_jobs) {
+                base->tt_jobs = js_mallocz(ctx, sizeof(*base->tt_jobs));
+                if (!base->tt_jobs)
+                    goto fail;
+                init_list_head(&base->tt_jobs->jobs);
+            }
+            e = js_mallocz(ctx, sizeof(*e) + argc2 * sizeof(JSValue));
+            if (!e)
+                goto fail;
+            e->realm = JS_DupContext(ctx);
+            e->job_func = (kind == 0) ? promise_reaction_job
+                                      : js_promise_resolve_thenable_job;
+            e->argc = (int)argc2;
+            for (j = 0; j < argc2; j++)
+                e->argv[j] = JS_UNDEFINED;
+            list_add_tail(&e->link, &base->tt_jobs->jobs);
+            base->tt_jobs->count++;
+            for (j = 0; j < argc2; j++) {
+                JSValue v = rd_get_vref(r);
+                if (JS_IsException(v))
+                    goto fail;
+                e->argv[j] = v;
+            }
+        }
+    }
+
+    /* ---- async flows: fresh result promises regain their handle link ---- */
+    for (i = 0; i < r->rec_count; i++) {
+        if (r->recs[i].kind == TT_REC_STATE && r->recs[i].st)
+            tt_async_flow_link_from_state(ctx, r->recs[i].st);
+    }
+
+    /* ---- root ---- */
+    root_kind = (uint8_t)tt_rd_u8(&r->rd);
+    if (r->rd.err)
+        goto trunc;
+    if (root_kind == 1) {
+        root_val = rd_get_vref(r);
+        if (JS_IsException(root_val)) {
+            root_val = JS_UNDEFINED;
+            goto fail;
+        }
+    } else {
+        uint32_t idx = tt_rd_leb(&r->rd);
+        if (r->rd.err || idx >= r->rec_count ||
+            r->recs[idx].kind != TT_REC_STATE)
+            goto trunc;
+        if (r->recs[idx].st != base) {
+            JS_ThrowTypeError(ctx, "flow bytes: root is not the base state");
+            goto fail;
+        }
+    }
+
+    /* ---- adopt the transplanted machine: the rebuilt chain becomes this
+       flow's OWN suspended machine (a first-class per-flow value),
+       resumable any time with JS_TTFlowResumeParked. Any number of flows
+       can hold parked machines in one runtime at once. ---- */
+    if (r->machine) {
+        if (!r->m) {          /* an all-heap chain still gets its handle */
+            r->m = tt_machine_new(ctx);
+            if (!r->m)
+                goto fail;
+        }
+        r->m->parked_frame = r->frames[r->chain_count - 1].sf;
+        r->m->base_frame = &base->frame;
+        base->tt_machine = r->m;
+        r->m = NULL;
+    }
+
+    /* ---- reconciliation: keep the graph, drop construction refs ---- */
+    js_rc(base)->ref_count++;             /* the caller's reference */
+    rd_release(r);
+    if (proot)
+        *proot = root_val;
+    else
+        JS_FreeValue(ctx, root_val);
+    return base;
+
+trunc:
+    JS_ThrowTypeError(ctx, "flow bytes: truncated or corrupt");
+fail:
+    JS_FreeValue(ctx, root_val);
+    rd_unwind_arena(r);
+    rd_release(r);
+    if (r->m) {
+        /* the un-adopted machine: its chain was already dismantled above
+           (values freed, weak slots cleared by rd_release) -- raw-free the
+           arena and the handle */
+        tt_arena_segs_free(rt, r->m->arena_seg);
+        js_free_rt(rt, r->m);
+    }
+    return NULL;
+}
+
+/* -- fork (in-heap clone) -------------------------------------------------- */
+
+/* JS_TTFlowFork clones a suspended flow into a concurrent sibling: the same
+   classification as the serializer -- baseline entities SHARE (a refcount
+   bump), everything flow-private deep-copies -- run through the same
+   assign-then-relink swizzle, but into live heap objects instead of bytes.
+   Both flows then resume and diverge independently over the shared
+   baseline, each applying its own COW delta on check-in. */
+
+typedef struct TTForkCtx {
+    JSContext *ctx;
+    TTFlowWr *w;              /* completed pass-A enumeration of the parent */
+    /* per record: the sibling entity (one construction reference each) */
+    JSValue *clone_v;
+    JSVarRef **clone_vr;
+    JSAsyncFunctionState **clone_st;
+    void **clone_raw;         /* PRESOLVED clones; PROMISE_FUNC data until
+                                 its object adopts it in pass 2 */
+    /* per frame-table entry: the sibling frame */
+    JSStackFrame **clone_frame;
+    /* machine-parked parent: the sibling chain's own machine (owned until
+       the sibling base adopts it) */
+    TTMachine *m;
+} TTForkCtx;
+
+/* the sibling counterpart of wr_frame_owned_start() */
+static JSValue *fork_frame_owned_start(TTForkCtx *fk, uint32_t i)
+{
+    return fk->w->frames[i].owner ? fk->clone_frame[i]->tt_frame_base
+                                  : fk->clone_frame[i]->arg_buf;
+}
+
+/* map a live parent value to the sibling's: baseline and immutable values
+   share, private records map to their clones; returns an owned reference */
+static JSValue fork_map_value(TTForkCtx *fk, JSValueConst v)
+{
+    void *ptr;
+    uint32_t idx;
+    switch (JS_VALUE_GET_TAG(v)) {
+    case JS_TAG_OBJECT:
+    case JS_TAG_SYMBOL:
+        ptr = JS_VALUE_GET_PTR(v);
+        if (tt_ptrmap_get(&fk->w->bl->map, ptr))
+            return JS_DupValue(fk->ctx, v);        /* baseline: shared */
+        idx = tt_ptrmap_get(&fk->w->map, ptr);
+        if (!idx) {
+            JS_ThrowInternalError(fk->ctx, "flow fork: value escaped the "
+                                  "enumeration pass");
+            return JS_EXCEPTION;
+        }
+        return JS_DupValue(fk->ctx, fk->clone_v[idx - 1]);
+    default:
+        /* strings and ropes are immutable (shared); immediates copy */
+        return JS_DupValue(fk->ctx, v);
+    }
+}
+
+/* map a parent cell; returns a borrowed pointer (caller bumps) */
+static JSVarRef *fork_map_varref(TTForkCtx *fk, JSVarRef *vr)
+{
+    uint32_t idx;
+    if (tt_ptrmap_get(&fk->w->bl->map, vr))
+        return vr;                                 /* baseline cell: shared */
+    idx = tt_ptrmap_get(&fk->w->map, vr);
+    if (!idx) {
+        JS_ThrowInternalError(fk->ctx, "flow fork: cell escaped the "
+                              "enumeration pass");
+        return NULL;
+    }
+    return fk->clone_vr[idx - 1];
+}
+
+/* clone the parent object's own properties onto the sibling (shape order,
+   the serializer's exact coverage) */
+static int fork_copy_props(TTForkCtx *fk, JSObject *src, JSValueConst dst,
+                           BOOL skip_length)
+{
+    JSContext *ctx = fk->ctx;
+    JSObject *dp = JS_VALUE_GET_OBJ(dst);
+    int i;
+    for (i = 0; i < src->shape->prop_count; i++) {
+        JSShapeProperty *prs = get_shape_prop(src->shape) + i;
+        JSProperty *pr = &src->prop[i];
+        JSProperty *npr;
+        if (prs->atom == JS_ATOM_NULL)
+            continue;
+        if (skip_length && prs->atom == JS_ATOM_length)
+            continue;
+        switch (prs->flags & JS_PROP_TMASK) {
+        case JS_PROP_NORMAL: {
+            JSValue v = fork_map_value(fk, pr->u.value);
+            if (JS_IsException(v))
+                return -1;
+            npr = add_property(ctx, dp, prs->atom,
+                               prs->flags & 0x3f);
+            if (!npr) {
+                JS_FreeValue(ctx, v);
+                return -1;
+            }
+            npr->u.value = v;
+            break;
+        }
+        case JS_PROP_GETSET: {
+            JSValue g = JS_UNDEFINED, s = JS_UNDEFINED;
+            if (pr->u.getset.getter) {
+                g = fork_map_value(fk, JS_MKPTR(JS_TAG_OBJECT,
+                                                pr->u.getset.getter));
+                if (JS_IsException(g))
+                    return -1;
+            }
+            if (pr->u.getset.setter) {
+                s = fork_map_value(fk, JS_MKPTR(JS_TAG_OBJECT,
+                                                pr->u.getset.setter));
+                if (JS_IsException(s)) {
+                    JS_FreeValue(ctx, g);
+                    return -1;
+                }
+            }
+            npr = add_property(ctx, dp, prs->atom,
+                               prs->flags & 0x3f);
+            if (!npr) {
+                JS_FreeValue(ctx, g);
+                JS_FreeValue(ctx, s);
+                return -1;
+            }
+            npr->u.getset.getter =
+                JS_IsUndefined(g) ? NULL : JS_VALUE_GET_OBJ(g);
+            npr->u.getset.setter =
+                JS_IsUndefined(s) ? NULL : JS_VALUE_GET_OBJ(s);
+            break;
+        }
+        case JS_PROP_VARREF: {
+            JSVarRef *vr = fork_map_varref(fk, pr->u.var_ref);
+            if (!vr)
+                return -1;
+            npr = add_property(ctx, dp, prs->atom,
+                               prs->flags & 0x3f);
+            if (!npr)
+                return -1;
+            js_rc(vr)->ref_count++;
+            npr->u.var_ref = vr;
+            break;
+        }
+        default:              /* autoinit .prototype: recreate lazily */
+            if (JS_DefineAutoInitProperty(ctx, dst, prs->atom,
+                                          JS_AUTOINIT_ID_PROTOTYPE, NULL,
+                                          prs->flags &
+                                          (JS_PROP_CONFIGURABLE |
+                                           JS_PROP_WRITABLE |
+                                           JS_PROP_ENUMERABLE)) < 0)
+                return -1;
+            break;
+        }
+    }
+    return 0;
+}
+
+static int fork_set_proto(TTForkCtx *fk, JSObject *src, JSValueConst dst)
+{
+    JSValue proto = src->shape->proto ?
+        fork_map_value(fk, JS_MKPTR(JS_TAG_OBJECT, src->shape->proto))
+        : JS_NULL;
+    int ret;
+    if (JS_IsException(proto))
+        return -1;
+    ret = JS_SetPrototypeInternal(fk->ctx, dst, proto, TRUE);
+    JS_FreeValue(fk->ctx, proto);
+    return ret < 0 ? -1 : 0;
+}
+
+/* drop the fork's construction references; the relinked sibling graph keeps
+   what the returned handle reaches (the reconciliation step, as the
+   deserializer's) */
+static void fork_release(TTForkCtx *fk)
+{
+    uint32_t i;
+    for (i = 0; i < fk->w->rec_count; i++) {
+        switch (fk->w->recs[i].kind) {
+        case TT_REC_STATE:
+            if (fk->clone_st[i])
+                async_func_free(fk->ctx->rt, fk->clone_st[i]);
+            break;
+        case TT_REC_VARREF_OPEN:
+        case TT_REC_VARREF_CLOSED:
+            if (fk->clone_vr[i])
+                free_var_ref(fk->ctx->rt, fk->clone_vr[i]);
+            break;
+        case TT_REC_PRESOLVED:
+            if (fk->clone_raw && fk->clone_raw[i])
+                js_promise_resolve_function_free_resolved(fk->ctx->rt,
+                                                          fk->clone_raw[i]);
+            break;
+        case TT_REC_PROMISE_FUNC:
+            if (fk->clone_raw && fk->clone_raw[i]) {
+                /* the object never adopted its data (early failure) */
+                JSPromiseFunctionData *fd = fk->clone_raw[i];
+                JS_FreeValue(fk->ctx, fd->promise);
+                js_free(fk->ctx, fd);
+            }
+            JS_FreeValue(fk->ctx, fk->clone_v[i]);
+            break;
+        default:
+            JS_FreeValue(fk->ctx, fk->clone_v[i]);
+            break;
+        }
+    }
+    js_free(fk->ctx, fk->clone_v);
+    js_free(fk->ctx, fk->clone_vr);
+    js_free(fk->ctx, fk->clone_st);
+    js_free(fk->ctx, fk->clone_frame);
+    js_free(fk->ctx, fk->clone_raw);
+}
+
+/* fork_flow(): clone 'base'+'root' (a suspended generator flow) inside the
+   same runtime. Yield-suspended flows clone their state graph; machine-
+   parked flows (a handle, the legacy parked machine, or -- via the chain
+   override -- the RUNNING machine at a step point) additionally rebuild
+   the parked TrampFrame chain in the sibling's own arena, so the sibling
+   arrives as an independently suspended machine. Returns the sibling's
+   handle. */
+static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
+                         JSValueConst root,
+                         JSStackFrame *chain_innermost,
+                         uint8_t *chain_arena_top, TTArenaSeg *chain_seg)
+{
+    TTFlowWr w_s, *w = &w_s;
+    TTForkCtx fk_s, *fk = &fk_s;
+    JSValue result = JS_EXCEPTION;
+    uint32_t i;
+
+    if (!ctx->rt->tt_flow_baseline) {
+        return JS_ThrowTypeError(ctx, "flow fork: no baseline captured");
+    }
+    memset(w, 0, sizeof(*w));
+    w->ctx = ctx;
+    w->bl = ctx->rt->tt_flow_baseline;
+    w->forking = TRUE;
+    w->chain_innermost = chain_innermost;
+    w->chain_arena_top = chain_arena_top;
+    w->chain_seg = chain_seg;
+    memset(fk, 0, sizeof(*fk));
+    fk->ctx = ctx;
+    fk->w = w;
+
+    /* pass A: the serializer's classification, verbatim */
+    if (wr_enumerate(w, base, root, 1))
+        goto out;
+
+    fk->clone_v = js_mallocz(ctx, sizeof(JSValue) * (w->rec_count + 1));
+    fk->clone_vr = js_mallocz(ctx, sizeof(JSVarRef *) * (w->rec_count + 1));
+    fk->clone_st = js_mallocz(ctx,
+                              sizeof(JSAsyncFunctionState *) * (w->rec_count + 1));
+    fk->clone_frame = js_mallocz(ctx,
+                                 sizeof(JSStackFrame *) * (w->frame_count + 1));
+    fk->clone_raw = js_mallocz(ctx, sizeof(void *) * (w->rec_count + 1));
+    if (!fk->clone_v || !fk->clone_vr || !fk->clone_st || !fk->clone_frame ||
+        !fk->clone_raw)
+        goto out;
+    for (i = 0; i < w->rec_count; i++)
+        fk->clone_v[i] = JS_UNDEFINED;
+
+    /* pass 1 (assign): allocate every sibling shell */
+    for (i = 0; i < w->rec_count; i++) {
+        TTFlowWrRec *rec = &w->recs[i];
+        switch (rec->kind) {
+        case TT_REC_PLAIN:
+        case TT_REC_DATAOBJ:
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    ((JSObject *)rec->ptr)->class_id);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            if (rec->kind == TT_REC_DATAOBJ)
+                JS_VALUE_GET_OBJ(fk->clone_v[i])->u.object_data =
+                    JS_UNDEFINED;
+            break;
+        case TT_REC_ARRAY:
+            fk->clone_v[i] = JS_NewArray(ctx);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            break;
+        case TT_REC_CLOSURE: {
+            JSObject *src = rec->ptr;
+            JSFunctionBytecode *b = src->u.func.function_bytecode;
+            JSObject *dp;
+            fk->clone_v[i] =
+                JS_NewObjectProtoClass(ctx, JS_NULL,
+                                       func_kind_to_class_id[b->func_kind]);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            dp = JS_VALUE_GET_OBJ(fk->clone_v[i]);
+            dp->u.func.function_bytecode = b;
+            JS_DupValue(ctx, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b));
+            dp->u.func.home_object = NULL;
+            dp->u.func.var_refs = NULL;
+            if (b->closure_var_count) {
+                dp->u.func.var_refs =
+                    js_mallocz(ctx, sizeof(JSVarRef *) * b->closure_var_count);
+                if (!dp->u.func.var_refs)
+                    goto out;
+            }
+            break;
+        }
+        case TT_REC_GENOBJ: {
+            JSObject *src = rec->ptr;
+            JSGeneratorData *sgd = src->u.generator_data;
+            JSGeneratorData *gd;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    JS_CLASS_GENERATOR);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            gd = js_mallocz(ctx, sizeof(*gd));
+            if (!gd)
+                goto out;
+            gd->state = sgd ? sgd->state : JS_GENERATOR_STATE_COMPLETED;
+            gd->func_state = NULL;             /* linked in pass 2 */
+            JS_SetOpaque(fk->clone_v[i], gd);
+            break;
+        }
+        case TT_REC_STATE: {
+            JSAsyncFunctionState *src = rec->ptr;
+            JSObject *fo = JS_VALUE_GET_OBJ(src->frame.cur_func);
+            JSFunctionBytecode *b = fo->u.func.function_bytecode;
+            JSAsyncFunctionState *st =
+                rd_alloc_state(ctx, b, (uint32_t)src->argc);
+            if (!st)
+                goto out;
+            st->throw_flag = src->throw_flag;
+            /* same runtime, same bytecode: the pc copies verbatim */
+            st->frame.cur_pc = src->frame.cur_pc;
+            st->frame.cur_sp = st->frame.arg_buf +
+                (src->frame.cur_sp - src->frame.arg_buf);
+            st->frame.tt_last_line = src->frame.tt_last_line;
+            st->frame.tt_pc_lo = src->frame.tt_pc_lo;
+            st->frame.tt_pc_hi = src->frame.tt_pc_hi;
+            st->frame.tt_prev_off = src->frame.tt_prev_off;
+            fk->clone_st[i] = st;
+            break;
+        }
+        case TT_REC_VARREF_OPEN:
+        case TT_REC_VARREF_CLOSED: {
+            JSVarRef *src = rec->ptr;
+            JSVarRef *vr = js_malloc(ctx, sizeof(*vr));
+            if (!vr)
+                goto out;
+            js_rc(vr)->ref_count = 1;
+            add_gc_object(ctx->rt, &vr->header, JS_GC_OBJ_TYPE_VAR_REF);
+            vr->is_lexical = src->is_lexical;
+            vr->is_const = src->is_const;
+            vr->is_detached = TRUE;            /* open ones reattach below */
+            vr->value = JS_UNDEFINED;
+            vr->pvalue = &vr->value;
+            fk->clone_vr[i] = vr;
+            break;
+        }
+        case TT_REC_STRING:
+        case TT_REC_SYMBOL:
+            /* immutable: siblings share the very same value */
+            fk->clone_v[i] = JS_DupValue(ctx, JS_MKPTR(
+                rec->kind == TT_REC_STRING ? JS_TAG_STRING : JS_TAG_SYMBOL,
+                rec->ptr));
+            break;
+        case TT_REC_PROMISE: {
+            JSPromiseData *pd;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    JS_CLASS_PROMISE);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            pd = js_mallocz(ctx, sizeof(*pd));
+            if (!pd)
+                goto out;
+            pd->promise_state = JS_PROMISE_PENDING;
+            init_list_head(&pd->promise_reactions[0]);
+            init_list_head(&pd->promise_reactions[1]);
+            pd->promise_result = JS_UNDEFINED;
+            JS_SetOpaque(fk->clone_v[i], pd);
+            break;
+        }
+        case TT_REC_PROMISE_FUNC: {
+            JSObject *src = rec->ptr;
+            JSPromiseFunctionData *fd;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    src->class_id);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            fd = js_mallocz(ctx, sizeof(*fd));
+            if (!fd)
+                goto out;
+            fd->promise = JS_UNDEFINED;
+            fk->clone_raw[i] = fd;    /* adopted in pass 2 */
+            break;
+        }
+        case TT_REC_PRESOLVED: {
+            JSPromiseFunctionDataResolved *src = rec->ptr, *sr;
+            sr = js_malloc(ctx, sizeof(*sr));
+            if (!sr)
+                goto out;
+            sr->ref_count = 1;
+            sr->already_resolved = src->already_resolved;
+            fk->clone_raw[i] = sr;
+            break;
+        }
+        case TT_REC_ASYNC_RESOLVE: {
+            JSObject *src = rec->ptr;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    src->class_id);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            JS_VALUE_GET_OBJ(fk->clone_v[i])->u.async_function_data = NULL;
+            break;
+        }
+        }
+    }
+    /* frames: state-owned frames map to their clone states; arena frames
+       of a machine-parked chain rebuild in the sibling's OWN arena with
+       identical geometry, so every parent-relative offset (arg windows,
+       receivers, open-cell slots) transfers verbatim. Chain order puts
+       each parent at i-1, already cloned. */
+    for (i = 0; i < w->frame_count; i++) {
+        if (w->frames[i].owner == 0) {
+            JSAsyncFunctionState *src =
+                container_of(w->frames[i].sf, JSAsyncFunctionState, frame);
+            uint32_t idx = tt_ptrmap_get(&w->map, src);
+            fk->clone_frame[i] = &fk->clone_st[idx - 1]->frame;
+        } else {
+            JSStackFrame *src = w->frames[i].sf;
+            JSObject *fo = JS_VALUE_GET_OBJ(src->cur_func);
+            JSFunctionBytecode *b = fo->u.func.function_bytecode;
+            JSStackFrame *nsf;
+            JSValue *vals;
+            JSValue *pstart, *cstart;
+            size_t val_count =
+                (size_t)(src->arg_buf == src->tt_frame_base ? b->arg_count
+                                                            : 0) +
+                b->var_count + b->stack_size;
+            uint32_t k;
+            if (!fk->m) {
+                fk->m = tt_machine_new(ctx);
+                if (!fk->m)
+                    goto out;
+            }
+            nsf = tt_machine_arena_push(ctx, fk->m, val_count,
+                                        b->var_ref_count, &vals);
+            if (!nsf)
+                goto out;
+            nsf->js_mode = src->js_mode;
+            nsf->cur_func = JS_UNDEFINED; /* borrow, bound after payloads */
+            nsf->cur_pc = src->cur_pc;    /* same bytecode: copies verbatim */
+            nsf->cur_sp = vals + (src->cur_sp - src->tt_frame_base);
+            nsf->tt_frame_kind = src->tt_frame_kind;
+            nsf->tt_call_argc = src->tt_call_argc;
+            nsf->tt_this = JS_UNDEFINED;  /* borrow, bound after payloads */
+            nsf->tt_new_target = JS_UNDEFINED;
+            nsf->tt_orig_argc = src->tt_orig_argc;
+            nsf->tt_frame_base = vals;
+            nsf->tt_ctor_this = JS_UNDEFINED;
+            nsf->tt_aux = NULL;
+            nsf->tt_aux_i = src->tt_aux_i;
+            nsf->arg_count = src->arg_count;
+            nsf->var_buf = vals + (src->var_buf - src->tt_frame_base);
+            nsf->var_refs = (JSVarRef **)(vals + val_count);
+            for (k = 0; k < (uint32_t)b->var_ref_count; k++)
+                nsf->var_refs[k] = NULL;
+            for (k = 0; k < (uint32_t)val_count; k++)
+                vals[k] = JS_UNDEFINED;
+            /* the argument window and receiver alias the PARENT's slots,
+               at the very offsets the parent's clone reproduces */
+            pstart = wr_frame_owned_start(&w->frames[i - 1]);
+            cstart = fork_frame_owned_start(fk, i - 1);
+            if (src->tt_orig_argv < pstart ||
+                src->tt_orig_argv + src->tt_orig_argc >
+                    w->frames[i - 1].sf->cur_sp) {
+                JS_ThrowInternalError(ctx, "flow fork: argument window "
+                                      "outside the parent frame");
+                goto out;
+            }
+            nsf->tt_orig_argv = cstart + (src->tt_orig_argv - pstart);
+            nsf->arg_buf = (src->arg_buf == src->tt_frame_base)
+                ? vals : cstart + (src->arg_buf - pstart);
+            nsf->prev_frame = fk->clone_frame[i - 1];
+            nsf->tt_last_line = src->tt_last_line;
+            nsf->tt_pc_lo = src->tt_pc_lo;
+            nsf->tt_pc_hi = src->tt_pc_hi;
+            nsf->tt_prev_off = src->tt_prev_off;
+            fk->clone_frame[i] = nsf;
+        }
+    }
+
+    /* open cells reattach over the sibling stacks (get_var_ref's rules:
+       weak frame slot, pin on the owning state) */
+    for (i = 0; i < w->rec_count; i++) {
+        JSVarRef *src, *vr;
+        JSStackFrame *reg_sf;
+        uint32_t reg_idx, k, mem = 0;
+        if (w->recs[i].kind != TT_REC_VARREF_OPEN)
+            continue;
+        src = w->recs[i].ptr;
+        vr = fk->clone_vr[i];
+        reg_idx = tt_ptrmap_get(&w->frame_map, src->stack_frame);
+        if (!reg_idx) {
+            JS_ThrowInternalError(ctx, "flow fork: open cell frame escaped "
+                                  "enumeration");
+            goto out;
+        }
+        reg_sf = fk->clone_frame[reg_idx - 1];
+        for (k = 0; k < w->frame_count; k++) {
+            JSValue *s0 = wr_frame_owned_start(&w->frames[k]);
+            if (src->pvalue >= s0 && src->pvalue < w->frames[k].sf->cur_sp) {
+                mem = k + 1;
+                break;
+            }
+        }
+        if (!mem) {
+            JS_ThrowInternalError(ctx, "flow fork: open cell storage escaped "
+                                  "enumeration");
+            goto out;
+        }
+        vr->is_detached = FALSE;
+        vr->var_ref_idx = src->var_ref_idx;
+        vr->stack_frame = reg_sf;
+        /* the cell's storage slot is owned-start-relative: aliased-arg
+           cells live in the PARENT's block, and the clone reproduces the
+           exact offsets (mirrors the wire format's frame/off pairs) */
+        vr->pvalue = fork_frame_owned_start(fk, mem - 1) +
+            (src->pvalue - wr_frame_owned_start(&w->frames[mem - 1]));
+        reg_sf->var_refs[src->var_ref_idx] = vr;
+        /* get_var_ref()'s rule: only a heap (async-state) frame pins its
+           owner; cells on arena frames close when the frame pops */
+        if (reg_sf->js_mode & JS_MODE_ASYNC)
+            js_rc(container_of(reg_sf, JSAsyncFunctionState,
+                               frame))->ref_count++;
+    }
+
+    /* pass 2 (relink): fill every sibling from its live parent */
+    for (i = 0; i < w->rec_count; i++) {
+        TTFlowWrRec *rec = &w->recs[i];
+        switch (rec->kind) {
+        case TT_REC_PLAIN:
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]) ||
+                fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        case TT_REC_ARRAY: {
+            JSObject *src = rec->ptr;
+            JSObject *dst;
+            uint32_t k;
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            dst = JS_VALUE_GET_OBJ(fk->clone_v[i]);
+            if (src->u.array.count &&
+                expand_fast_array(ctx, dst, src->u.array.count) < 0)
+                goto out;
+            for (k = 0; k < src->u.array.count; k++) {
+                JSValue v = fork_map_value(fk, src->u.array.u.values[k]);
+                if (JS_IsException(v))
+                    goto out;
+                if (add_fast_array_element(ctx, dst, v, 0) < 0)
+                    goto out;
+            }
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], TRUE))
+                goto out;
+            break;
+        }
+        case TT_REC_DATAOBJ: {
+            JSObject *src = rec->ptr;
+            JSValue v;
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            v = fork_map_value(fk, src->u.object_data);
+            if (JS_IsException(v))
+                goto out;
+            JS_VALUE_GET_OBJ(fk->clone_v[i])->u.object_data = v;
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        }
+        case TT_REC_CLOSURE: {
+            JSObject *src = rec->ptr;
+            JSObject *dst = JS_VALUE_GET_OBJ(fk->clone_v[i]);
+            JSFunctionBytecode *b = src->u.func.function_bytecode;
+            int k;
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            if (src->u.func.home_object) {
+                JSValue h = fork_map_value(fk, JS_MKPTR(JS_TAG_OBJECT,
+                                                        src->u.func.home_object));
+                if (JS_IsException(h))
+                    goto out;
+                dst->u.func.home_object = JS_VALUE_GET_OBJ(h);
+            }
+            if (src->u.func.var_refs) {
+                for (k = 0; k < b->closure_var_count; k++) {
+                    JSVarRef *vr = src->u.func.var_refs[k];
+                    if (!vr)
+                        continue;
+                    vr = fork_map_varref(fk, vr);
+                    if (!vr)
+                        goto out;
+                    js_rc(vr)->ref_count++;
+                    dst->u.func.var_refs[k] = vr;
+                }
+            }
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        }
+        case TT_REC_GENOBJ: {
+            JSObject *src = rec->ptr;
+            JSGeneratorData *sgd = src->u.generator_data;
+            JSGeneratorData *gd = JS_GetOpaque(fk->clone_v[i],
+                                               JS_CLASS_GENERATOR);
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            if (sgd && sgd->func_state &&
+                sgd->state != JS_GENERATOR_STATE_COMPLETED) {
+                uint32_t sidx = tt_ptrmap_get(&w->map, sgd->func_state);
+                gd->func_state = fk->clone_st[sidx - 1];
+                js_rc(gd->func_state)->ref_count++;
+            }
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        }
+        case TT_REC_STATE: {
+            JSAsyncFunctionState *src = rec->ptr;
+            JSAsyncFunctionState *st = fk->clone_st[i];
+            JSValue *sp, *dp2;
+            JSValue v;
+            v = fork_map_value(fk, src->frame.cur_func);
+            if (JS_IsException(v))
+                goto out;
+            st->frame.cur_func = v;
+            v = fork_map_value(fk, src->this_val);
+            if (JS_IsException(v))
+                goto out;
+            st->this_val = v;
+            st->frame.tt_this = st->this_val;
+            v = fork_map_value(fk, src->resolving_funcs[0]);
+            if (JS_IsException(v))
+                goto out;
+            st->resolving_funcs[0] = v;
+            v = fork_map_value(fk, src->resolving_funcs[1]);
+            if (JS_IsException(v))
+                goto out;
+            st->resolving_funcs[1] = v;
+            dp2 = st->frame.arg_buf;
+            for (sp = src->frame.arg_buf; sp < src->frame.cur_sp;
+                 sp++, dp2++) {
+                v = fork_map_value(fk, *sp);
+                if (JS_IsException(v))
+                    goto out;
+                *dp2 = v;
+            }
+            /* the sibling's independent first-write log, checked out */
+            if (src->tt_delta && src->tt_delta->count) {
+                TTFlowDelta *sd = src->tt_delta;
+                TTFlowDelta *nd = js_mallocz(ctx, sizeof(*nd));
+                uint32_t k;
+                if (!nd)
+                    goto out;
+                nd->checked_in = FALSE;
+                st->tt_delta = nd;
+                for (k = 0; k < sd->count; k++) {
+                    TTFlowDeltaRec *sr = &sd->tab[k];
+                    TTFlowDeltaRec *nr = tt_flow_delta_push(ctx, nd);
+                    uint32_t k2;
+                    if (!nr)
+                        goto out;
+                    memset(nr, 0, sizeof(*nr));
+                    nr->kind = sr->kind;
+                    nr->holds = sr->holds;
+                    nr->prop_flags = sr->prop_flags;
+                    nr->obj = JS_UNDEFINED;
+                    nr->saved = JS_UNDEFINED;
+                    nr->alen = JS_UNDEFINED;
+                    if (!JS_IsUndefined(sr->obj)) {
+                        v = fork_map_value(fk, sr->obj);
+                        if (JS_IsException(v))
+                            goto out;
+                        nr->obj = v;
+                    }
+                    if (sr->atom != JS_ATOM_NULL)
+                        nr->atom = JS_DupAtom(ctx, sr->atom);
+                    if (sr->vr) {
+                        JSVarRef *vr = fork_map_varref(fk, sr->vr);
+                        if (!vr)
+                            goto out;
+                        js_rc(vr)->ref_count++;
+                        nr->vr = vr;
+                    }
+                    if (!JS_IsUndefined(sr->saved)) {
+                        v = fork_map_value(fk, sr->saved);
+                        if (JS_IsException(v))
+                            goto out;
+                        nr->saved = v;
+                    }
+                    switch (sr->kind) {
+                    case TT_DELTA_ARRAY:
+                        if (sr->acount) {
+                            nr->avec = js_mallocz(ctx, sizeof(JSValue) *
+                                                  sr->acount);
+                            if (!nr->avec)
+                                goto out;
+                            for (k2 = 0; k2 < sr->acount; k2++)
+                                nr->avec[k2] = JS_UNDEFINED;
+                            nr->acount = nr->asize = sr->acount;
+                            for (k2 = 0; k2 < sr->acount; k2++) {
+                                v = fork_map_value(fk, sr->avec[k2]);
+                                if (JS_IsException(v))
+                                    goto out;
+                                nr->avec[k2] = v;
+                            }
+                        }
+                        v = fork_map_value(fk, sr->alen);
+                        if (JS_IsException(v))
+                            goto out;
+                        nr->alen = v;
+                        break;
+                    case TT_DELTA_PROMISE: {
+                        JSPromiseData *spd = sr->snap;
+                        JSPromiseData *npd = js_mallocz(ctx, sizeof(*npd));
+                        struct list_head *el;
+                        int m;
+                        if (!npd)
+                            goto out;
+                        init_list_head(&npd->promise_reactions[0]);
+                        init_list_head(&npd->promise_reactions[1]);
+                        npd->promise_result = JS_UNDEFINED;
+                        nr->snap = npd;
+                        npd->promise_state = spd->promise_state;
+                        npd->is_handled = spd->is_handled;
+                        v = fork_map_value(fk, spd->promise_result);
+                        if (JS_IsException(v))
+                            goto out;
+                        npd->promise_result = v;
+                        for (m = 0; m < 2; m++) {
+                            list_for_each(el, &spd->promise_reactions[m]) {
+                                JSPromiseReactionData *srd =
+                                    list_entry(el, JSPromiseReactionData,
+                                               link);
+                                JSPromiseReactionData *drd =
+                                    js_mallocz(ctx, sizeof(*drd));
+                                int m2;
+                                if (!drd)
+                                    goto out;
+                                for (m2 = 0; m2 < 2; m2++)
+                                    drd->resolving_funcs[m2] = JS_UNDEFINED;
+                                drd->handler = JS_UNDEFINED;
+                                list_add_tail(&drd->link,
+                                              &npd->promise_reactions[m]);
+                                for (m2 = 0; m2 < 2; m2++) {
+                                    v = fork_map_value(fk,
+                                            srd->resolving_funcs[m2]);
+                                    if (JS_IsException(v))
+                                        goto out;
+                                    drd->resolving_funcs[m2] = v;
+                                }
+                                v = fork_map_value(fk, srd->handler);
+                                if (JS_IsException(v))
+                                    goto out;
+                                drd->handler = v;
+                            }
+                        }
+                        break;
+                    }
+                    case TT_DELTA_MAP: {
+                        /* baseline maps are shared identities: the
+                           snapshot's keys/values map through the fork,
+                           node structure clones as-is */
+                        JSMapState *sms = sr->snap;
+                        JSMapState *nms;
+                        struct list_head *el;
+                        nms = js_mallocz(ctx, sizeof(*nms));
+                        if (!nms)
+                            goto out;
+                        init_list_head(&nms->records);
+                        nms->hash_bits = sms->hash_bits;
+                        nms->hash_size = sms->hash_size;
+                        nms->record_count_threshold =
+                            sms->record_count_threshold;
+                        nms->hash_table = js_mallocz(ctx,
+                            sizeof(JSMapRecord *) * nms->hash_size);
+                        if (!nms->hash_table) {
+                            js_free(ctx, nms);
+                            goto out;
+                        }
+                        nr->snap = nms;
+                        list_for_each(el, &sms->records) {
+                            JSMapRecord *smr =
+                                list_entry(el, JSMapRecord, link);
+                            JSMapRecord *nmr = js_mallocz(ctx, sizeof(*nmr));
+                            uint32_t h;
+                            if (!nmr)
+                                goto out;
+                            nmr->ref_count = 1;
+                            nmr->key = JS_UNDEFINED;
+                            nmr->value = JS_UNDEFINED;
+                            list_add_tail(&nmr->link, &nms->records);
+                            nms->record_count++;
+                            v = fork_map_value(fk, smr->key);
+                            if (JS_IsException(v))
+                                goto out;
+                            nmr->key = v;
+                            v = fork_map_value(fk, smr->value);
+                            if (JS_IsException(v))
+                                goto out;
+                            nmr->value = v;
+                            h = map_hash_key(nmr->key, nms->hash_bits);
+                            nmr->hash_next = nms->hash_table[h];
+                            nms->hash_table[h] = nmr;
+                        }
+                        break;
+                    }
+                    case TT_DELTA_ABUF:
+                        nr->snap = js_malloc(ctx, sr->snap_len ?
+                                             sr->snap_len : 1);
+                        if (!nr->snap)
+                            goto out;
+                        nr->snap_len = sr->snap_len;
+                        memcpy(nr->snap, sr->snap, sr->snap_len);
+                        break;
+                    }
+                    if (tt_flow_delta_index_rec(ctx, nd, nd->count - 1))
+                        goto out;
+                }
+            }
+            break;
+        }
+        case TT_REC_VARREF_CLOSED: {
+            JSVarRef *src = rec->ptr;
+            JSValue v = fork_map_value(fk, *src->pvalue);
+            if (JS_IsException(v))
+                goto out;
+            fk->clone_vr[i]->value = v;
+            break;
+        }
+        case TT_REC_PROMISE: {
+            JSObject *src = rec->ptr;
+            JSPromiseData *spd = JS_GetOpaque(JS_MKPTR(JS_TAG_OBJECT, src),
+                                              JS_CLASS_PROMISE);
+            JSPromiseData *dpd = JS_GetOpaque(fk->clone_v[i],
+                                              JS_CLASS_PROMISE);
+            struct list_head *el;
+            int k;
+            JSValue v;
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            dpd->promise_state = spd->promise_state;
+            dpd->is_handled = spd->is_handled;
+            v = fork_map_value(fk, spd->promise_result);
+            if (JS_IsException(v))
+                goto out;
+            dpd->promise_result = v;
+            for (k = 0; k < 2; k++) {
+                list_for_each(el, &spd->promise_reactions[k]) {
+                    JSPromiseReactionData *srd =
+                        list_entry(el, JSPromiseReactionData, link);
+                    JSPromiseReactionData *drd =
+                        js_mallocz(ctx, sizeof(*drd));
+                    int m;
+                    if (!drd)
+                        goto out;
+                    for (m = 0; m < 2; m++)
+                        drd->resolving_funcs[m] = JS_UNDEFINED;
+                    drd->handler = JS_UNDEFINED;
+                    list_add_tail(&drd->link, &dpd->promise_reactions[k]);
+                    for (m = 0; m < 2; m++) {
+                        v = fork_map_value(fk, srd->resolving_funcs[m]);
+                        if (JS_IsException(v))
+                            goto out;
+                        drd->resolving_funcs[m] = v;
+                    }
+                    v = fork_map_value(fk, srd->handler);
+                    if (JS_IsException(v))
+                        goto out;
+                    drd->handler = v;
+                }
+            }
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        }
+        case TT_REC_PROMISE_FUNC: {
+            JSObject *src = rec->ptr;
+            JSPromiseFunctionData *sfd = src->u.promise_function_data;
+            JSPromiseFunctionData *dfd = fk->clone_raw[i];
+            uint32_t pidx = tt_ptrmap_get(&w->map, sfd->presolved);
+            JSValue v;
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            v = fork_map_value(fk, sfd->promise);
+            if (JS_IsException(v))
+                goto out;
+            dfd->promise = v;
+            dfd->presolved = fk->clone_raw[pidx - 1];
+            dfd->presolved->ref_count++;
+            JS_VALUE_GET_OBJ(fk->clone_v[i])->u.promise_function_data = dfd;
+            fk->clone_raw[i] = NULL;  /* owned by the object now */
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        }
+        case TT_REC_ASYNC_RESOLVE: {
+            JSObject *src = rec->ptr;
+            uint32_t sidx = tt_ptrmap_get(&w->map,
+                                          src->u.async_function_data);
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            JS_VALUE_GET_OBJ(fk->clone_v[i])->u.async_function_data =
+                fk->clone_st[sidx - 1];
+            js_rc(fk->clone_st[sidx - 1])->ref_count++;
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    /* arena frame payloads + borrows: every heap frame is filled now, and
+       chain order fills each arena parent before its child, so the borrow
+       of the parent's callee/receiver slot always reads a finished clone */
+    for (i = 0; i < w->frame_count; i++) {
+        JSStackFrame *src, *nsf;
+        JSValue *pstart, *cstart;
+        uint32_t argv_off, k, live;
+        if (w->frames[i].owner != 1)
+            continue;
+        src = w->frames[i].sf;
+        nsf = fk->clone_frame[i];
+        live = (uint32_t)(src->cur_sp - src->tt_frame_base);
+        for (k = 0; k < live; k++) {
+            JSValue v = fork_map_value(fk, src->tt_frame_base[k]);
+            if (JS_IsException(v))
+                goto out;
+            nsf->tt_frame_base[k] = v;
+        }
+        /* the engine's borrows: the callee sits just below the argument
+           window on the parent's stack, the receiver just below that */
+        pstart = wr_frame_owned_start(&w->frames[i - 1]);
+        cstart = fork_frame_owned_start(fk, i - 1);
+        argv_off = (uint32_t)(src->tt_orig_argv - pstart);
+        if (argv_off < 1 ||
+            memcmp(&pstart[argv_off - 1], &src->cur_func,
+                   sizeof(JSValue)) != 0) {
+            JS_ThrowInternalError(ctx, "flow fork: arena frame function "
+                                  "does not match its call site");
+            goto out;
+        }
+        nsf->cur_func = cstart[argv_off - 1];
+        if (!JS_IsUndefined(src->tt_this)) {
+            if (argv_off < 2 ||
+                memcmp(&pstart[argv_off - 2], &src->tt_this,
+                       sizeof(JSValue)) != 0) {
+                JS_ThrowInternalError(ctx, "flow fork: `this` is not the "
+                                      "parent receiver slot");
+                goto out;
+            }
+            nsf->tt_this = cstart[argv_off - 2];
+        }
+    }
+
+    /* chained heap frames: rebind the in-loop generator splice linkage to
+       the SIBLING's generator objects; the base clone keeps its C-entry
+       shape (yields/returns come back to the host), exactly as a
+       transplanted machine does */
+    for (i = 1; i < w->frame_count; i++) {
+        JSStackFrame *srcf, *nsf;
+        JSGeneratorData *sgd, *ngd = NULL;
+        uint32_t k;
+        if (w->frames[i].owner != 0 || !w->frames[i].chained)
+            continue;
+        srcf = w->frames[i].sf;
+        nsf = fk->clone_frame[i];
+        sgd = srcf->tt_aux;
+        for (k = 0; k < w->rec_count; k++) {
+            if (w->recs[k].kind == TT_REC_GENOBJ &&
+                ((JSObject *)w->recs[k].ptr)->u.generator_data == sgd) {
+                ngd = JS_GetOpaque(fk->clone_v[k], JS_CLASS_GENERATOR);
+                break;
+            }
+        }
+        if (!ngd) {
+            JS_ThrowTypeError(ctx, "flow fork: chained generator object "
+                              "escaped the flow graph");
+            goto out;
+        }
+        nsf->tt_frame_kind = TT_FRAME_GEN;
+        nsf->tt_aux = ngd;
+        nsf->tt_aux_i = srcf->tt_aux_i;
+        nsf->tt_call_argc = srcf->tt_call_argc;
+        nsf->prev_frame = fk->clone_frame[i - 1];
+    }
+
+    /* the sibling adopts its machine: an independently suspended,
+       independently resumable parked chain */
+    if (w->machine) {
+        JSAsyncFunctionState *cbase;
+        uint32_t bidx = tt_ptrmap_get(&w->map, base);
+        uint32_t last = 0;
+        for (i = 0; i < w->frame_count; i++)
+            if (w->frames[i].chained)
+                last = i;
+        if (!fk->m) {         /* an all-heap chain still gets its handle */
+            fk->m = tt_machine_new(ctx);
+            if (!fk->m)
+                goto out;
+        }
+        cbase = fk->clone_st[bidx - 1];
+        fk->m->parked_frame = fk->clone_frame[last];
+        fk->m->base_frame = &cbase->frame;
+        cbase->tt_machine = fk->m;
+        fk->m = NULL;
+    }
+
+    /* the flow's captured pending jobs: the sibling gets its own copies */
+    if (base->tt_jobs) {
+        uint32_t bidx = tt_ptrmap_get(&w->map, base);
+        JSAsyncFunctionState *cbase = fk->clone_st[bidx - 1];
+        struct list_head *el;
+        cbase->tt_jobs = js_mallocz(ctx, sizeof(*cbase->tt_jobs));
+        if (!cbase->tt_jobs)
+            goto out;
+        init_list_head(&cbase->tt_jobs->jobs);
+        list_for_each(el, &base->tt_jobs->jobs) {
+            JSJobEntry *se = list_entry(el, JSJobEntry, link);
+            JSJobEntry *de;
+            int j;
+            de = js_mallocz(ctx, sizeof(*de) + se->argc * sizeof(JSValue));
+            if (!de)
+                goto out;
+            de->realm = JS_DupContext(ctx);
+            de->job_func = se->job_func;
+            de->argc = se->argc;
+            for (j = 0; j < se->argc; j++)
+                de->argv[j] = JS_UNDEFINED;
+            list_add_tail(&de->link, &cbase->tt_jobs->jobs);
+            cbase->tt_jobs->count++;
+            for (j = 0; j < se->argc; j++) {
+                JSValue v = fork_map_value(fk, se->argv[j]);
+                if (JS_IsException(v))
+                    goto out;
+                de->argv[j] = v;
+            }
+        }
+    }
+
+    /* async flows: the sibling's result promise regains its handle link */
+    for (i = 0; i < w->rec_count; i++) {
+        if (w->recs[i].kind == TT_REC_STATE && fk->clone_st[i])
+            tt_async_flow_link_from_state(ctx, fk->clone_st[i]);
+    }
+
+    /* reconciliation: the handle keeps the graph, construction refs drop */
+    {
+        uint32_t ridx = tt_ptrmap_get(&w->map, JS_VALUE_GET_PTR(root));
+        result = JS_DupValue(ctx, fk->clone_v[ridx - 1]);
+    }
+out:
+    fork_release(fk);
+    if (fk->m) {
+        /* the fork failed before the sibling adopted its machine: free the
+           half-built chain's owned slots (unfilled ones are UNDEFINED,
+           cur_func/tt_this are borrows) after fork_release cleared the
+           weak cell slots inside these frames */
+        for (i = 0; i < w->frame_count; i++) {
+            JSStackFrame *nsf = fk->clone_frame ? fk->clone_frame[i] : NULL;
+            JSValue *pval;
+            if (w->frames[i].owner != 1 || !nsf)
+                continue;
+            for (pval = nsf->tt_frame_base; pval < nsf->cur_sp; pval++)
+                JS_FreeValue(ctx, *pval);
+        }
+        tt_arena_segs_free(ctx->rt, fk->m->arena_seg);
+        js_free_rt(ctx->rt, fk->m);
+    }
+    tt_ptrmap_free(ctx, &w->map);
+    tt_ptrmap_free(ctx, &w->frame_map);
+    tt_ptrmap_free(ctx, &w->atom_map);
+    js_free(ctx, w->recs);
+    js_free(ctx, w->frames);
+    js_free(ctx, w->atoms);
+    return result;
+}
+
+/* -- public wrappers ------------------------------------------------------- */
+
+/* Serialize a suspended flow (generator object handle). Returns js_malloc'd
+   bytes (caller frees with js_free) or NULL with an exception set. */
+uint8_t *JS_TTFlowSerialize(JSContext *ctx, JSValueConst flow, size_t *plen)
+{
+    JSAsyncFunctionState *st = tt_flow_state_of(ctx, flow);
+    if (!st)
+        return NULL;
+    return serialize_flow(ctx, st, flow, 1, plen);
+}
+
+/* Deserialize into the runtime owning the captured baseline; returns the
+   flow handle (the rebuilt generator object). */
+JSValue JS_TTFlowDeserialize(JSContext *ctx, const uint8_t *buf, size_t len)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValue root;
+    JSAsyncFunctionState *st;
+    if (!rt->tt_flow_baseline) {
+        return JS_ThrowTypeError(ctx, "flow deserialization: no baseline "
+                                 "captured in this runtime");
+    }
+    if (rt->tt_flow_baseline->ctx != ctx) {
+        return JS_ThrowTypeError(ctx, "flow deserialization: wrong realm");
+    }
+    st = deserialize_flow(rt, buf, len, &root);
+    if (!st)
+        return JS_EXCEPTION;
+    async_func_free(rt, st);              /* keep only the handle's reference */
+    if (JS_IsUndefined(root))
+        return JS_ThrowTypeError(ctx, "flow bytes: no host handle (bare "
+                                 "state root)");
+    return root;
+}
+
+/* Resume a flow suspended as a machine handle: completes the next() the
+   park interrupted (in this or another process). cmd 0 continues, cmd 1
+   aborts (an Interrupted error unwinds the whole chain, completing the
+   flow -- the way to discard a parked flow without leaking it). *pdone
+   follows the generator protocol (0 yielded, 1 done, 2 yield* delegation);
+   *pparked = 1 means a step handler re-parked the machine back into its
+   handle -- call again to continue. Afterwards the flow is an ordinary
+   suspended generator: drive it with next(). The machine's own arena and
+   park registers are installed around the run and captured back at a
+   re-park, so any number of suspended machines resume independently --
+   even while the legacy host-entered machine is parked. */
+JSValue JS_TTFlowResumeParked(JSContext *ctx, JSValueConst flow, int cmd,
+                              int *pdone, int *pparked)
+{
+    JSRuntime *rt = ctx->rt;
+    JSGeneratorData *gd;
+    JSAsyncFunctionState *s;
+    JSValue func_ret, ret;
+    BOOL gdone = TRUE;
+    TTMachine *m;
+    TTMachineSaved sv;
+    BOOL saved_park_ok;
+
+    *pdone = 1;
+    *pparked = 0;
+    if (JS_VALUE_GET_TAG(flow) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_OBJ(flow)->class_id != JS_CLASS_GENERATOR)
+        return JS_ThrowTypeError(ctx, "flow handle must be a generator "
+                                 "object");
+    gd = JS_GetOpaque(flow, JS_CLASS_GENERATOR);
+    if (!gd || !gd->func_state || gd->state != JS_GENERATOR_STATE_EXECUTING)
+        return JS_ThrowTypeError(ctx, "flow is not machine-parked");
+    s = gd->func_state;
+    m = s->tt_machine;
+    if (!m) {
+        if (tt_flow_base_is_parked(rt, s))
+            return JS_ThrowTypeError(ctx, "flow is parked inside a live "
+                                     "machine; resume it with "
+                                     "JS_TTCallResume instead");
+        return JS_ThrowTypeError(ctx, "flow is not the parked machine");
+    }
+    if (!m->parked_frame)
+        return JS_ThrowTypeError(ctx, "flow's machine is already running");
+    if (s->frame.tt_frame_kind != TT_FRAME_ENTRY ||
+        s->frame.prev_frame != NULL)
+        return JS_ThrowInternalError(ctx, "parked machine base is not an "
+                                     "entry frame");
+    if (js_check_stack_overflow(rt, 0))
+        return JS_ThrowStackOverflow(ctx);
+    /* swap the machine's registers in (the host's -- possibly a parked
+       legacy machine's -- are saved either way) */
+    saved_park_ok = rt->tt_park_ok;
+    tt_machine_install(rt, m, &sv);
+    m->parked_frame = NULL;   /* running: GC must not walk the stale chain */
+    rt->tt_park_ok = TRUE;
+    rt->tt_park_abort = (cmd == 1);
+    func_ret = JS_CallInternal(ctx, JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED,
+                               0, NULL, JS_CALL_FLAG_TT_RESUME);
+    if (rt->tt_parked_frame) {
+        /* re-parked: capture the machine back into its handle */
+        tt_machine_capture(rt, m, &sv);
+        rt->tt_park_ok = saved_park_ok;
+        *pparked = 1;
+        return JS_UNDEFINED;
+    }
+    /* ran to a yield / completion / throw: the chain unwound in full and
+       the machine is spent -- the flow is an ordinary generator again */
+    tt_machine_capture(rt, m, &sv);
+    rt->tt_park_ok = saved_park_ok;
+    rt->tt_park_abort = FALSE;
+    s->tt_machine = NULL;
+    tt_machine_free(rt, m, &s->frame);    /* empty chain: frees the arena */
+    func_ret = async_func_finish(ctx, s, func_ret);
+    ret = js_generator_resume_post(ctx, gd, func_ret, &gdone);
+    *pdone = (int)gdone;
+    return ret;
+}
+
+/* Fork a suspended flow into a concurrent sibling: baseline entities are
+   shared (a reference each), all flow-private state -- the state chain,
+   parked frames, private closures and cells, the COW delta -- deep-copies.
+   Works on yield-suspended flows AND machine-parked ones (a per-flow
+   handle or the legacy parked machine): a parked TrampFrame chain clones
+   into the sibling's own arena, arriving as an independently suspended
+   machine. Both flows resume and diverge independently; each applies its
+   own delta on check-in. The parent must be checked out (as for
+   serialization); the sibling arrives checked out. */
+JSValue JS_TTFlowFork(JSContext *ctx, JSValueConst flow)
+{
+    JSAsyncFunctionState *st = tt_flow_state_of(ctx, flow);
+    if (!st)
+        return JS_EXCEPTION;
+    return fork_flow(ctx, st, flow, NULL, NULL, NULL);
+}
+
+/* TRUE if the flow is suspended as a parked machine (its own handle or the
+   legacy host-entered park running through it) -- i.e. the resume that
+   applies is JS_TTFlowResumeParked / JS_TTCallResume, not next(). */
+JS_BOOL JS_TTFlowParked(JSContext *ctx, JSValueConst flow)
+{
+    JSGeneratorData *gd;
+    if (JS_VALUE_GET_TAG(flow) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_OBJ(flow)->class_id != JS_CLASS_GENERATOR)
+        return FALSE;
+    gd = JS_GetOpaque(flow, JS_CLASS_GENERATOR);
+    if (!gd || !gd->func_state || gd->state != JS_GENERATOR_STATE_EXECUTING)
+        return FALSE;
+    return tt_flow_base_is_parked(ctx->rt, gd->func_state);
+}
+
+/* Fork the RUNNING machine at the current step point. Callable ONLY from
+   inside the step handler (the transient sp published by TT_STEP_CHECK is
+   the running frame's only stack extent). The flow forked is the OUTERMOST
+   generator on the running chain; frames below it (the driver loop, the
+   host entry) stay put. Returns the fork-arm: an independently suspended
+   machine handle that resumes from this very opcode with
+   JS_TTFlowResumeParked. The continue-arm is the running machine itself --
+   return 0 from the handler to let it run on, or 2 to park it (resume
+   with JS_TTCallResume). This is OP_if_true on an unknown: both arms run. */
+JSValue JS_TTForkHere(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *inner, *sf, *base_sf = NULL;
+    JSAsyncFunctionState *base;
+    JSValue root = JS_UNDEFINED;
+    JSValue *saved_cur_sp;
+    JSValue result;
+
+    if (!rt->tt_step_sp)
+        return JS_ThrowTypeError(ctx, "JS_TTForkHere is only callable from "
+                                 "inside the step handler");
+    inner = rt->current_stack_frame;
+    if (!inner)
+        return JS_ThrowInternalError(ctx, "fork here: no running frame");
+    for (sf = inner; sf; sf = sf->prev_frame) {
+        if (sf->js_mode & JS_MODE_ASYNC)
+            base_sf = sf;
+    }
+    if (!base_sf)
+        return JS_ThrowTypeError(ctx, "fork here: no generator flow on the "
+                                 "running chain");
+    base = container_of(base_sf, JSAsyncFunctionState, frame);
+    /* the flow's host handle: the generator object the driver iterates,
+       found by value on the frames below the base */
+    for (sf = base_sf->prev_frame; sf && JS_IsUndefined(root);
+         sf = sf->prev_frame) {
+        JSValue *pv;
+        if ((sf->js_mode & JS_MODE_ASYNC) || !sf->cur_sp)
+            continue;
+        for (pv = sf->tt_frame_base; pv < sf->cur_sp; pv++) {
+            if (JS_VALUE_GET_TAG(*pv) == JS_TAG_OBJECT &&
+                JS_VALUE_GET_OBJ(*pv)->class_id == JS_CLASS_GENERATOR) {
+                JSGeneratorData *gd = JS_GetOpaque(*pv, JS_CLASS_GENERATOR);
+                if (gd && gd->func_state == base) {
+                    root = *pv;             /* borrowed from the frame slot */
+                    break;
+                }
+            }
+        }
+    }
+    if (JS_IsUndefined(root))
+        return JS_ThrowTypeError(ctx, "fork here: the flow's generator "
+                                 "handle is not on the driver frames");
+    /* the innermost frame is mid-opcode: its sp lives only in the step
+       hook's transient. Publish it for the clone walk, restore after --
+       a running frame must never keep a stale cur_sp. */
+    saved_cur_sp = inner->cur_sp;
+    inner->cur_sp = rt->tt_step_sp;
+    result = fork_flow(ctx, base, root, inner, rt->tt_arena_top,
+                       rt->tt_arena_seg);
+    inner->cur_sp = saved_cur_sp;
+    return result;
+}
+
+/* Storage footprint of a flow's suspended machine. *pused = the bytes its
+   parked chain's arena frames actually occupy; *preserved = the RAM the
+   machine holds for them (segment storage + headers + the handle). A
+   machine grows by demand-sized segments, so reserved tracks used --
+   N suspended machines cost the sum of their chain depths, not N slabs.
+   Returns 0, or -1 (no exception) when the flow holds no machine. */
+int JS_TTFlowMachineStats(JSContext *ctx, JSValueConst flow, size_t *pused,
+                          size_t *preserved, int *psegments)
+{
+    JSGeneratorData *gd;
+    TTMachine *m;
+    JSStackFrame *sf;
+    TTArenaSeg *seg;
+    size_t used = 0, reserved = sizeof(TTMachine);
+    int nsegs = 0;
+
+    if (pused)
+        *pused = 0;
+    if (preserved)
+        *preserved = 0;
+    if (psegments)
+        *psegments = 0;
+    if (JS_VALUE_GET_TAG(flow) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_OBJ(flow)->class_id != JS_CLASS_GENERATOR)
+        return -1;
+    gd = JS_GetOpaque(flow, JS_CLASS_GENERATOR);
+    if (!gd || !gd->func_state || !gd->func_state->tt_machine)
+        return -1;
+    m = gd->func_state->tt_machine;
+    for (sf = m->parked_frame; sf && sf != m->base_frame; sf = sf->prev_frame) {
+        if (!(sf->js_mode & JS_MODE_ASYNC))
+            used += tt_chain_frame_size(sf);
+    }
+    seg = m->arena_seg;
+    while (seg && seg->prev)
+        seg = seg->prev;
+    for (; seg; seg = seg->next) {
+        reserved += sizeof(TTArenaSeg) + seg->size + 16;
+        nsegs++;
+    }
+    if (pused)
+        *pused = used;
+    if (preserved)
+        *preserved = reserved;
+    if (psegments)
+        *psegments = nsegs;
+    return 0;
+}
+
+/* Evict a suspended machine to bytes: serialize the flow -- chain, private
+   graph, delta -- through the flow serializer's classification, then free
+   its RAM by completing the handle without resuming (the state finalizer
+   dismantles the machine, its arena segments, and the delta). The handle
+   the host keeps becomes a completed husk; JS_TTMachineHydrate rebuilds a
+   live suspended machine from the bytes -- in this runtime or any runtime
+   holding the identically rebuilt baseline. Requires the flow checked out
+   (as serialization does); works for yield-suspended flows too. The live
+   legacy machine refuses (its chain sits on the runtime's own registers --
+   park state the host cannot drop). */
+uint8_t *JS_TTMachineEvict(JSContext *ctx, JSValueConst flow, size_t *plen)
+{
+    JSAsyncFunctionState *st = tt_flow_state_of(ctx, flow);
+    uint8_t *bytes;
+    JSGeneratorData *gd;
+
+    if (!st)
+        return NULL;
+    if (!st->tt_machine && tt_flow_base_is_parked(ctx->rt, st)) {
+        JS_ThrowTypeError(ctx, "cannot evict the live legacy machine; "
+                          "fork it into a handle first");
+        return NULL;
+    }
+    bytes = serialize_flow(ctx, st, flow, 1, plen);
+    if (!bytes)
+        return NULL;
+    if (JS_VALUE_GET_OBJ(flow)->class_id == JS_CLASS_PROMISE) {
+        /* sever the handle's flow link; the orphaned await graph (state,
+           awaited promise, continuation handlers -- one cycle) collects
+           right here, freeing the hot copy */
+        JSPromiseData *pd = JS_GetOpaque(flow, JS_CLASS_PROMISE);
+        if (pd && pd->tt_flow_state == st) {
+            pd->tt_flow_state = NULL;
+            async_func_free(ctx->rt, st);
+        }
+        JS_RunGC(ctx->rt);
+    } else {
+        gd = JS_GetOpaque(flow, JS_CLASS_GENERATOR);
+        free_generator_stack_rt(ctx->rt, gd);
+    }
+    return bytes;
+}
+
+/* the cold half of eviction: bytes back to a live suspended machine */
+JSValue JS_TTMachineHydrate(JSContext *ctx, const uint8_t *buf, size_t len)
+{
+    return JS_TTFlowDeserialize(ctx, buf, len);
+}
+/*---------------------------------------------------------------------------*/
+/* end TimeTravelJS flow serialization                                        */
+/*---------------------------------------------------------------------------*/
+
 typedef struct BCWriterState {
     JSContext *ctx;
     DynBuf dbuf;
@@ -46673,6 +53676,8 @@ static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
                    (get_shape_prop(p->shape)->flags & JS_PROP_WRITABLE) != 0)) {
             /* fast case */
             uint32_t new_len;
+            if (TT_COW_HIT(ctx, p) && tt_cow_array(ctx, p))
+                return JS_EXCEPTION;
             new_len = p->u.array.count + argc;
             if (likely(new_len <= INT32_MAX)) {
                 if (unlikely(new_len > p->u.array.u1.size)) {
@@ -56114,6 +63119,9 @@ static JSValue js_map_set(JSContext *ctx, JSValueConst this_val,
 
     if (!s)
         return JS_EXCEPTION;
+    if (TT_COW_HIT(ctx, JS_VALUE_GET_OBJ(this_val)) &&
+        tt_cow_map(ctx, JS_VALUE_GET_OBJ(this_val)))
+        return JS_EXCEPTION;
     key = map_normalize_key_const(ctx, argv[0]);
     if (s->is_weak && !js_weakref_is_target(key))
         return JS_ThrowTypeError(ctx, "invalid value used as %s key", (magic & MAGIC_SET) ? "WeakSet" : "WeakMap");
@@ -56237,6 +63245,9 @@ static JSValue js_map_delete(JSContext *ctx, JSValueConst this_val,
     JSMapState *s = JS_GetOpaque2(ctx, this_val, JS_CLASS_MAP + magic);
     if (!s)
         return JS_EXCEPTION;
+    if (TT_COW_HIT(ctx, JS_VALUE_GET_OBJ(this_val)) &&
+        tt_cow_map(ctx, JS_VALUE_GET_OBJ(this_val)))
+        return JS_EXCEPTION;
     return map_delete_record(ctx, s, argv[0]);
 }
 
@@ -56248,6 +63259,9 @@ static JSValue js_map_clear(JSContext *ctx, JSValueConst this_val,
     JSMapRecord *mr;
 
     if (!s)
+        return JS_EXCEPTION;
+    if (TT_COW_HIT(ctx, JS_VALUE_GET_OBJ(this_val)) &&
+        tt_cow_map(ctx, JS_VALUE_GET_OBJ(this_val)))
         return JS_EXCEPTION;
 
     /* remove from the hash table */
@@ -57329,29 +64343,8 @@ static const JSCFunctionListEntry js_generator_proto_funcs[] = {
 
 /* Promise */
 
-typedef struct JSPromiseData {
-    JSPromiseStateEnum promise_state;
-    /* 0=fulfill, 1=reject, list of JSPromiseReactionData.link */
-    struct list_head promise_reactions[2];
-    BOOL is_handled; /* Note: only useful to debug */
-    JSValue promise_result;
-} JSPromiseData;
-
-typedef struct JSPromiseFunctionDataResolved {
-    int ref_count;
-    BOOL already_resolved;
-} JSPromiseFunctionDataResolved;
-
-typedef struct JSPromiseFunctionData {
-    JSValue promise;
-    JSPromiseFunctionDataResolved *presolved;
-} JSPromiseFunctionData;
-
-typedef struct JSPromiseReactionData {
-    struct list_head link; /* not used in promise_reaction_job */
-    JSValue resolving_funcs[2];
-    JSValue handler;
-} JSPromiseReactionData;
+/* (JSPromiseData and friends are defined before the TimeTravelJS flow
+   serialization section, which classifies and clones them) */
 
 JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValue promise)
 {
@@ -57441,6 +64434,9 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
 
     if (!s || s->promise_state != JS_PROMISE_PENDING)
         return; /* should never happen */
+    if (TT_COW_HIT(ctx, JS_VALUE_GET_OBJ(promise)) &&
+        tt_cow_promise(ctx, JS_VALUE_GET_OBJ(promise)))
+        return;               /* capture failed: the settle is aborted */
     set_value(ctx, &s->promise_result, JS_DupValue(ctx, value));
     s->promise_state = JS_PROMISE_FULFILLED + is_reject;
 #ifdef DUMP_PROMISE
@@ -57900,6 +64896,8 @@ static JSValue js_promise_resolve_function_call(JSContext *ctx,
     s = p->u.promise_function_data;
     if (!s || s->presolved->already_resolved)
         return JS_UNDEFINED;
+    if (TT_COW_HIT(ctx, p) && tt_cow_presolved(ctx, p))
+        return JS_EXCEPTION;
     s->presolved->already_resolved = TRUE;
     is_reject = p->class_id - JS_CLASS_PROMISE_RESOLVE_FUNCTION;
     if (argc > 0)
@@ -57953,6 +64951,8 @@ static void js_promise_finalizer(JSRuntime *rt, JSValue val)
             promise_reaction_data_free(rt, rd);
         }
     }
+    if (s->tt_flow_state)
+        async_func_free(rt, s->tt_flow_state);
     JS_FreeValueRT(rt, s->promise_result);
     js_free_rt(rt, s);
 }
@@ -57975,6 +64975,8 @@ static void js_promise_mark(JSRuntime *rt, JSValueConst val,
             JS_MarkValue(rt, rd->handler, mark_func);
         }
     }
+    if (s->tt_flow_state)
+        mark_func(rt, &s->tt_flow_state->header);
     JS_MarkValue(rt, s->promise_result, mark_func);
 }
 
@@ -58506,6 +65508,9 @@ static __exception int perform_promise_then(JSContext *ctx,
     JSPromiseReactionData *rd_array[2], *rd;
     int i, j;
 
+    if (TT_COW_HIT(ctx, JS_VALUE_GET_OBJ(promise)) &&
+        tt_cow_promise(ctx, JS_VALUE_GET_OBJ(promise)))
+        return -1;
     rd_array[0] = NULL;
     rd_array[1] = NULL;
     for(i = 0; i < 2; i++) {
@@ -59352,6 +66357,8 @@ static JSValue JS_SetThisTimeValue(JSContext *ctx, JSValueConst this_val, double
     if (JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT) {
         JSObject *p = JS_VALUE_GET_OBJ(this_val);
         if (p->class_id == JS_CLASS_DATE) {
+            if (TT_COW_HIT(ctx, p) && tt_cow_odata(ctx, p))
+                return JS_EXCEPTION;
             JS_FreeValue(ctx, p->u.object_data);
             p->u.object_data = JS_NewFloat64(ctx, v);
             return JS_DupValue(ctx, p->u.object_data);
@@ -62008,6 +69015,9 @@ static JSValue js_typed_array_set(JSContext *ctx,
     if (argc > 1) {
         offset = argv[1];
     }
+    if (JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT &&
+        tt_cow_ta(ctx, JS_VALUE_GET_OBJ(this_val)))
+        return JS_EXCEPTION;
     return js_typed_array_set_internal(ctx, this_val, argv[0], offset);
 }
 
@@ -62194,6 +69204,8 @@ static JSValue js_typed_array_copyWithin(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     if (typed_array_is_oob(p))
         return JS_ThrowTypeErrorArrayBufferOOB(ctx);
+    if (tt_cow_ta(ctx, p))
+        return JS_EXCEPTION;
     len = p->u.array.count;
 
     if (JS_ToInt32Clamp(ctx, &to, argv[0], 0, len, len))
@@ -62236,6 +69248,8 @@ static JSValue js_typed_array_fill(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     if (typed_array_is_oob(p))
         return JS_ThrowTypeErrorArrayBufferOOB(ctx);
+    if (tt_cow_ta(ctx, p))
+        return JS_EXCEPTION;
     len = p->u.array.count;
 
     if (p->class_id == JS_CLASS_UINT8C_ARRAY) {
@@ -62759,6 +69773,8 @@ static JSValue js_typed_array_reverse(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     if (len > 0) {
         p = JS_VALUE_GET_OBJ(this_val);
+        if (tt_cow_ta(ctx, p))
+            return JS_EXCEPTION;
         switch (typed_array_size_log2(p->class_id)) {
         case 0:
             {
@@ -63136,6 +70152,8 @@ static JSValue js_typed_array_sort(JSContext *ctx, JSValueConst this_val,
 
     if (len > 1) {
         p = JS_VALUE_GET_OBJ(this_val);
+        if (tt_cow_ta(ctx, p))
+            return JS_EXCEPTION;
         switch (p->class_id) {
         case JS_CLASS_INT8_ARRAY:
             tsc.getfun = js_TA_get_int8;
@@ -64715,6 +71733,8 @@ static JSValue js_dataview_setValue(JSContext *ctx,
     ta = JS_GetOpaque2(ctx, this_obj, JS_CLASS_DATAVIEW);
     if (!ta)
         return JS_EXCEPTION;
+    if (tt_cow_ta(ctx, JS_VALUE_GET_OBJ(this_obj)))
+        return JS_EXCEPTION;
     size = 1 << typed_array_size_log2(class_id);
     if (JS_ToIndex(ctx, &pos, argv[0]))
         return JS_EXCEPTION;
@@ -65771,8 +72791,8 @@ static JSFunctionBytecode *tt_frame_bytecode(JSStackFrame *sf)
     if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
         return NULL;
     p = JS_VALUE_GET_OBJ(sf->cur_func);
-    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
-        return NULL;
+    if (!js_class_has_bytecode(p->class_id))
+        return NULL;          /* generator/async frames carry bytecode too */
     return p->u.func.function_bytecode;
 }
 
@@ -65975,11 +72995,25 @@ void JS_TTResetExecState(JSContext *ctx)
     JSRuntime *rt = ctx->rt;
     rt->current_stack_frame = NULL;
     rt->tt_parked_frame = NULL;
+    rt->tt_step_sp = NULL;
+    rt->tt_cow_flow = NULL;
     rt->tt_loop_depth = 0;
     rt->tt_park_ok = FALSE;
     rt->tt_park_abort = FALSE;
     rt->tt_skip_once = FALSE;
-    rt->tt_arena_top = rt->tt_arena_base;
+    if (rt->tt_arena_seg) {
+        /* empty the installed arena: back to its first segment, later
+           segments dropped */
+        TTArenaSeg *seg = rt->tt_arena_seg;
+        while (seg->prev)
+            seg = seg->prev;
+        tt_arena_seg_free_tail(rt, seg, NULL);
+        rt->tt_arena_seg = seg;
+        rt->tt_arena_base = seg->base;
+        rt->tt_arena_top = seg->base;
+        rt->tt_arena_limit = seg->limit;
+        rt->tt_arena_total = seg->size;
+    }
     rt->tt_exec_fn = JS_UNDEFINED; /* do not free: heap may be mid-heal */
     rt->tt_job_kind = 0;           /* abandoned job continuation, if any */
     rt->tt_job_aux = NULL;
@@ -66085,18 +73119,16 @@ JSValue JS_TTCallResume(JSContext *ctx, int cmd, int *pparked)
 }
 
 /* Write a frame local (argument, local variable, or closure capture) at the
-   given bytecode-frame level. Returns TRUE if the binding was found. Used by
-   the debugger's edit-and-continue: rebinding a name must reach the live
-   frame slot, not a copy. */
-JS_BOOL JS_TTSetLocal(JSContext *ctx, int level, JSAtom name, JSValueConst value)
+   given bytecode-frame level, starting the walk at `sf`. The core of the
+   debugger's edit-and-continue: rebinding a name must reach the live frame
+   slot, not a copy. */
+static JS_BOOL tt_set_local_from(JSContext *ctx, JSStackFrame *sf, int level,
+                                 JSAtom name, JSValueConst value)
 {
-    JSRuntime *rt = ctx->rt;
-    JSStackFrame *sf;
     JSFunctionBytecode *b;
     JSObject *p;
     int i;
 
-    sf = rt->current_stack_frame;
     while (sf && (tt_frame_bytecode(sf) == NULL))
         sf = sf->prev_frame;
     while (sf && level > 0) {
@@ -66141,6 +73173,102 @@ JS_BOOL JS_TTSetLocal(JSContext *ctx, int level, JSAtom name, JSValueConst value
         }
     }
     return FALSE;
+}
+
+JS_BOOL JS_TTSetLocal(JSContext *ctx, int level, JSAtom name, JSValueConst value)
+{
+    return tt_set_local_from(ctx, ctx->rt->current_stack_frame, level, name,
+                             value);
+}
+
+/* the frame a suspended flow executes next: a machine handle's parked
+   innermost frame, or the suspended (yield/await) state's own frame */
+static JSStackFrame *tt_flow_start_frame(JSValueConst flow)
+{
+    JSAsyncFunctionState *s = NULL;
+    if (JS_VALUE_GET_TAG(flow) != JS_TAG_OBJECT)
+        return NULL;
+    switch (JS_VALUE_GET_OBJ(flow)->class_id) {
+    case JS_CLASS_GENERATOR: {
+        JSGeneratorData *gd = JS_GetOpaque(flow, JS_CLASS_GENERATOR);
+        if (gd)
+            s = gd->func_state;
+        break;
+    }
+    case JS_CLASS_PROMISE:
+        s = tt_promise_flow_state(flow);
+        break;
+    }
+    if (!s || s->is_completed)
+        return NULL;
+    if (s->tt_machine && s->tt_machine->parked_frame)
+        return s->tt_machine->parked_frame;
+    if (s->frame.cur_sp)
+        return &s->frame;
+    return NULL;
+}
+
+/* The same edit against a suspended flow handle (a generator object or an
+   async flow's result promise): the walk starts at the frame the flow will
+   execute next -- a machine's parked innermost frame, or the suspended
+   yield/await frame itself. */
+JS_BOOL JS_TTFlowSetLocal(JSContext *ctx, JSValueConst flow, int level,
+                          JSAtom name, JSValueConst value)
+{
+    JSStackFrame *sf = tt_flow_start_frame(flow);
+    if (!sf)
+        return FALSE;
+    return tt_set_local_from(ctx, sf, level, name, value);
+}
+
+/* Read a live frame local out of a suspended flow (the debugger dual of
+   JS_TTFlowSetLocal); JS_UNDEFINED when the binding is not found. The way
+   a host reaches an arm's own resolver/iterator to settle its awaits. */
+JSValue JS_TTFlowGetLocal(JSContext *ctx, JSValueConst flow, int level,
+                          JSAtom name)
+{
+    JSStackFrame *sf = tt_flow_start_frame(flow);
+    JSFunctionBytecode *b;
+    JSObject *p;
+    int i;
+
+    if (!sf)
+        return JS_UNDEFINED;
+    while (sf && (tt_frame_bytecode(sf) == NULL))
+        sf = sf->prev_frame;
+    while (sf && level > 0) {
+        sf = sf->prev_frame;
+        while (sf && (tt_frame_bytecode(sf) == NULL))
+            sf = sf->prev_frame;
+        level--;
+    }
+    if (!sf)
+        return JS_UNDEFINED;
+    b = tt_frame_bytecode(sf);
+    p = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (b->vardefs) {
+        if (sf->arg_buf) {
+            for (i = 0; i < b->arg_count && i < sf->arg_count; i++) {
+                if (b->vardefs[i].var_name == name)
+                    return JS_DupValue(ctx, sf->arg_buf[i]);
+            }
+        }
+        if (sf->var_buf) {
+            for (i = 0; i < b->var_count; i++) {
+                if (b->vardefs[b->arg_count + i].var_name == name)
+                    return JS_DupValue(ctx, sf->var_buf[i]);
+            }
+        }
+    }
+    if (p->u.func.var_refs) {
+        for (i = 0; i < b->closure_var_count; i++) {
+            JSVarRef *var_ref = p->u.func.var_refs[i];
+            if (b->closure_var[i].var_name == name && var_ref &&
+                var_ref->pvalue)
+                return JS_DupValue(ctx, *var_ref->pvalue);
+        }
+    }
+    return JS_UNDEFINED;
 }
 
 /* ===================== TimeTravelJS __wasi__ host interface ==========

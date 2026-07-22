@@ -1,0 +1,2142 @@
+/*
+ * TimeTravelJS flow-serialization harness.
+ *
+ * Two processes prove the cross-process contract:
+ *   flow-harness emit <file>    process A: build baseline, run a flow to a
+ *                               park deep inside a yield* chain, record a COW
+ *                               delta, check the flow out, serialize it to
+ *                               <file>; then check it back in and finish it
+ *                               locally, printing the reference trace.
+ *   flow-harness resume <file>  process B: fresh runtime, rebuild the same
+ *                               baseline, deserialize, check in, finish,
+ *                               printing the same trace format.
+ * run.sh byte-compares the two "POST:" traces.
+ *
+ *   flow-harness selftest       in-process assertions: N-flow baseline
+ *                               dedup (by id, zero copies), re-serialization
+ *                               byte-equality, shared identity after
+ *                               transplant, corrupt-input rejection,
+ *                               wrong-baseline rejection, GC + leak checks.
+ *
+ *   flow-harness emit2/resume2  the machine-parked TrampFrame chain: a
+ *                               step-hook park INSIDE helper() (four frames
+ *                               deep under a for-of driver) serializes as
+ *                               [outer heap, inner yield* splice, helper
+ *                               arena]; process B transplants the parked
+ *                               machine and completes the interrupted
+ *                               next() with JS_TTFlowResumeParked. emit2's
+ *                               reference future comes from an in-process
+ *                               transplant into a second runtime, and the
+ *                               original machine is discarded through the
+ *                               abort-unwind path.
+ *
+ *   flow-harness forktest       JS_TTFlowFork: clone a parked flow (two
+ *                               frames deep in yield*, open cell, delta)
+ *                               into siblings; prove divergent futures
+ *                               under different next() feeds, two- and
+ *                               three-way delta isolation (fork-of-fork),
+ *                               baseline sharing by identity, refusal on
+ *                               completed flows, leak-free teardown.
+ *
+ *   flow-harness forkhere       the suspended machine as a first-class
+ *                               per-flow value: JS_TTForkHere splits the
+ *                               RUNNING machine mid-opcode from the step
+ *                               hook (four frames deep in helper()); the
+ *                               legacy machine plus three forked handles
+ *                               stay suspended concurrently, resume
+ *                               independently (with per-arm injections
+ *                               into the same live local and per-arm
+ *                               deltas), and an abandoned arm tears down
+ *                               leak-free without ever resuming.
+ *
+ *   flow-harness mass           segmented arenas: 2000 machines forked
+ *                               from one baseline; HARD bound that their
+ *                               measured arena RAM is a small multiple of
+ *                               the chains' actual bytes, not N x 2 MB;
+ *                               spot resumes identical; mass teardown
+ *                               through the leak oracle.
+ *
+ *   flow-harness deep           a recursion parked 30 frames down forks/
+ *                               transplants into multi-segment machines
+ *                               that grow further while installed and
+ *                               unwind back across every segment
+ *                               boundary, byte-identical to the
+ *                               never-segmented reference; evict/hydrate
+ *                               of the deep machine included.
+ *
+ *   flow-harness evict          cold eviction: a suspended machine (with
+ *                               an injected local and a delta) round-
+ *                               trips through bytes -- freed, hydrated,
+ *                               resumed byte-identically to its
+ *                               never-evicted twin -- without disturbing
+ *                               the parent or siblings; the live legacy
+ *                               machine refuses; yield-suspended flows
+ *                               evict too.
+ *
+ *   flow-harness asynctest      per-flow async machinery: an async
+ *                               function suspended at `await p` forks
+ *                               through its RESULT-PROMISE handle; each
+ *                               arm settles its own cloned resolver
+ *                               (read via JS_TTFlowGetLocal) and
+ *                               continues past the await with diverging
+ *                               values, isolated deltas, and a .then
+ *                               observer running as its own parked
+ *                               sub-flow. A for-await loop over a
+ *                               flow-private async iterator forks
+ *                               mid-loop into independently-fed arms.
+ *                               An await-suspended flow with a captured
+ *                               pending microtask evicts to bytes, frees,
+ *                               hydrates, and pumps to a byte-identical
+ *                               continuation -- the microtask firing
+ *                               exactly once per living copy.
+ *
+ *   flow-harness cowtest        automatic transparent COW: two forked arms
+ *                               run ORDINARY program code (sharedObj.x = v;
+ *                               sharedArr.push(...); sharedP.then(...)) with
+ *                               no host DeltaWrite calls; the engine captures
+ *                               baseline pre-images into the checked-in
+ *                               flow's delta automatically. Asserts per-arm
+ *                               isolation, pristine baseline when nobody is
+ *                               checked in, shared pointer identity, the
+ *                               exact delta record count (flow-private
+ *                               objects are never captured), zero
+ *                               allocation on the second write to an
+ *                               already-captured cell, serialize/hydrate
+ *                               round-trip of an auto-captured delta, the
+ *                               per-arm promise-reaction oracle, and that
+ *                               completion commits the winning arm's writes.
+ */
+#include "quickjs.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+
+/* the baseline program: MUST be byte-identical in every process. The flow
+   exercises: baseline objects (CONFIG/TABLE), nested generators (yield* =
+   two parked TrampFrames), a flow-private object + closure over a flow
+   local (open var_ref), try (catch offset on the parked stack), TDZ slot,
+   float, short bigint, Date wrapper, symbol-keyed private prop. */
+static const char *BASELINE_SRC =
+"\"use strict\";\n"
+"var CONFIG = { name: \"baseline-config\", limit: 3, tag: \"cfg\" };\n"
+"var TABLE = [];\n"
+"for (var i = 0; i < 64; i++) TABLE.push(\"row-\" + i);\n"
+"function bump(x) { return x + CONFIG.limit; }\n"
+"function helper(k, a) {\n"
+"  var acc = k * 2;\n"
+"  acc = acc + CONFIG.limit;\n"
+"  acc = acc - a;\n"
+"  return acc + 1;\n"
+"}\n"
+"function drive(g) { var out = []; for (var v of g) out.push(v); return out.join(\"|\"); }\n"
+"function* inner(a) {\n"
+"  var t = 0.5;\n"
+"  for (var k = 0; k < a; k++) {\n"
+"    t += helper(k, a);\n"
+"    try { var fed = yield \"inner:\" + k + \":\" + t + \":\" + TABLE[k % TABLE.length]; }\n"
+"    catch (e) { yield \"caught:\" + e; }\n"
+"    if (fed) t += fed;\n"
+"  }\n"
+"  return \"inner-done:\" + t;\n"
+"}\n"
+"function* outer(n) {\n"
+"  var local = { acc: 1 };\n"
+"  var mk = function (d) { return local.acc + d; };\n"
+"  var when = new Date(1234567890123);\n"
+"  var big = 123n;\n"
+"  var sym = Symbol(\"flow-sym\");\n"
+"  var symval = {};\n"
+"  symval[sym] = \"sv\";\n"
+"  yield \"start:\" + CONFIG.name;\n"
+"  var got = yield* inner(n);\n"
+"  let late = \"L\" + n;\n"
+"  local.acc = mk(bump(n));\n"
+"  yield \"after-inner:\" + got + \":\" + local.acc + \":\" + late;\n"
+"  yield \"delta-view:\" + CONFIG.tag + \":\" + when.getTime() + \":\" + String(big);\n"
+"  return \"outer-done:\" + local.acc + \":\" + CONFIG.tag + \":\" + symval[sym];\n"
+"}\n"
+"function rec(n, a) {\n"
+"  if (n <= 0) return helper(1, a);\n"
+"  return rec(n - 1, a) + 0;\n"
+"}\n"
+"function* deepflow(d) {\n"
+"  var t = rec(d, 3);\n"
+"  yield \"deep:\" + t;\n"
+"  yield \"deep2:\" + (t + rec(3, 1));\n"
+"  return \"deep-done:\" + t;\n"
+"}\n"
+"var SINK = [];\n"
+"function sink(tag) { return function (v) { SINK.push(tag + \":\" + v); return v; }; }\n"
+"async function af(n) {\n"
+"  var r = null;\n"
+"  var p = new Promise(function (res) { r = res; });\n"
+"  var got = await p;\n"
+"  return \"af\" + n + \":got=\" + got + \":\" + CONFIG.tag;\n"
+"}\n"
+"async function loopy(ait) {\n"
+"  var acc = [];\n"
+"  for await (var v of ait) {\n"
+"    acc.push(v);\n"
+"    if (acc.length >= 2) break;\n"
+"  }\n"
+"  return acc.join(\"+\");\n"
+"}\n"
+"function mk_ait() {\n"
+"  var o = {};\n"
+"  o.feed = null;\n"
+"  o.next = function () { return new Promise(function (res) { o.feed = res; }); };\n"
+"  o[Symbol.asyncIterator] = function () { return o; };\n"
+"  return o;\n"
+"}\n"
+"var MLOG = [];\n"
+"async function mf() {\n"
+"  var r = null;\n"
+"  Promise.resolve(\"m\").then(function (v) { MLOG.push(\"micro:\" + v); return v; });\n"
+"  var got = await new Promise(function (res) { r = res; });\n"
+"  return \"mf:got=\" + got;\n"
+"}\n"
+"var SHOBJ = { x: 0 };\n"
+"var SHARR = [];\n"
+"var SHP_RES = null;\n"
+"var SHP = new Promise(function (r) { SHP_RES = r; });\n"
+"function* cowflow() {\n"
+"  var v = yield \"ready\";\n"
+"  SHOBJ.x = v;\n"
+"  SHOBJ.x = v + 10;\n"
+"  SHARR.push(\"arm\" + v);\n"
+"  SHP.then(sink(\"p\" + v));\n"
+"  var w = yield \"wrote:\" + SHOBJ.x + \":\" + SHARR.join(\",\") + \":\" + SHARR.length;\n"
+"  return \"done:\" + SHOBJ.x + \":\" + w;\n"
+"}\n";
+
+static void die(JSContext *ctx, const char *what)
+{
+    JSValue e = JS_GetException(ctx);
+    const char *msg = JS_ToCString(ctx, e);
+    fprintf(stderr, "FATAL %s: %s\n", what, msg ? msg : "?");
+    exit(1);
+}
+
+static JSContext *new_baseline_ctx(JSRuntime **prt)
+{
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx;
+    JSValue v;
+    assert(rt);
+    ctx = JS_NewContext(rt);
+    assert(ctx);
+    v = JS_Eval(ctx, BASELINE_SRC, strlen(BASELINE_SRC), "baseline.js",
+                JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(v))
+        die(ctx, "baseline eval");
+    JS_FreeValue(ctx, v);
+    if (JS_TTBaselineCapture(ctx))
+        die(ctx, "baseline capture");
+    *prt = rt;
+    return ctx;
+}
+
+/* start outer(4) and advance 'steps' yields; prints them with 'pfx' */
+static JSValue start_flow(JSContext *ctx, int steps, const char *pfx)
+{
+    JSValue g, glob, fn, arg;
+    int i;
+    glob = JS_GetGlobalObject(ctx);
+    fn = JS_GetPropertyStr(ctx, glob, "outer");
+    arg = JS_NewInt32(ctx, 4);
+    g = JS_Call(ctx, fn, JS_UNDEFINED, 1, (JSValueConst *)&arg);
+    if (JS_IsException(g))
+        die(ctx, "outer()");
+    JS_FreeValue(ctx, fn);
+    JS_FreeValue(ctx, glob);
+    for (i = 0; i < steps; i++) {
+        JSValue r = JS_Invoke(ctx, g, JS_NewAtom(ctx, "next"), 0, NULL);
+        JSValue val;
+        const char *s;
+        if (JS_IsException(r))
+            die(ctx, "next()");
+        val = JS_GetPropertyStr(ctx, r, "value");
+        s = JS_ToCString(ctx, val);
+        if (pfx)
+            printf("%s%s\n", pfx, s);
+        JS_FreeCString(ctx, s);
+        JS_FreeValue(ctx, val);
+        JS_FreeValue(ctx, r);
+    }
+    return g;
+}
+
+/* drive a suspended flow to completion, printing every yield + the return */
+static void finish_flow(JSContext *ctx, JSValueConst g, const char *pfx)
+{
+    for (;;) {
+        JSValue r = JS_Invoke(ctx, (JSValue)g, JS_NewAtom(ctx, "next"), 0, NULL);
+        JSValue val, done;
+        const char *s;
+        int isdone;
+        if (JS_IsException(r))
+            die(ctx, "next()");
+        val = JS_GetPropertyStr(ctx, r, "value");
+        done = JS_GetPropertyStr(ctx, r, "done");
+        isdone = JS_ToBool(ctx, done);
+        s = JS_ToCString(ctx, val);
+        printf("%s%s%s\n", pfx, isdone ? "return:" : "", s);
+        JS_FreeCString(ctx, s);
+        JS_FreeValue(ctx, val);
+        JS_FreeValue(ctx, done);
+        JS_FreeValue(ctx, r);
+        if (isdone)
+            break;
+    }
+}
+
+static JSValue get_global(JSContext *ctx, const char *name)
+{
+    JSValue glob = JS_GetGlobalObject(ctx);
+    JSValue v = JS_GetPropertyStr(ctx, glob, name);
+    JS_FreeValue(ctx, glob);
+    return v;
+}
+
+static char *eval_str(JSContext *ctx, const char *expr)
+{
+    JSValue v = JS_Eval(ctx, expr, strlen(expr), "probe.js", JS_EVAL_TYPE_GLOBAL);
+    const char *s;
+    char *out;
+    if (JS_IsException(v))
+        die(ctx, expr);
+    s = JS_ToCString(ctx, v);
+    out = strdup(s ? s : "?");
+    JS_FreeCString(ctx, s);
+    JS_FreeValue(ctx, v);
+    return out;
+}
+
+static void expect_str(JSContext *ctx, const char *expr, const char *want,
+                       const char *what)
+{
+    char *got = eval_str(ctx, expr);
+    if (strcmp(got, want)) {
+        fprintf(stderr, "FAIL %s: %s == \"%s\", want \"%s\"\n",
+                what, expr, got, want);
+        exit(1);
+    }
+    free(got);
+}
+
+/* park the machine at the Nth arrival on a target source line; with
+   fork_here set, split the running machine there first (the fork-arm handle
+   lands in plan->forked, the continue-arm parks by the returned 2) */
+typedef struct ParkPlan {
+    int line;
+    int countdown;
+    int parked_line;
+    int fork_here;
+    JSValue forked;
+} ParkPlan;
+
+static int park_handler(JSContext *ctx, int line, int col, int depth,
+                        int parkable, void *opaque)
+{
+    ParkPlan *plan = opaque;
+    (void)col; (void)depth;
+    if (getenv("FLOW_DEBUG_STEPS"))
+        fprintf(stderr, "[step] line=%d depth=%d parkable=%d\n",
+                line, depth, parkable);
+    if (parkable && line == plan->line && --plan->countdown == 0) {
+        plan->parked_line = line;
+        if (plan->fork_here) {
+            plan->forked = JS_TTForkHere(ctx);
+            if (JS_IsException(plan->forked))
+                return 1;     /* abort; the command dies on the exception */
+        }
+        return 2;
+    }
+    return 0;
+}
+
+/* 1-based line of the first occurrence of 'needle' in the baseline */
+static int baseline_line_of(const char *needle)
+{
+    const char *p = strstr(BASELINE_SRC, needle);
+    int line = 1;
+    const char *q;
+    assert(p);
+    for (q = BASELINE_SRC; q < p; q++)
+        if (*q == '\n')
+            line++;
+    return line;
+}
+
+static void print_step(JSContext *ctx, JSValueConst val, int done,
+                       const char *pfx)
+{
+    if (done == 2) {
+        /* yield* delegation step: the value IS the iterator result */
+        JSValue v2 = JS_GetPropertyStr(ctx, val, "value");
+        JSValue d2 = JS_GetPropertyStr(ctx, val, "done");
+        print_step(ctx, v2, JS_ToBool(ctx, d2), pfx);
+        JS_FreeValue(ctx, v2);
+        JS_FreeValue(ctx, d2);
+        return;
+    }
+    {
+        const char *str = JS_ToCString(ctx, val);
+        printf("%s%s%s\n", pfx, done == 1 ? "return:" : "", str ? str : "?");
+        JS_FreeCString(ctx, str);
+    }
+}
+
+/* record the flow's COW delta: CONFIG.tag = "cfg-flow" through the flow */
+static void write_delta(JSContext *ctx, JSValueConst g)
+{
+    JSValue cfg = get_global(ctx, "CONFIG");
+    JSAtom tag = JS_NewAtom(ctx, "tag");
+    JSValue nv = JS_NewString(ctx, "cfg-flow");
+    if (JS_TTFlowDeltaWriteProp(ctx, g, cfg, tag, nv))
+        die(ctx, "delta write");
+    JS_FreeValue(ctx, nv);
+    JS_FreeAtom(ctx, tag);
+    JS_FreeValue(ctx, cfg);
+}
+
+/* ---- emit: process A ---- */
+static int cmd_emit(const char *path)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    JSValue g;
+    uint8_t *bytes;
+    size_t len;
+    FILE *f;
+
+    printf("BASELINE:count=%u:fp=%016llx\n",
+           (unsigned)JS_TTBaselineCount(rt),
+           (unsigned long long)JS_TTBaselineFingerprint(rt));
+
+    g = start_flow(ctx, 3, "PRE:");           /* parked inside inner (yield*) */
+    write_delta(ctx, g);
+    expect_str(ctx, "CONFIG.tag", "cfg-flow", "delta live view");
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout");
+    expect_str(ctx, "CONFIG.tag", "cfg", "pristine after checkout");
+
+    bytes = JS_TTFlowSerialize(ctx, g, &len);
+    if (!bytes)
+        die(ctx, "serialize");
+    f = fopen(path, "wb");
+    if (!f || fwrite(bytes, 1, len, f) != len) {
+        fprintf(stderr, "FATAL cannot write %s\n", path);
+        return 1;
+    }
+    fclose(f);
+    printf("BYTES:%u\n", (unsigned)len);
+    js_free(ctx, bytes);
+
+    /* reference future: check back in and finish locally */
+    if (JS_TTFlowCheckin(ctx, g))
+        die(ctx, "checkin");
+    finish_flow(ctx, g, "POST:");
+    expect_str(ctx, "CONFIG.tag", "cfg-flow", "delta committed by resume");
+
+    JS_FreeValue(ctx, g);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    return 0;
+}
+
+/* ---- resume: process B ---- */
+static int cmd_resume(const char *path)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    JSValue g;
+    uint8_t *bytes;
+    long len;
+    FILE *f;
+
+    printf("BASELINE:count=%u:fp=%016llx\n",
+           (unsigned)JS_TTBaselineCount(rt),
+           (unsigned long long)JS_TTBaselineFingerprint(rt));
+
+    f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "FATAL cannot read %s\n", path);
+        return 1;
+    }
+    fseek(f, 0, SEEK_END);
+    len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    bytes = malloc(len);
+    if (fread(bytes, 1, len, f) != (size_t)len) {
+        fprintf(stderr, "FATAL short read\n");
+        return 1;
+    }
+    fclose(f);
+    printf("BYTES:%u\n", (unsigned)len);
+
+    g = JS_TTFlowDeserialize(ctx, bytes, len);
+    free(bytes);
+    if (JS_IsException(g))
+        die(ctx, "deserialize");
+
+    expect_str(ctx, "CONFIG.tag", "cfg", "pristine before checkin");
+    /* the rebuilt graph must survive a full GC before it ever runs */
+    JS_RunGC(rt);
+    if (JS_TTFlowCheckin(ctx, g))
+        die(ctx, "checkin");
+    expect_str(ctx, "CONFIG.tag", "cfg-flow", "flow view after checkin");
+
+    finish_flow(ctx, g, "POST:");
+    expect_str(ctx, "CONFIG.tag", "cfg-flow", "delta committed by resume");
+
+    JS_FreeValue(ctx, g);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    return 0;
+}
+
+/* ---- emit2/resume2: the machine-parked TrampFrame chain round trip ----
+   The flow parks INSIDE helper() called from inner() delegated from outer()
+   via yield* -- a three-frame chain [outer heap, inner heap, helper arena]
+   -- then crosses the process boundary and completes the interrupted
+   next() on the other side. */
+static int cmd_emit2(const char *path)
+{
+    JSRuntime *rt, *rt2;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    JSContext *ctx2;
+    JSValue g, g2, drive_fn;
+    ParkPlan plan;
+    uint8_t *bytes;
+    size_t blen;
+    FILE *f;
+    int parked = 0, done = 0;
+
+    printf("BASELINE:count=%u:fp=%016llx\n",
+           (unsigned)JS_TTBaselineCount(rt),
+           (unsigned long long)JS_TTBaselineFingerprint(rt));
+
+    g = start_flow(ctx, 2, "PRE:");   /* "start", "inner:0" */
+
+    /* a for-of driver resumes the generator through the engine's in-loop
+       splices, so the step hook can park anywhere inside; park at
+       helper()'s middle line, deep inside outer -> yield* inner -> helper */
+    plan.line = baseline_line_of("acc = acc + CONFIG.limit");
+    plan.countdown = 1;
+    plan.parked_line = 0;
+    plan.fork_here = 0;
+    plan.forked = JS_UNDEFINED;
+    JS_TTSetStepHandler(rt, park_handler, &plan);
+    JS_TTSetStepFilename(ctx, "baseline.js");
+    JS_TTEnableStep(rt, 1);
+    drive_fn = get_global(ctx, "drive");
+    {
+        JSValueConst args[1] = { g };
+        JSValue ret = JS_TTCallArgs(ctx, drive_fn, JS_UNDEFINED, 1, args,
+                                    &parked);
+        if (!parked) {
+            fprintf(stderr, "FATAL machine did not park (line %d)\n",
+                    plan.line);
+            return 1;
+        }
+        JS_FreeValue(ctx, ret);
+    }
+    JS_TTEnableStep(rt, 0);
+    printf("PARKED:line=%d\n", plan.parked_line);
+
+    write_delta(ctx, g);              /* delta on a machine-parked flow */
+    expect_str(ctx, "CONFIG.tag", "cfg-flow", "delta live view");
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout");
+    expect_str(ctx, "CONFIG.tag", "cfg", "pristine after checkout");
+
+    bytes = JS_TTFlowSerialize(ctx, g, &blen);
+    if (!bytes)
+        die(ctx, "serialize");
+    f = fopen(path, "wb");
+    if (!f || fwrite(bytes, 1, blen, f) != blen) {
+        fprintf(stderr, "FATAL cannot write %s\n", path);
+        return 1;
+    }
+    fclose(f);
+    printf("BYTES:%u\n", (unsigned)blen);
+
+    /* reference future: transplant into a SECOND runtime in this process
+       and drive it exactly like process B will -- the two futures must
+       agree byte for byte */
+    ctx2 = new_baseline_ctx(&rt2);
+    g2 = JS_TTFlowDeserialize(ctx2, bytes, blen);
+    if (JS_IsException(g2))
+        die(ctx2, "in-process deserialize");
+    expect_str(ctx2, "CONFIG.tag", "cfg", "pristine before checkin");
+    JS_RunGC(rt2);
+    if (JS_TTFlowCheckin(ctx2, g2))
+        die(ctx2, "checkin");
+    expect_str(ctx2, "CONFIG.tag", "cfg-flow", "flow view after checkin");
+    {
+        JSValue v = JS_TTFlowResumeParked(ctx2, g2, 0, &done, &parked);
+        if (parked || JS_IsException(v))
+            die(ctx2, "resume parked");
+        print_step(ctx2, v, done, "POST:");
+        JS_FreeValue(ctx2, v);
+    }
+    finish_flow(ctx2, g2, "POST:");
+    expect_str(ctx2, "CONFIG.tag", "cfg-flow", "delta committed by resume");
+    JS_FreeValue(ctx2, g2);
+    JS_FreeContext(ctx2);
+    JS_FreeRuntime(rt2);
+
+    /* discard the original parked machine: the documented abort path
+       (Interrupted unwinds helper -> inner -> outer -> driver) */
+    {
+        JSValue ret = JS_TTCallResume(ctx, 1, &parked);
+        if (parked)
+            die(ctx, "abort did not complete");
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    js_free(ctx, bytes);
+    JS_FreeValue(ctx, drive_fn);
+    JS_FreeValue(ctx, g);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    return 0;
+}
+
+static int cmd_resume2(const char *path)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    JSValue g;
+    uint8_t *bytes;
+    long blen;
+    FILE *f;
+    int done = 0, parked = 0;
+
+    printf("BASELINE:count=%u:fp=%016llx\n",
+           (unsigned)JS_TTBaselineCount(rt),
+           (unsigned long long)JS_TTBaselineFingerprint(rt));
+
+    f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "FATAL cannot read %s\n", path);
+        return 1;
+    }
+    fseek(f, 0, SEEK_END);
+    blen = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    bytes = malloc(blen);
+    if (fread(bytes, 1, blen, f) != (size_t)blen) {
+        fprintf(stderr, "FATAL short read\n");
+        return 1;
+    }
+    fclose(f);
+    printf("BYTES:%u\n", (unsigned)blen);
+
+    g = JS_TTFlowDeserialize(ctx, bytes, blen);
+    if (JS_IsException(g))
+        die(ctx, "deserialize");
+    if (!JS_TTFlowParked(ctx, g)) {
+        fprintf(stderr, "FATAL flow did not arrive as a parked machine\n");
+        return 1;
+    }
+    printf("PARKED:transplanted\n");
+
+    /* suspended machines are per-flow values now: a second transplant of
+       the same bytes must SUCCEED and park independently -- and resuming
+       (aborting) it must leave the first machine untouched */
+    {
+        int d2 = 0, p2 = 0;
+        JSValue dup = JS_TTFlowDeserialize(ctx, bytes, (size_t)blen);
+        JSValue ret;
+        if (JS_IsException(dup))
+            die(ctx, "second transplant");
+        if (!JS_TTFlowParked(ctx, dup)) {
+            fprintf(stderr, "FAIL second machine not parked\n");
+            return 1;
+        }
+        ret = JS_TTFlowResumeParked(ctx, dup, 1, &d2, &p2);   /* abort */
+        if (p2 || !JS_IsException(ret)) {
+            fprintf(stderr, "FAIL abort of second machine\n");
+            return 1;
+        }
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, dup);
+        if (!JS_TTFlowParked(ctx, g)) {
+            fprintf(stderr, "FAIL first machine lost its park\n");
+            return 1;
+        }
+        printf("SELF:concurrent transplant ok\n");
+    }
+    /* re-serializing the transplanted parked chain reproduces the bytes:
+       arena offsets are relative, ids deterministic */
+    {
+        size_t l2;
+        uint8_t *again = JS_TTFlowSerialize(ctx, g, &l2);
+        if (!again)
+            die(ctx, "re-serialize parked");
+        if (l2 != (size_t)blen || memcmp(again, bytes, l2) != 0) {
+            fprintf(stderr, "FAIL parked re-serialization drifted\n");
+            return 1;
+        }
+        js_free(ctx, again);
+        printf("SELF:parked byte-stable ok\n");
+    }
+    free(bytes);
+
+    expect_str(ctx, "CONFIG.tag", "cfg", "pristine before checkin");
+    JS_RunGC(rt);
+    if (JS_TTFlowCheckin(ctx, g))
+        die(ctx, "checkin");
+    expect_str(ctx, "CONFIG.tag", "cfg-flow", "flow view after checkin");
+
+    {
+        JSValue v = JS_TTFlowResumeParked(ctx, g, 0, &done, &parked);
+        if (parked || JS_IsException(v))
+            die(ctx, "resume parked");
+        print_step(ctx, v, done, "POST:");
+        JS_FreeValue(ctx, v);
+    }
+    finish_flow(ctx, g, "POST:");
+    expect_str(ctx, "CONFIG.tag", "cfg-flow", "delta committed by resume");
+
+    JS_FreeValue(ctx, g);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    return 0;
+}
+
+/* ---- selftest: dedup, identity, byte-stability, robustness, leaks ---- */
+static uint8_t *serialize_parked(JSContext *ctx, JSValueConst g, size_t *plen)
+{
+    uint8_t *b;
+    if (JS_TTFlowCheckout(ctx, (JSValue)g))
+        die(ctx, "checkout");
+    b = JS_TTFlowSerialize(ctx, g, plen);
+    if (!b)
+        die(ctx, "serialize");
+    return b;
+}
+
+static int cmd_selftest(void)
+{
+    JSRuntime *rtA, *rtB, *rtC;
+    JSContext *ctxA, *ctxB, *ctxC;
+    JSValue g1, g2, h1, h2;
+    uint8_t *b1, *b2, *b1again;
+    size_t l1, l2, l1again;
+    size_t i;
+
+    /* -- process-A-side: two flows over the same baseline -- */
+    ctxA = new_baseline_ctx(&rtA);
+    g1 = start_flow(ctxA, 3, NULL);
+    write_delta(ctxA, g1);
+    g2 = start_flow(ctxA, 3, NULL);
+    b1 = serialize_parked(ctxA, g1, &l1);
+    b2 = serialize_parked(ctxA, g2, &l2);
+
+    /* the shared baseline must not be copied into either flow: TABLE alone
+       holds 64 "row-N" strings; a single leaked copy would show up */
+    for (i = 0; b1 && i + 4 <= l1; i++)
+        assert(memcmp(b1 + i, "row-", 4) != 0);
+    for (i = 0; b2 && i + 4 <= l2; i++)
+        assert(memcmp(b2 + i, "row-", 4) != 0);
+    assert(l1 < 2048 && l2 < 2048);
+    printf("SELFTEST:dedup ok (flow bytes %u/%u, no baseline copies)\n",
+           (unsigned)l1, (unsigned)l2);
+
+    /* -- fresh-runtime transplant of BOTH flows -- */
+    ctxB = new_baseline_ctx(&rtB);
+    assert(JS_TTBaselineFingerprint(rtB) == JS_TTBaselineFingerprint(rtA));
+    h1 = JS_TTFlowDeserialize(ctxB, b1, l1);
+    if (JS_IsException(h1))
+        die(ctxB, "deserialize h1");
+    h2 = JS_TTFlowDeserialize(ctxB, b2, l2);
+    if (JS_IsException(h2))
+        die(ctxB, "deserialize h2");
+
+    /* re-serializing the transplanted flow must reproduce the bytes exactly:
+       assign ids -> relink is deterministic on both sides */
+    b1again = JS_TTFlowSerialize(ctxB, h1, &l1again);
+    if (!b1again)
+        die(ctxB, "re-serialize");
+    assert(l1again == l1 && memcmp(b1again, b1, l1) == 0);
+    js_free(ctxB, b1again);
+    printf("SELFTEST:byte-stable re-serialization ok\n");
+
+    /* both transplanted flows must share the SAME rebuilt baseline object:
+       flow 1's delta view must be visible to flow 2's execution */
+    if (JS_TTFlowCheckin(ctxB, h1))
+        die(ctxB, "checkin h1");
+    expect_str(ctxB, "CONFIG.tag", "cfg-flow", "h1 view in B");
+    finish_flow(ctxB, h2, "XTALK:");   /* h2 has no delta: sees h1's view */
+    {
+        char *last = eval_str(ctxB, "CONFIG.tag");
+        assert(!strcmp(last, "cfg-flow"));
+        free(last);
+    }
+    if (JS_TTFlowCheckout(ctxB, h1))
+        die(ctxB, "checkout h1");
+    expect_str(ctxB, "CONFIG.tag", "cfg", "pristine after h1 checkout");
+    printf("SELFTEST:shared identity ok\n");
+
+    /* corrupt input must be rejected, never crash */
+    {
+        int rejected = 0;
+        size_t offs[] = { 7, l1 / 3, l1 / 2, l1 - 2 };
+        for (i = 0; i < sizeof(offs) / sizeof(offs[0]); i++) {
+            uint8_t *evil = malloc(l1);
+            JSValue r;
+            memcpy(evil, b1, l1);
+            evil[offs[i]] ^= 0x5a;
+            r = JS_TTFlowDeserialize(ctxB, evil, l1);
+            if (JS_IsException(r)) {
+                rejected++;
+                JS_FreeValue(ctxB, JS_GetException(ctxB));
+            } else {
+                JS_FreeValue(ctxB, r);
+            }
+            free(evil);
+        }
+        printf("SELFTEST:corruption rejected %d/4 (no crashes)\n", rejected);
+        assert(rejected >= 3);
+        /* truncations */
+        for (i = 1; i < l1; i += (l1 / 37) + 1) {
+            JSValue r = JS_TTFlowDeserialize(ctxB, b1, i);
+            if (JS_IsException(r))
+                JS_FreeValue(ctxB, JS_GetException(ctxB));
+            else
+                JS_FreeValue(ctxB, r);
+        }
+        printf("SELFTEST:truncation sweep ok\n");
+    }
+
+    /* a drifted baseline must be refused by fingerprint */
+    {
+        JSRuntime *rt2 = JS_NewRuntime();
+        JSContext *c2 = JS_NewContext(rt2);
+        const char *extra = "var DRIFT = { x: 1 };\n";
+        char *src2 = malloc(strlen(BASELINE_SRC) + strlen(extra) + 1);
+        JSValue v, r;
+        strcpy(src2, BASELINE_SRC);
+        strcat(src2, extra);
+        v = JS_Eval(c2, src2, strlen(src2), "baseline.js", JS_EVAL_TYPE_GLOBAL);
+        free(src2);
+        assert(!JS_IsException(v));
+        JS_FreeValue(c2, v);
+        assert(!JS_TTBaselineCapture(c2));
+        assert(JS_TTBaselineFingerprint(rt2) != JS_TTBaselineFingerprint(rtA));
+        r = JS_TTFlowDeserialize(c2, b1, l1);
+        assert(JS_IsException(r));
+        JS_FreeValue(c2, JS_GetException(c2));
+        JS_FreeContext(c2);
+        JS_FreeRuntime(rt2);
+        printf("SELFTEST:baseline drift refused ok\n");
+    }
+
+    /* dropping a transplanted flow (delta included) without resuming must
+       not leak: rely on the runtime teardown assertions */
+    ctxC = new_baseline_ctx(&rtC);
+    {
+        JSValue h = JS_TTFlowDeserialize(ctxC, b1, l1);
+        if (JS_IsException(h))
+            die(ctxC, "deserialize into C");
+        JS_RunGC(rtC);
+        JS_FreeValue(ctxC, h);   /* abandoned unfinished */
+        JS_RunGC(rtC);
+    }
+    JS_FreeContext(ctxC);
+    JS_FreeRuntime(rtC);
+    printf("SELFTEST:abandoned-flow teardown ok\n");
+
+    js_free(ctxA, b1);
+    js_free(ctxA, b2);
+    JS_FreeValue(ctxB, h1);
+    JS_FreeValue(ctxB, h2);
+    JS_FreeContext(ctxB);
+    JS_FreeRuntime(rtB);
+    JS_FreeValue(ctxA, g1);
+    JS_FreeValue(ctxA, g2);
+    JS_FreeContext(ctxA);
+    fprintf(stderr, "[teardown rtA]\n");
+    JS_FreeRuntime(rtA);
+    printf("SELFTEST:teardown ok\n");
+    return 0;
+}
+
+/* drive a suspended flow to completion feeding next(feed) each step,
+   collecting "value|" into buf */
+static void collect_flow(JSContext *ctx, JSValueConst g, int feed,
+                         char *buf, size_t cap)
+{
+    JSAtom na = JS_NewAtom(ctx, "next");
+    buf[0] = 0;
+    for (;;) {
+        JSValue arg = JS_NewInt32(ctx, feed);
+        JSValue r = JS_Invoke(ctx, (JSValue)g, na, 1, (JSValueConst *)&arg);
+        JSValue val, done;
+        const char *str;
+        int isdone;
+        if (JS_IsException(r))
+            die(ctx, "next(feed)");
+        val = JS_GetPropertyStr(ctx, r, "value");
+        done = JS_GetPropertyStr(ctx, r, "done");
+        isdone = JS_ToBool(ctx, done);
+        str = JS_ToCString(ctx, val);
+        if (strlen(buf) + strlen(str) + 2 < cap) {
+            strcat(buf, str ? str : "?");
+            strcat(buf, "|");
+        }
+        JS_FreeCString(ctx, str);
+        JS_FreeValue(ctx, val);
+        JS_FreeValue(ctx, done);
+        JS_FreeValue(ctx, r);
+        if (isdone)
+            break;
+    }
+    JS_FreeAtom(ctx, na);
+}
+
+static void delta_mark(JSContext *ctx, JSValueConst g, const char *mark)
+{
+    JSValue cfg = get_global(ctx, "CONFIG");
+    JSAtom tag = JS_NewAtom(ctx, "tag");
+    JSValue nv = JS_NewString(ctx, mark);
+    if (JS_TTFlowDeltaWriteProp(ctx, g, cfg, tag, nv))
+        die(ctx, "delta mark");
+    JS_FreeValue(ctx, nv);
+    JS_FreeAtom(ctx, tag);
+    JS_FreeValue(ctx, cfg);
+}
+
+/* fork: clone a parked flow (two frames deep in yield*, open cell, delta),
+   prove independent divergence, two-way then three-way delta isolation,
+   baseline sharing by identity, and leak-free teardown */
+static int cmd_forktest(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    JSValue g, g2, g3;
+    char trace_p[2048], trace_s[2048], trace_g[2048];
+
+    /* park at the "inner:1" yield: [outer, inner] chain, mk closure over
+       a live local, one delta write, checked out */
+    g = start_flow(ctx, 3, NULL);
+    write_delta(ctx, g);
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout parent");
+    expect_str(ctx, "CONFIG.tag", "cfg", "pristine after checkout");
+
+    g2 = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(g2))
+        die(ctx, "fork");
+    printf("FORK:sibling ok\n");
+
+    /* (b) delta isolation, both directions */
+    if (JS_TTFlowCheckin(ctx, g))
+        die(ctx, "checkin parent");
+    expect_str(ctx, "CONFIG.tag", "cfg-flow", "parent view");
+    delta_mark(ctx, g, "parent-mark");
+    expect_str(ctx, "CONFIG.tag", "parent-mark", "parent write");
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout parent 2");
+    expect_str(ctx, "CONFIG.tag", "cfg", "pristine again");
+
+    if (JS_TTFlowCheckin(ctx, g2))
+        die(ctx, "checkin sibling");
+    expect_str(ctx, "CONFIG.tag", "cfg-flow",
+               "sibling sees fork-time view, not parent-mark");
+    delta_mark(ctx, g2, "sib-mark");
+    if (JS_TTFlowCheckout(ctx, g2))
+        die(ctx, "checkout sibling");
+    expect_str(ctx, "CONFIG.tag", "cfg", "pristine after sibling");
+
+    if (JS_TTFlowCheckin(ctx, g))
+        die(ctx, "checkin parent 3");
+    expect_str(ctx, "CONFIG.tag", "parent-mark",
+               "parent view survives sibling's writes");
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout parent 3");
+    printf("FORK:delta isolation ok\n");
+
+    /* (e) fork-of-fork: the grandchild carries the SIBLING's view */
+    g3 = JS_TTFlowFork(ctx, g2);
+    if (JS_IsException(g3))
+        die(ctx, "fork of fork");
+    if (JS_TTFlowCheckin(ctx, g3))
+        die(ctx, "checkin g3");
+    expect_str(ctx, "CONFIG.tag", "sib-mark", "grandchild inherits sibling");
+    delta_mark(ctx, g3, "g3-mark");
+    if (JS_TTFlowCheckout(ctx, g3))
+        die(ctx, "checkout g3");
+    if (JS_TTFlowCheckin(ctx, g2))
+        die(ctx, "checkin sibling 2");
+    expect_str(ctx, "CONFIG.tag", "sib-mark",
+               "sibling view survives grandchild's writes");
+    if (JS_TTFlowCheckout(ctx, g2))
+        die(ctx, "checkout sibling 2");
+    printf("FORK:three-way isolation ok\n");
+
+    /* (c) baseline shared by identity: a host-level mutation of TABLE is
+       visible to every fork's future (a clone would show pristine rows) */
+    {
+        JSValue v = JS_Eval(ctx, "TABLE[2] = 'row-2-mutated';", 26,
+                            "probe.js", JS_EVAL_TYPE_GLOBAL);
+        if (JS_IsException(v))
+            die(ctx, "table mutation");
+        JS_FreeValue(ctx, v);
+    }
+
+    /* (a) resume all three with different feeds; each under its own delta */
+    if (JS_TTFlowCheckin(ctx, g))
+        die(ctx, "checkin for run p");
+    collect_flow(ctx, g, 1, trace_p, sizeof(trace_p));
+    if (JS_TTFlowCheckin(ctx, g2))
+        die(ctx, "checkin for run s");
+    collect_flow(ctx, g2, 2, trace_s, sizeof(trace_s));
+    if (JS_TTFlowCheckin(ctx, g3))
+        die(ctx, "checkin for run g");
+    collect_flow(ctx, g3, 3, trace_g, sizeof(trace_g));
+
+    printf("TRACE_P:%s\n", trace_p);
+    printf("TRACE_S:%s\n", trace_s);
+    printf("TRACE_G:%s\n", trace_g);
+    assert(strcmp(trace_p, trace_s) != 0);
+    assert(strcmp(trace_s, trace_g) != 0);
+    assert(strcmp(trace_p, trace_g) != 0);
+    assert(strstr(trace_p, "delta-view:parent-mark"));
+    assert(strstr(trace_s, "delta-view:sib-mark"));
+    assert(strstr(trace_g, "delta-view:g3-mark"));
+    assert(strstr(trace_p, "row-2-mutated"));
+    assert(strstr(trace_s, "row-2-mutated"));
+    assert(strstr(trace_g, "row-2-mutated"));
+    printf("FORK:divergent futures ok\n");
+
+    /* also: forking a completed/running flow refuses cleanly */
+    {
+        JSValue bad = JS_TTFlowFork(ctx, g);   /* g completed above */
+        assert(JS_IsException(bad));
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+
+    /* (d) leak-free teardown: two completed flows, one abandoned fork */
+    {
+        JSValue g4 = JS_TTFlowFork(ctx, g3);   /* completed -> must refuse */
+        assert(JS_IsException(g4));
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    JS_FreeValue(ctx, g);
+    JS_FreeValue(ctx, g2);
+    JS_FreeValue(ctx, g3);
+    /* an extra suspended fork abandoned without resuming */
+    {
+        JSValue g5 = start_flow(ctx, 3, NULL);
+        JSValue g6;
+        if (JS_TTFlowCheckout(ctx, g5))
+            die(ctx, "checkout g5");
+        g6 = JS_TTFlowFork(ctx, g5);
+        if (JS_IsException(g6))
+            die(ctx, "fork g5");
+        JS_FreeValue(ctx, g5);
+        JS_FreeValue(ctx, g6);
+        JS_RunGC(rt);
+    }
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    printf("FORK:teardown ok\n");
+    return 0;
+}
+
+/* the first resumed step of a machine-parked arm, stringified into buf
+   (unwraps a done==2 yield* delegation result exactly like print_step) */
+static void resume_first(JSContext *ctx, JSValueConst arm, char *buf,
+                         size_t cap)
+{
+    int done = 0, parked = 0;
+    JSValue v = JS_TTFlowResumeParked(ctx, (JSValue)arm, 0, &done, &parked);
+    const char *s;
+    if (parked || JS_IsException(v))
+        die(ctx, "resume arm");
+    if (done == 2) {
+        JSValue v2 = JS_GetPropertyStr(ctx, v, "value");
+        JS_FreeValue(ctx, v);
+        v = v2;
+    }
+    s = JS_ToCString(ctx, v);
+    snprintf(buf, cap, "%s|", s ? s : "?");
+    JS_FreeCString(ctx, s);
+    JS_FreeValue(ctx, v);
+}
+
+/* forkhere: fork the RUNNING machine from inside the step hook, at an
+   opcode boundary in the middle of helper()'s arithmetic, four frames deep
+   (helper <- inner <- outer <- for-of drive). armA = the continue-arm (the
+   legacy parked machine), armB/armC = JS_TTForkHere handles, armD = a
+   host-side JS_TTFlowFork of the parked machine, abandoned unresumed.
+   Proves: (a) diverging futures from the same opcode under per-arm
+   injections of the same live local, (b) delta isolation across arms,
+   (c) 4 independently suspended machines coexisting in one runtime, a
+   handle resuming to completion while the legacy machine stays parked,
+   (d) leak-free teardown of an abandoned arm through the state finalizer. */
+static int cmd_forkhere(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    JSValue g, armB, armC, armD, drive_fn;
+    ParkPlan plan;
+    JSAtom name_a;
+    char traceA[2048], traceB[2048], traceC[2048];
+    int parked = 0;
+
+    g = start_flow(ctx, 2, NULL);     /* suspended at inner's k=0 yield */
+    write_delta(ctx, g);
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout");
+
+    /* drive under opcode-granularity stepping; the trigger sits on the
+       SECOND opcode boundary of helper's middle line at k=1 -- genuinely
+       mid-statement, four frames deep */
+    plan.line = baseline_line_of("acc = acc + CONFIG.limit");
+    plan.countdown = 2;
+    plan.parked_line = 0;
+    plan.fork_here = 1;
+    plan.forked = JS_UNDEFINED;
+    JS_TTSetStepHandler(rt, park_handler, &plan);
+    JS_TTSetStepFilename(ctx, "baseline.js");
+    JS_TTSetGranularity(ctx, 1);
+    JS_TTEnableStep(rt, 1);
+    drive_fn = get_global(ctx, "drive");
+    {
+        JSValueConst args[1] = { g };
+        JSValue ret = JS_TTCallArgs(ctx, drive_fn, JS_UNDEFINED, 1, args,
+                                    &parked);
+        if (JS_IsException(ret))
+            die(ctx, "fork-here drive");
+        if (!parked) {
+            fprintf(stderr, "FATAL machine did not park at the fork point\n");
+            return 1;
+        }
+        JS_FreeValue(ctx, ret);
+    }
+    JS_TTEnableStep(rt, 0);
+    armB = plan.forked;
+    if (!JS_TTParked(ctx) || !JS_TTFlowParked(ctx, armB)) {
+        fprintf(stderr, "FAIL fork-here arms not both suspended\n");
+        return 1;
+    }
+    printf("FORKHERE:split at line %d, both arms suspended\n",
+           plan.parked_line);
+
+    /* (d-setup) a host-side fork of the legacy parked machine: a third
+       independently suspended machine, to be abandoned unresumed */
+    armD = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(armD))
+        die(ctx, "host-side fork of parked machine");
+    if (!JS_TTFlowParked(ctx, armD)) {
+        fprintf(stderr, "FAIL armD not suspended\n");
+        return 1;
+    }
+
+    /* (b) delta isolation across arms: distinct marks, both checked out */
+    if (JS_TTFlowCheckin(ctx, g))
+        die(ctx, "checkin A");
+    expect_str(ctx, "CONFIG.tag", "cfg-flow", "armA inherits pre-fork view");
+    delta_mark(ctx, g, "cfg-A");
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout A");
+    expect_str(ctx, "CONFIG.tag", "cfg", "pristine after armA");
+    if (JS_TTFlowCheckin(ctx, armB))
+        die(ctx, "checkin B");
+    expect_str(ctx, "CONFIG.tag", "cfg-flow",
+               "armB inherits the fork-time view, not cfg-A");
+    delta_mark(ctx, armB, "cfg-B");
+    if (JS_TTFlowCheckout(ctx, armB))
+        die(ctx, "checkout B");
+    if (JS_TTFlowCheckin(ctx, g))
+        die(ctx, "checkin A2");
+    expect_str(ctx, "CONFIG.tag", "cfg-A", "armA view survives armB's mark");
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout A2");
+    printf("FORKHERE:delta isolation ok\n");
+
+    /* (a) inject different values into the SAME live local (helper's
+       argument `a`, an aliased-arg slot: armA through the running chain,
+       armB through its handle) */
+    name_a = JS_NewAtom(ctx, "a");
+    {
+        JSValue v = JS_NewInt32(ctx, 10);
+        if (!JS_TTSetLocal(ctx, 0, name_a, v)) {
+            fprintf(stderr, "FAIL inject armA\n");
+            return 1;
+        }
+        v = JS_NewInt32(ctx, 20);
+        if (!JS_TTFlowSetLocal(ctx, armB, 0, name_a, v)) {
+            fprintf(stderr, "FAIL inject armB\n");
+            return 1;
+        }
+    }
+
+    /* (c) a third ForkHere INSIDE armA's resume: two opcode boundaries
+       later on the same helper line (still k=1, before `a` is read) the
+       trigger fires again, the handler splits again, armA re-parks */
+    plan.countdown = 2;
+    plan.parked_line = 0;
+    plan.forked = JS_UNDEFINED;
+    JS_TTEnableStep(rt, 1);
+    {
+        JSValue ret = JS_TTCallResume(ctx, 0, &parked);
+        if (JS_IsException(ret))
+            die(ctx, "armA resume to second fork");
+        if (!parked) {
+            fprintf(stderr, "FATAL armA did not re-park\n");
+            return 1;
+        }
+        JS_FreeValue(ctx, ret);
+    }
+    JS_TTEnableStep(rt, 0);
+    armC = plan.forked;
+    if (!JS_TTParked(ctx) || !JS_TTFlowParked(ctx, armB) ||
+        !JS_TTFlowParked(ctx, armC) || !JS_TTFlowParked(ctx, armD)) {
+        fprintf(stderr, "FAIL four machines not all suspended\n");
+        return 1;
+    }
+    printf("FORKHERE:legacy + 3 handles suspended concurrently\n");
+    {
+        JSValue v = JS_NewInt32(ctx, 30);
+        if (!JS_TTFlowSetLocal(ctx, armC, 0, name_a, v)) {
+            fprintf(stderr, "FAIL inject armC\n");
+            return 1;
+        }
+    }
+    JS_FreeAtom(ctx, name_a);
+
+    /* armB runs to completion WHILE the legacy machine stays parked: the
+       handle's machine registers install and restore around the run */
+    if (JS_TTFlowCheckin(ctx, armB))
+        die(ctx, "checkin B2");
+    resume_first(ctx, armB, traceB, sizeof(traceB));
+    collect_flow(ctx, armB, 0, traceB + strlen(traceB),
+                 sizeof(traceB) - strlen(traceB));
+    if (!JS_TTParked(ctx)) {
+        fprintf(stderr, "FAIL legacy machine lost its park across armB\n");
+        return 1;
+    }
+    printf("FORKHERE:armB completed around the parked machine\n");
+
+    /* armA (the continue-arm) completes: drive() returns its whole trace */
+    if (JS_TTFlowCheckin(ctx, g))
+        die(ctx, "checkin A3");
+    {
+        JSValue ret = JS_TTCallResume(ctx, 0, &parked);
+        const char *s;
+        if (parked || JS_IsException(ret))
+            die(ctx, "armA final resume");
+        s = JS_ToCString(ctx, ret);
+        snprintf(traceA, sizeof(traceA), "%s", s ? s : "?");
+        JS_FreeCString(ctx, s);
+        JS_FreeValue(ctx, ret);
+    }
+
+    /* armC: its own mark, then its own future */
+    if (JS_TTFlowCheckin(ctx, armC))
+        die(ctx, "checkin C");
+    delta_mark(ctx, armC, "cfg-C");
+    resume_first(ctx, armC, traceC, sizeof(traceC));
+    collect_flow(ctx, armC, 0, traceC + strlen(traceC),
+                 sizeof(traceC) - strlen(traceC));
+
+    printf("TRACE_A:%s\n", traceA);
+    printf("TRACE_B:%s\n", traceB);
+    printf("TRACE_C:%s\n", traceC);
+    assert(strcmp(traceA, traceB) != 0);
+    assert(strcmp(traceA, traceC) != 0);
+    assert(strcmp(traceB, traceC) != 0);
+    assert(strstr(traceA, "delta-view:cfg-A"));
+    assert(strstr(traceB, "delta-view:cfg-B"));
+    assert(strstr(traceC, "delta-view:cfg-C"));
+    printf("FORKHERE:divergent futures ok\n");
+
+    /* (d) the abandoned arm: survives a full GC suspended, then tears
+       down leak-free through the state finalizer, never resumed */
+    JS_RunGC(rt);
+    if (!JS_TTFlowParked(ctx, armD)) {
+        fprintf(stderr, "FAIL armD lost its machine across GC\n");
+        return 1;
+    }
+    JS_FreeValue(ctx, armD);
+    JS_RunGC(rt);
+
+    JS_FreeValue(ctx, drive_fn);
+    JS_FreeValue(ctx, g);
+    JS_FreeValue(ctx, armB);
+    JS_FreeValue(ctx, armC);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);       /* the leak oracle: gc_obj_list must drain */
+    printf("FORKHERE:teardown ok\n");
+    return 0;
+}
+
+/* park the standard machine (outer -> yield* inner -> helper under a for-of
+   drive, stopped on helper's middle line at k=1) with the delta written and
+   checked out -- ready to fork/serialize */
+static JSValue park_std_machine(JSContext *ctx, JSRuntime *rt, ParkPlan *plan,
+                                JSValue *pdrive_fn)
+{
+    JSValue g = start_flow(ctx, 2, NULL);
+    int parked = 0;
+    write_delta(ctx, g);
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout");
+    plan->line = baseline_line_of("acc = acc + CONFIG.limit");
+    plan->countdown = 1;
+    plan->parked_line = 0;
+    plan->fork_here = 0;
+    plan->forked = JS_UNDEFINED;
+    JS_TTSetStepHandler(rt, park_handler, plan);
+    JS_TTSetStepFilename(ctx, "baseline.js");
+    JS_TTEnableStep(rt, 1);
+    *pdrive_fn = get_global(ctx, "drive");
+    {
+        JSValueConst args[1] = { g };
+        JSValue ret = JS_TTCallArgs(ctx, *pdrive_fn, JS_UNDEFINED, 1, args,
+                                    &parked);
+        if (JS_IsException(ret))
+            die(ctx, "drive");
+        if (!parked) {
+            fprintf(stderr, "FATAL machine did not park\n");
+            exit(1);
+        }
+        JS_FreeValue(ctx, ret);
+    }
+    JS_TTEnableStep(rt, 0);
+    return g;
+}
+
+/* mass: N suspended machines forked from one baseline cost the sum of
+   their actual chain depths, not N fixed 2 MB slabs -- hard bounds on the
+   measured arena RAM, spot resumes, leak-free mass teardown */
+#define NMASS 2000
+static JSValue mass_arms[NMASS];
+
+static int cmd_mass(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    ParkPlan plan;
+    JSValue drive_fn, g;
+    size_t tot_used = 0, tot_reserved = 0;
+    char t0[2048], t1[2048], t2[2048];
+    int i, parked = 0;
+
+    g = park_std_machine(ctx, rt, &plan, &drive_fn);
+
+    for (i = 0; i < NMASS; i++) {
+        mass_arms[i] = JS_TTFlowFork(ctx, g);
+        if (JS_IsException(mass_arms[i]))
+            die(ctx, "mass fork");
+    }
+    for (i = 0; i < NMASS; i++) {
+        size_t used = 0, reserved = 0;
+        int segs = 0;
+        if (JS_TTFlowMachineStats(ctx, mass_arms[i], &used, &reserved,
+                                  &segs)) {
+            fprintf(stderr, "FAIL arm %d has no machine\n", i);
+            return 1;
+        }
+        tot_used += used;
+        tot_reserved += reserved;
+    }
+    printf("MASS:%d machines, used=%zu reserved=%zu (%.0f bytes/machine)\n",
+           NMASS, tot_used, tot_reserved, (double)tot_reserved / NMASS);
+    /* HARD bounds: reserved tracks the chains actually parked -- a small
+       multiple of used plus a per-machine sliver -- and sits orders of
+       magnitude below N x 2 MB slabs */
+    assert(tot_used >= (size_t)NMASS * 200);
+    assert(tot_reserved <= 4 * tot_used + (size_t)NMASS * 2048);
+    assert(tot_reserved < (size_t)NMASS * (2u * 1024 * 1024) / 100);
+    printf("MASS:arena RAM bound ok\n");
+
+    /* spot-resume three arms across the population: identical futures */
+    {
+        int picks[3] = { 0, NMASS / 2, NMASS - 1 };
+        char *bufs[3] = { t0, t1, t2 };
+        int k;
+        for (k = 0; k < 3; k++) {
+            resume_first(ctx, mass_arms[picks[k]], bufs[k], 2048);
+            collect_flow(ctx, mass_arms[picks[k]], 0,
+                         bufs[k] + strlen(bufs[k]), 2048 - strlen(bufs[k]));
+        }
+        assert(strcmp(t0, t1) == 0 && strcmp(t1, t2) == 0);
+        assert(strstr(t0, "delta-view:"));
+    }
+    printf("MASS:spot resumes identical ok\n");
+
+    for (i = 0; i < NMASS; i++)
+        JS_FreeValue(ctx, mass_arms[i]);
+    {   /* discard the legacy machine through the abort path */
+        JSValue ret = JS_TTCallResume(ctx, 1, &parked);
+        if (parked)
+            die(ctx, "abort did not complete");
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    JS_FreeValue(ctx, drive_fn);
+    JS_FreeValue(ctx, g);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    printf("MASS:teardown ok\n");
+    return 0;
+}
+
+/* deep: a chain grown by recursion under the step hook crosses multiple
+   arena segments; it still forks, transplants, evicts and resumes
+   byte-identically across the segment boundaries */
+static int cmd_deep(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    ParkPlan plan;
+    JSValue g, drive_fn, armF, armF2, h1, armFh;
+    uint8_t *bytes, *ebytes;
+    size_t blen, elen, used = 0, reserved = 0;
+    int segs = 0, parked = 0;
+    char tF2[2048], tH[2048], tHy[2048], ref[4096];
+
+    /* a 60-deep recursion, parked ~30 frames down on the descent */
+    {
+        JSValue fn = get_global(ctx, "deepflow");
+        JSValue arg = JS_NewInt32(ctx, 60);
+        g = JS_Call(ctx, fn, JS_UNDEFINED, 1, (JSValueConst *)&arg);
+        if (JS_IsException(g))
+            die(ctx, "deepflow()");
+        JS_FreeValue(ctx, fn);
+    }
+    plan.line = baseline_line_of("return rec(n - 1, a) + 0");
+    plan.countdown = 30;
+    plan.parked_line = 0;
+    plan.fork_here = 0;
+    plan.forked = JS_UNDEFINED;
+    JS_TTSetStepHandler(rt, park_handler, &plan);
+    JS_TTSetStepFilename(ctx, "baseline.js");
+    JS_TTEnableStep(rt, 1);
+    drive_fn = get_global(ctx, "drive");
+    {
+        JSValueConst args[1] = { g };
+        JSValue ret = JS_TTCallArgs(ctx, drive_fn, JS_UNDEFINED, 1, args,
+                                    &parked);
+        if (JS_IsException(ret))
+            die(ctx, "deep drive");
+        if (!parked) {
+            fprintf(stderr, "FATAL deep machine did not park\n");
+            return 1;
+        }
+        JS_FreeValue(ctx, ret);
+    }
+    JS_TTEnableStep(rt, 0);
+
+    /* fork the deep chain: the sibling's machine spans several segments */
+    armF = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(armF))
+        die(ctx, "deep fork");
+    if (JS_TTFlowMachineStats(ctx, armF, &used, &reserved, &segs)) {
+        fprintf(stderr, "FAIL deep fork has no machine\n");
+        return 1;
+    }
+    printf("DEEP:fork used=%zu reserved=%zu segments=%d\n",
+           used, reserved, segs);
+    assert(segs >= 2);                    /* crosses segment boundaries */
+    assert(used >= 4000);                 /* the ~30 rec frames are real */
+    assert(reserved <= 3 * used + 4096);  /* demand growth tracks depth */
+
+    bytes = JS_TTFlowSerialize(ctx, g, &blen);   /* the legacy deep chain */
+    if (!bytes)
+        die(ctx, "deep serialize");
+    h1 = JS_TTFlowDeserialize(ctx, bytes, blen);
+    if (JS_IsException(h1))
+        die(ctx, "deep deserialize");
+    js_free(ctx, bytes);
+    {
+        int s2 = 0;
+        if (JS_TTFlowMachineStats(ctx, h1, NULL, NULL, &s2) || s2 < 2) {
+            fprintf(stderr, "FAIL transplanted deep machine not segmented\n");
+            return 1;
+        }
+    }
+
+    armF2 = JS_TTFlowFork(ctx, armF);     /* fork ACROSS the boundaries */
+    if (JS_IsException(armF2))
+        die(ctx, "deep fork-of-fork");
+
+    ebytes = JS_TTMachineEvict(ctx, armF, &elen);
+    if (!ebytes)
+        die(ctx, "deep evict");
+    if (JS_TTFlowParked(ctx, armF)) {
+        fprintf(stderr, "FAIL evicted arm still parked\n");
+        return 1;
+    }
+    armFh = JS_TTMachineHydrate(ctx, ebytes, elen);
+    if (JS_IsException(armFh))
+        die(ctx, "deep hydrate");
+    js_free(ctx, ebytes);
+
+    /* reference future: the legacy machine completes drive() -- resuming
+       descends 30 more rec levels INSIDE the machine, then unwinds all of
+       them; for the handles below, both directions cross segments */
+    {
+        JSValue ret = JS_TTCallResume(ctx, 0, &parked);
+        const char *s;
+        if (parked || JS_IsException(ret))
+            die(ctx, "deep reference resume");
+        s = JS_ToCString(ctx, ret);
+        snprintf(ref, sizeof(ref), "%s", s ? s : "?");
+        JS_FreeCString(ctx, s);
+        JS_FreeValue(ctx, ret);
+    }
+
+    resume_first(ctx, armFh, tHy, sizeof(tHy));
+    collect_flow(ctx, armFh, 0, tHy + strlen(tHy),
+                 sizeof(tHy) - strlen(tHy));
+    resume_first(ctx, h1, tH, sizeof(tH));
+    collect_flow(ctx, h1, 0, tH + strlen(tH), sizeof(tH) - strlen(tH));
+    resume_first(ctx, armF2, tF2, sizeof(tF2));
+    collect_flow(ctx, armF2, 0, tF2 + strlen(tF2),
+                 sizeof(tF2) - strlen(tF2));
+
+    printf("DEEP:ref=%s\n", ref);
+    printf("DEEP:handle=%s\n", tHy);
+    assert(strcmp(tHy, tH) == 0);
+    assert(strcmp(tHy, tF2) == 0);
+    assert(strstr(tHy, "deep:"));
+    {   /* the handles' first step is the very token the reference joined */
+        char tok[256];
+        size_t j = 0;
+        while (tHy[j] && tHy[j] != '|' && j < 255) {
+            tok[j] = tHy[j];
+            j++;
+        }
+        tok[j] = 0;
+        assert(j > 5 && strstr(ref, tok));
+    }
+    printf("DEEP:multi-segment resume/fork/evict byte-identical ok\n");
+
+    JS_FreeValue(ctx, drive_fn);
+    JS_FreeValue(ctx, g);
+    JS_FreeValue(ctx, armF);
+    JS_FreeValue(ctx, armF2);
+    JS_FreeValue(ctx, h1);
+    JS_FreeValue(ctx, armFh);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    printf("DEEP:teardown ok\n");
+    return 0;
+}
+
+/* evict: a suspended machine round-trips through bytes -- freed, hydrated,
+   resumed byte-identically -- without disturbing its siblings; the live
+   legacy machine refuses; plain yield-suspended flows evict too */
+static int cmd_evict(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    ParkPlan plan;
+    JSValue g, drive_fn, armX, armY, armX2;
+    uint8_t *ebytes;
+    size_t elen;
+    JSAtom name_a;
+    char tX[2048], tY[2048];
+    int parked = 0;
+
+    g = park_std_machine(ctx, rt, &plan, &drive_fn);
+
+    armX = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(armX))
+        die(ctx, "fork armX");
+    armY = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(armY))
+        die(ctx, "fork armY");
+
+    /* identical injections into the twins BEFORE eviction: the injected
+       local must travel in the bytes */
+    name_a = JS_NewAtom(ctx, "a");
+    {
+        JSValue v = JS_NewInt32(ctx, 20);
+        if (!JS_TTFlowSetLocal(ctx, armX, 0, name_a, v) ||
+            !JS_TTFlowSetLocal(ctx, armY, 0, name_a, v)) {
+            fprintf(stderr, "FAIL twin injection\n");
+            return 1;
+        }
+    }
+    JS_FreeAtom(ctx, name_a);
+
+    /* the live legacy machine refuses to evict */
+    {
+        size_t l0;
+        uint8_t *b0 = JS_TTMachineEvict(ctx, g, &l0);
+        assert(b0 == NULL);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+
+    ebytes = JS_TTMachineEvict(ctx, armX, &elen);
+    if (!ebytes)
+        die(ctx, "evict armX");
+    printf("EVICT:armX -> %zu bytes\n", elen);
+    /* the evicted handle is a completed husk; its siblings are untouched */
+    assert(!JS_TTFlowParked(ctx, armX));
+    assert(JS_TTFlowParked(ctx, armY));
+    assert(JS_TTParked(ctx));
+
+    armX2 = JS_TTMachineHydrate(ctx, ebytes, elen);
+    if (JS_IsException(armX2))
+        die(ctx, "hydrate armX");
+    js_free(ctx, ebytes);
+    assert(JS_TTFlowParked(ctx, armX2));
+
+    if (JS_TTFlowCheckin(ctx, armX2))
+        die(ctx, "checkin armX2");
+    resume_first(ctx, armX2, tX, sizeof(tX));
+    collect_flow(ctx, armX2, 0, tX + strlen(tX), sizeof(tX) - strlen(tX));
+    if (JS_TTFlowCheckin(ctx, armY))
+        die(ctx, "checkin armY");
+    resume_first(ctx, armY, tY, sizeof(tY));
+    collect_flow(ctx, armY, 0, tY + strlen(tY), sizeof(tY) - strlen(tY));
+
+    printf("EVICT:trace=%s\n", tX);
+    assert(strcmp(tX, tY) == 0);   /* byte-identical future across eviction */
+    assert(strstr(tX, "delta-view:cfg-flow"));
+    printf("EVICT:hydrated future byte-identical to its twin ok\n");
+
+    /* a plain yield-suspended flow evicts too */
+    {
+        JSValue g2 = start_flow(ctx, 3, NULL), g2h;
+        uint8_t *e2;
+        size_t l2;
+        char t2[2048];
+        write_delta(ctx, g2);
+        if (JS_TTFlowCheckout(ctx, g2))
+            die(ctx, "checkout g2");
+        e2 = JS_TTMachineEvict(ctx, g2, &l2);
+        if (!e2)
+            die(ctx, "evict g2");
+        g2h = JS_TTMachineHydrate(ctx, e2, l2);
+        if (JS_IsException(g2h))
+            die(ctx, "hydrate g2");
+        js_free(ctx, e2);
+        if (JS_TTFlowCheckin(ctx, g2h))
+            die(ctx, "checkin g2h");
+        collect_flow(ctx, g2h, 0, t2, sizeof(t2));
+        assert(strstr(t2, "after-inner:"));
+        JS_FreeValue(ctx, g2);
+        JS_FreeValue(ctx, g2h);
+    }
+    printf("EVICT:yield-suspended eviction ok\n");
+
+    {   /* discard the legacy machine */
+        JSValue ret = JS_TTCallResume(ctx, 1, &parked);
+        if (parked)
+            die(ctx, "abort did not complete");
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    JS_FreeValue(ctx, drive_fn);
+    JS_FreeValue(ctx, g);
+    JS_FreeValue(ctx, armX);
+    JS_FreeValue(ctx, armY);
+    JS_FreeValue(ctx, armX2);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    printf("EVICT:teardown ok\n");
+    return 0;
+}
+
+/* drain the (checked-in) flow's live queue; parked job callbacks finish as
+   their own sub-machines. Returns jobs run; *psub counts the parked ones. */
+static int pump_all(JSContext *ctx, JSRuntime *rt, int *psub)
+{
+    int fired = 0;
+    for (;;) {
+        int pk = 0;
+        int r = JS_TTPumpJob(rt, NULL, &pk);
+        if (pk) {
+            int pk2 = 1;
+            while (pk2) {
+                JSValue v = JS_TTCallResume(ctx, 0, &pk2);
+                JS_FreeValue(ctx, v);
+            }
+            if (psub)
+                (*psub)++;
+            fired++;
+            continue;
+        }
+        if (r < 0)
+            die(ctx, "job raised");
+        if (r == 0)
+            break;
+        fired++;
+    }
+    return fired;
+}
+
+static JSValue eval_val(JSContext *ctx, const char *expr)
+{
+    JSValue v = JS_Eval(ctx, expr, strlen(expr), "probe.js",
+                        JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(v))
+        die(ctx, expr);
+    return v;
+}
+
+/* settle an await-suspended arm through ITS OWN cloned resolver (read out
+   of the suspended frame) and pump its queue dry */
+static void settle_arm(JSContext *ctx, JSRuntime *rt, JSValueConst arm,
+                       const char *rname, JSValueConst v, int *psub)
+{
+    JSAtom a = JS_NewAtom(ctx, rname);
+    JSValue r = JS_TTFlowGetLocal(ctx, arm, 0, a);
+    JSValue ret;
+    JS_FreeAtom(ctx, a);
+    if (!JS_IsFunction(ctx, r))
+        die(ctx, "arm resolver not found");
+    ret = JS_Call(ctx, r, JS_UNDEFINED, 1, &v);
+    if (JS_IsException(ret))
+        die(ctx, "settle");
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, r);
+    pump_all(ctx, rt, psub);
+}
+
+/* async flows: per-flow job queues, promise-graph fork, await fork with
+   diverging settles, for-await fork, evict/hydrate with a pending
+   microtask */
+static int cmd_asynctest(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    ParkPlan plan;
+    JSAtom atom_r;
+    int subparks = 0;
+
+    atom_r = JS_NewAtom(ctx, "r");
+    plan.line = baseline_line_of("SINK.push(tag");
+    plan.countdown = 1;
+    plan.parked_line = 0;
+    plan.fork_here = 0;
+    plan.forked = JS_UNDEFINED;
+    JS_TTSetStepHandler(rt, park_handler, &plan);
+    JS_TTSetStepFilename(ctx, "baseline.js");
+
+    /* ---- (a) an async function suspended at `await p` forks; the arms
+       settle p independently and diverge; a .then chained after the await
+       runs as its own parked sub-flow in each arm ---- */
+    {
+        JSValue af_fn = get_global(ctx, "af");
+        JSValue arg = JS_NewInt32(ctx, 7);
+        JSValue g, armA, armB, thenret, sinkfn, sv;
+        g = JS_Call(ctx, af_fn, JS_UNDEFINED, 1, (JSValueConst *)&arg);
+        if (JS_IsException(g))
+            die(ctx, "af()");
+        JS_FreeValue(ctx, af_fn);
+        assert(JS_PromiseState(ctx, g) == JS_PROMISE_PENDING);
+        write_delta(ctx, g);            /* delta through the promise handle */
+        if (JS_TTFlowCheckout(ctx, g))
+            die(ctx, "checkout af");
+        armA = JS_TTFlowFork(ctx, g);
+        if (JS_IsException(armA))
+            die(ctx, "fork armA");
+        armB = JS_TTFlowFork(ctx, g);
+        if (JS_IsException(armB))
+            die(ctx, "fork armB");
+        printf("ASYNC:await-suspended flow forked twice\n");
+
+        /* arm A: its own delta mark, its own observer, its own settle */
+        if (JS_TTFlowCheckin(ctx, armA))
+            die(ctx, "checkin armA");
+        delta_mark(ctx, armA, "cfg-A");
+        sinkfn = eval_val(ctx, "sink('A')");
+        thenret = JS_Invoke(ctx, armA, JS_NewAtom(ctx, "then"), 1,
+                            (JSValueConst *)&sinkfn);
+        if (JS_IsException(thenret))
+            die(ctx, "then armA");
+        JS_FreeValue(ctx, thenret);
+        JS_FreeValue(ctx, sinkfn);
+        plan.countdown = 1;
+        JS_TTEnableStep(rt, 1);         /* the sink handler parks mid-run */
+        sv = JS_NewString(ctx, "ax");
+        settle_arm(ctx, rt, armA, "r", sv, &subparks);
+        JS_FreeValue(ctx, sv);
+        JS_TTEnableStep(rt, 0);
+        assert(JS_PromiseState(ctx, armA) == JS_PROMISE_FULFILLED);
+
+        /* arm B sees the fork-time delta view, not arm A's mark */
+        if (JS_TTFlowCheckin(ctx, armB))
+            die(ctx, "checkin armB");
+        expect_str(ctx, "CONFIG.tag", "cfg-flow",
+                   "armB inherits the fork-time view");
+        delta_mark(ctx, armB, "cfg-B");
+        sinkfn = eval_val(ctx, "sink('B')");
+        thenret = JS_Invoke(ctx, armB, JS_NewAtom(ctx, "then"), 1,
+                            (JSValueConst *)&sinkfn);
+        if (JS_IsException(thenret))
+            die(ctx, "then armB");
+        JS_FreeValue(ctx, thenret);
+        JS_FreeValue(ctx, sinkfn);
+        plan.countdown = 1;
+        JS_TTEnableStep(rt, 1);
+        sv = JS_NewString(ctx, "bx");
+        settle_arm(ctx, rt, armB, "r", sv, &subparks);
+        JS_FreeValue(ctx, sv);
+        JS_TTEnableStep(rt, 0);
+        assert(JS_PromiseState(ctx, armB) == JS_PROMISE_FULFILLED);
+
+        assert(subparks >= 2);          /* one parked sub-flow per arm */
+        expect_str(ctx, "SINK.join('|')",
+                   "A:af7:got=ax:cfg-A|B:af7:got=bx:cfg-B",
+                   "diverging await continuations, isolated deltas, "
+                   "per-arm sub-flows");
+        printf("ASYNC:await fork diverges, deltas isolated, "
+               "%d parked sub-flows\n", subparks);
+
+        JS_FreeValue(ctx, g);           /* parent: still suspended, dropped */
+        JS_FreeValue(ctx, armA);
+        JS_FreeValue(ctx, armB);
+    }
+
+    /* ---- (b) for-await over an async iterator, parked mid-loop, forks;
+       both arms iterate independently ---- */
+    {
+        JSValue ait = eval_val(ctx, "mk_ait()");
+        JSValue loopy_fn = get_global(ctx, "loopy");
+        JSValue lp, bA, bB;
+        JSAtom atom_ait = JS_NewAtom(ctx, "ait");
+        JSAtom atom_feed = JS_NewAtom(ctx, "feed");
+        int k;
+        lp = JS_Call(ctx, loopy_fn, JS_UNDEFINED, 1, (JSValueConst *)&ait);
+        if (JS_IsException(lp))
+            die(ctx, "loopy()");
+        JS_FreeValue(ctx, loopy_fn);
+        assert(JS_PromiseState(ctx, lp) == JS_PROMISE_PENDING);
+        if (JS_TTFlowCheckout(ctx, lp))
+            die(ctx, "checkout loopy");
+        bA = JS_TTFlowFork(ctx, lp);
+        if (JS_IsException(bA))
+            die(ctx, "fork bA");
+        bB = JS_TTFlowFork(ctx, lp);
+        if (JS_IsException(bB))
+            die(ctx, "fork bB");
+        for (k = 0; k < 2; k++) {
+            JSValue arm = k == 0 ? bA : bB;
+            const char *v1 = k == 0 ? "a1" : "b1";
+            const char *v2 = k == 0 ? "a2" : "b2";
+            const char *want = k == 0 ? "a1+a2" : "b1+b2";
+            int step;
+            if (JS_TTFlowCheckin(ctx, arm))
+                die(ctx, "checkin b-arm");
+            for (step = 0; step < 2; step++) {
+                JSValue it = JS_TTFlowGetLocal(ctx, arm, 0, atom_ait);
+                JSValue feed = JS_GetProperty(ctx, it, atom_feed);
+                JSValue res = JS_NewObject(ctx);
+                JSValue ret;
+                if (!JS_IsFunction(ctx, feed))
+                    die(ctx, "arm feed not found");
+                JS_SetPropertyStr(ctx, res, "value",
+                                  JS_NewString(ctx, step ? v2 : v1));
+                JS_SetPropertyStr(ctx, res, "done", JS_NewBool(ctx, 0));
+                ret = JS_Call(ctx, feed, JS_UNDEFINED, 1,
+                              (JSValueConst *)&res);
+                if (JS_IsException(ret))
+                    die(ctx, "feed");
+                JS_FreeValue(ctx, ret);
+                JS_FreeValue(ctx, res);
+                JS_FreeValue(ctx, feed);
+                JS_FreeValue(ctx, it);
+                pump_all(ctx, rt, NULL);
+            }
+            assert(JS_PromiseState(ctx, arm) == JS_PROMISE_FULFILLED);
+            {
+                JSValue rv = JS_PromiseResult(ctx, arm);
+                const char *s = JS_ToCString(ctx, rv);
+                if (strcmp(s, want)) {
+                    fprintf(stderr, "FAIL for-await arm: %s != %s\n", s,
+                            want);
+                    return 1;
+                }
+                JS_FreeCString(ctx, s);
+                JS_FreeValue(ctx, rv);
+            }
+            if (k == 0)
+                assert(JS_PromiseState(ctx, bB) == JS_PROMISE_PENDING);
+        }
+        printf("ASYNC:for-await arms iterate independently\n");
+        JS_FreeAtom(ctx, atom_ait);
+        JS_FreeAtom(ctx, atom_feed);
+        JS_FreeValue(ctx, ait);
+        JS_FreeValue(ctx, lp);
+        JS_FreeValue(ctx, bA);
+        JS_FreeValue(ctx, bB);
+    }
+
+    /* ---- (c) evict an await-suspended flow with a queued microtask to
+       bytes, free, hydrate, pump: byte-identical continuation, the
+       microtask fires exactly once per living copy ---- */
+    {
+        JSValue mf_fn = get_global(ctx, "mf");
+        JSValue mh, tw, h2, sv;
+        uint8_t *eb;
+        size_t el;
+        char res_tw[256], res_h2[256];
+        mh = JS_Call(ctx, mf_fn, JS_UNDEFINED, 0, NULL);
+        if (JS_IsException(mh))
+            die(ctx, "mf()");
+        JS_FreeValue(ctx, mf_fn);
+        if (JS_TTFlowCheckout(ctx, mh))   /* captures the pending micro job */
+            die(ctx, "checkout mf");
+        tw = JS_TTFlowFork(ctx, mh);      /* control twin, queue copied */
+        if (JS_IsException(tw))
+            die(ctx, "fork twin");
+        eb = JS_TTMachineEvict(ctx, mh, &el);
+        if (!eb)
+            die(ctx, "evict mf");
+        printf("ASYNC:await+microtask evicted to %u bytes\n", (unsigned)el);
+        h2 = JS_TTMachineHydrate(ctx, eb, el);
+        if (JS_IsException(h2))
+            die(ctx, "hydrate mf");
+        js_free(ctx, eb);
+
+        if (JS_TTFlowCheckin(ctx, tw))
+            die(ctx, "checkin twin");
+        pump_all(ctx, rt, NULL);          /* the twin's micro fires once */
+        sv = JS_NewString(ctx, "tv");
+        settle_arm(ctx, rt, tw, "r", sv, NULL);
+        JS_FreeValue(ctx, sv);
+        {
+            JSValue rv = JS_PromiseResult(ctx, tw);
+            const char *s = JS_ToCString(ctx, rv);
+            snprintf(res_tw, sizeof(res_tw), "%s", s ? s : "?");
+            JS_FreeCString(ctx, s);
+            JS_FreeValue(ctx, rv);
+        }
+        if (JS_TTFlowCheckin(ctx, h2))
+            die(ctx, "checkin hydrated");
+        pump_all(ctx, rt, NULL);          /* the hydrated micro fires once */
+        sv = JS_NewString(ctx, "tv");
+        settle_arm(ctx, rt, h2, "r", sv, NULL);
+        JS_FreeValue(ctx, sv);
+        {
+            JSValue rv = JS_PromiseResult(ctx, h2);
+            const char *s = JS_ToCString(ctx, rv);
+            snprintf(res_h2, sizeof(res_h2), "%s", s ? s : "?");
+            JS_FreeCString(ctx, s);
+            JS_FreeValue(ctx, rv);
+        }
+        printf("ASYNC:twin=%s hydrated=%s\n", res_tw, res_h2);
+        assert(strcmp(res_tw, res_h2) == 0);
+        assert(strcmp(res_tw, "mf:got=tv") == 0);
+        /* two living copies ran, one micro each; the evicted original's
+           captured job was serialized then freed unfired */
+        expect_str(ctx, "MLOG.join(',')", "micro:m,micro:m",
+                   "the microtask fired exactly once per copy");
+        printf("ASYNC:evict/hydrate continuation byte-identical, "
+               "microtask fired once\n");
+        JS_FreeValue(ctx, mh);
+        JS_FreeValue(ctx, tw);
+        JS_FreeValue(ctx, h2);
+    }
+
+    JS_FreeAtom(ctx, atom_r);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);       /* the leak oracle */
+    printf("ASYNC:teardown ok\n");
+    return 0;
+}
+
+/* one next(arg) on a generator flow, its .value stringified into buf */
+static void next_str(JSContext *ctx, JSValueConst g, JSValueConst arg,
+                     char *buf, size_t cap)
+{
+    JSValue r = JS_Invoke(ctx, (JSValue)g, JS_NewAtom(ctx, "next"), 1,
+                          (JSValueConst *)&arg);
+    JSValue val;
+    const char *s;
+    if (JS_IsException(r))
+        die(ctx, "next(arg)");
+    val = JS_GetPropertyStr(ctx, r, "value");
+    s = JS_ToCString(ctx, val);
+    snprintf(buf, cap, "%s", s ? s : "?");
+    JS_FreeCString(ctx, s);
+    JS_FreeValue(ctx, val);
+    JS_FreeValue(ctx, r);
+}
+
+/* automatic transparent COW: ordinary program writes to shared objects
+   are captured per flow -- no host DeltaWrite calls anywhere below */
+static int cmd_cowtest(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    JSValue g, armA, armB, h, feed;
+    uint8_t *bytes;
+    size_t blen;
+    void *shobj_ptr;
+    char out[512];
+
+    {   /* start cowflow to its "ready" yield */
+        JSValue fn = get_global(ctx, "cowflow");
+        g = JS_Call(ctx, fn, JS_UNDEFINED, 0, NULL);
+        if (JS_IsException(g))
+            die(ctx, "cowflow()");
+        JS_FreeValue(ctx, fn);
+        next_str(ctx, g, JS_UNDEFINED, out, sizeof(out));
+        assert(strcmp(out, "ready") == 0);
+    }
+    {
+        JSValue o = eval_val(ctx, "SHOBJ");
+        shobj_ptr = JS_VALUE_GET_PTR(o);
+        JS_FreeValue(ctx, o);
+    }
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout");
+    armA = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(armA))
+        die(ctx, "fork armA");
+    armB = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(armB))
+        die(ctx, "fork armB");
+
+    /* arm A writes shared state in ORDINARY program code */
+    if (JS_TTFlowCheckin(ctx, armA))
+        die(ctx, "checkin armA");
+    feed = JS_NewInt32(ctx, 1);
+    next_str(ctx, armA, feed, out, sizeof(out));
+    assert(strcmp(out, "wrote:11:arm1:1") == 0);
+    expect_str(ctx, "SHOBJ.x", "11", "armA view live");
+    expect_str(ctx, "SHARR.join(',')", "arm1", "armA array view");
+    {   /* shared identity: the very same object, isolated value */
+        JSValue o = eval_val(ctx, "SHOBJ");
+        assert(JS_VALUE_GET_PTR(o) == shobj_ptr);
+        JS_FreeValue(ctx, o);
+    }
+    assert(JS_TTFlowDeltaCount(ctx, armA) == 3);  /* SHOBJ, SHARR, SHP */
+    {   /* dedup: a second write to a captured cell allocates NOTHING */
+        JSMemoryUsage m0, m1;
+        JSValue shobj = eval_val(ctx, "SHOBJ");
+        JS_ComputeMemoryUsage(rt, &m0);
+        JS_SetPropertyStr(ctx, shobj, "x", JS_NewInt32(ctx, 11));
+        JS_ComputeMemoryUsage(rt, &m1);
+        assert(m1.malloc_count == m0.malloc_count);
+        assert(JS_TTFlowDeltaCount(ctx, armA) == 3);
+        JS_FreeValue(ctx, shobj);
+    }
+    if (JS_TTFlowCheckout(ctx, armA))
+        die(ctx, "checkout armA");
+    expect_str(ctx, "SHOBJ.x", "0", "baseline pristine after armA");
+    expect_str(ctx, "SHARR.length", "0", "baseline array pristine");
+    printf("COW:armA isolated, baseline pristine, dedup alloc-free\n");
+
+    /* arm B: only its own writes, blind to armA's */
+    if (JS_TTFlowCheckin(ctx, armB))
+        die(ctx, "checkin armB");
+    feed = JS_NewInt32(ctx, 2);
+    next_str(ctx, armB, feed, out, sizeof(out));
+    assert(strcmp(out, "wrote:12:arm2:1") == 0);
+    if (JS_TTFlowCheckout(ctx, armB))
+        die(ctx, "checkout armB");
+    expect_str(ctx, "SHOBJ.x", "0", "baseline pristine after armB");
+    expect_str(ctx, "SHARR.length", "0", "baseline array pristine 2");
+    printf("COW:armB isolated from armA\n");
+
+    /* auto-captured delta round-trips the wire: PROP + ARRAY + PROMISE */
+    bytes = JS_TTFlowSerialize(ctx, armB, &blen);
+    if (!bytes)
+        die(ctx, "serialize armB");
+    printf("COW:armB auto-delta -> %u bytes\n", (unsigned)blen);
+    h = JS_TTFlowDeserialize(ctx, bytes, blen);
+    if (JS_IsException(h))
+        die(ctx, "hydrate armB");
+    js_free(ctx, bytes);
+    JS_FreeValue(ctx, armB);          /* the hydrated copy takes its place */
+    if (JS_TTFlowCheckin(ctx, h))
+        die(ctx, "checkin h");
+    expect_str(ctx, "SHOBJ.x", "12", "hydrated auto-delta view");
+    expect_str(ctx, "SHARR.join(',')", "arm2", "hydrated array view");
+    if (JS_TTFlowCheckout(ctx, h))
+        die(ctx, "checkout h");
+    expect_str(ctx, "SHOBJ.x", "0", "pristine after hydrated view");
+    printf("COW:auto-captured delta round-tripped\n");
+
+    /* the promise oracle: both arms hold a .then on baseline SHP; each
+       settle fires ONLY that arm's reaction (reaction lists, the settled
+       state, and the capability's resolved flag all ride the delta) */
+    if (JS_TTFlowCheckin(ctx, armA))
+        die(ctx, "checkin armA 2");
+    JS_FreeValue(ctx, eval_val(ctx, "SHP_RES('sv')"));
+    pump_all(ctx, rt, NULL);
+    expect_str(ctx, "SINK.join(',')", "p1:sv", "armA ran only its reaction");
+    if (JS_TTFlowCheckout(ctx, armA))
+        die(ctx, "checkout armA 2");
+    expect_str(ctx, "SINK.length", "0", "SINK pristine between arms");
+    if (JS_TTFlowCheckin(ctx, h))
+        die(ctx, "checkin h 2");
+    JS_FreeValue(ctx, eval_val(ctx, "SHP_RES('sw')"));
+    pump_all(ctx, rt, NULL);
+    expect_str(ctx, "SINK.join(',')", "p2:sw", "h ran only its reaction");
+    if (JS_TTFlowCheckout(ctx, h))
+        die(ctx, "checkout h 2");
+    expect_str(ctx, "SINK.length", "0", "SINK pristine at the end");
+    printf("COW:per-arm promise reactions (the #4 oracle)\n");
+
+    /* completion while checked in commits; the last commit wins */
+    if (JS_TTFlowCheckin(ctx, armA))
+        die(ctx, "checkin armA 3");
+    feed = JS_NewString(ctx, "za");
+    next_str(ctx, armA, feed, out, sizeof(out));
+    JS_FreeValue(ctx, feed);
+    assert(strcmp(out, "done:11:za") == 0);
+    if (JS_TTFlowCheckin(ctx, h))
+        die(ctx, "checkin h 3");
+    feed = JS_NewString(ctx, "zb");
+    next_str(ctx, h, feed, out, sizeof(out));
+    JS_FreeValue(ctx, feed);
+    assert(strcmp(out, "done:12:zb") == 0);
+    expect_str(ctx, "SHOBJ.x", "12", "last commit wins");
+    expect_str(ctx, "SHARR.join(',')", "arm2", "last array commit wins");
+    printf("COW:completion commits\n");
+
+    JS_FreeValue(ctx, g);
+    JS_FreeValue(ctx, armA);
+    JS_FreeValue(ctx, h);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);       /* the leak oracle */
+    printf("COW:teardown ok\n");
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc >= 3 && !strcmp(argv[1], "emit"))
+        return cmd_emit(argv[2]);
+    if (argc >= 3 && !strcmp(argv[1], "resume"))
+        return cmd_resume(argv[2]);
+    if (argc >= 3 && !strcmp(argv[1], "emit2"))
+        return cmd_emit2(argv[2]);
+    if (argc >= 3 && !strcmp(argv[1], "resume2"))
+        return cmd_resume2(argv[2]);
+    if (argc >= 2 && !strcmp(argv[1], "selftest"))
+        return cmd_selftest();
+    if (argc >= 2 && !strcmp(argv[1], "forktest"))
+        return cmd_forktest();
+    if (argc >= 2 && !strcmp(argv[1], "forkhere"))
+        return cmd_forkhere();
+    if (argc >= 2 && !strcmp(argv[1], "mass"))
+        return cmd_mass();
+    if (argc >= 2 && !strcmp(argv[1], "deep"))
+        return cmd_deep();
+    if (argc >= 2 && !strcmp(argv[1], "evict"))
+        return cmd_evict();
+    if (argc >= 2 && !strcmp(argv[1], "asynctest"))
+        return cmd_asynctest();
+    if (argc >= 2 && !strcmp(argv[1], "cowtest"))
+        return cmd_cowtest();
+    fprintf(stderr, "usage: flow-harness emit|resume <file> | selftest\n");
+    return 2;
+}

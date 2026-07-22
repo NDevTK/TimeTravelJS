@@ -985,6 +985,90 @@ JSValue JS_TTGlobalLexicals(JSContext *ctx);
 void JS_TTResetExecState(JSContext *ctx);
 /* Rebind a live frame local/argument/closure capture. TRUE if found. */
 JS_BOOL JS_TTSetLocal(JSContext *ctx, int level, JSAtom name, JSValueConst value);
+
+/* TimeTravelJS flow serialization: transplant a suspended flow (generator
+   flow: base JSAsyncFunctionState + parked frame chain + per-flow COW delta)
+   into a fresh process that rebuilt the same baseline.
+   Contract: both processes evaluate identical baseline code, then call
+   JS_TTBaselineCapture() (deterministic BFS registration, so ids agree);
+   flows serialize against those ids. Baseline objects travel by id (a
+   baseline object shared by N flows is never copied); everything else
+   reachable from the flow travels by value. */
+int JS_TTBaselineCapture(JSContext *ctx);
+int JS_TTBaselineCaptureRoots(JSContext *ctx, JSValueConst *roots, int count);
+void JS_TTBaselineFree(JSRuntime *rt);
+uint32_t JS_TTBaselineCount(JSRuntime *rt);
+uint64_t JS_TTBaselineFingerprint(JSRuntime *rt);
+/* serialize a suspended flow (generator object handle); js_malloc'd bytes */
+uint8_t *JS_TTFlowSerialize(JSContext *ctx, JSValueConst flow, size_t *plen);
+/* rebuild a flow from bytes in the runtime owning the captured baseline */
+JSValue JS_TTFlowDeserialize(JSContext *ctx, const uint8_t *buf, size_t len);
+/* resume a flow suspended as a per-flow parked machine (deserialized while
+   mid-call, or created by JS_TTForkHere): completes the interrupted
+   next(). Each such flow owns its machine (its own frame arena), so any
+   number of parked machines coexist in one runtime and resume in any
+   order. cmd 0 continues, cmd 1 aborts (unwinds + completes the flow).
+   *pdone: 0 yield, 1 done, 2 yield* value; *pparked: a step handler
+   re-parked the machine back into its handle. Afterwards the flow is an
+   ordinary suspended generator. */
+JSValue JS_TTFlowResumeParked(JSContext *ctx, JSValueConst flow, int cmd,
+                              int *pdone, int *pparked);
+/* TRUE if the flow holds a parked machine (JS_TTFlowResumeParked applies,
+   or JS_TTCallResume for the legacy host-entered machine). */
+JS_BOOL JS_TTFlowParked(JSContext *ctx, JSValueConst flow);
+/* fork a suspended flow into a concurrent sibling in the same runtime:
+   baseline objects are shared (by reference), all flow-private state --
+   states, parked frames, closures, cells, the COW delta -- deep-copies,
+   so both flows resume and diverge independently. Machine-parked flows
+   clone their parked chain into the sibling's own arena (an independently
+   suspended machine). Requires the flow checked out; the sibling arrives
+   checked out. */
+JSValue JS_TTFlowFork(JSContext *ctx, JSValueConst flow);
+/* fork the RUNNING machine at the current opcode; callable only from
+   inside the step handler. Returns the fork-arm: an independently
+   suspended machine handle resuming from this very opcode via
+   JS_TTFlowResumeParked. The continue-arm is the running machine itself
+   (handler returns 0 to run on, 2 to park; resume with JS_TTCallResume).
+   OP_if_true on an unknown: both arms run. */
+JSValue JS_TTForkHere(JSContext *ctx);
+/* rebind a local in a suspended flow's frames (level 0 = the frame the
+   flow executes next: a machine's parked innermost frame or the suspended
+   yield/await frame); the flow-handle twin of JS_TTSetLocal. Flow handles
+   are generator objects, or -- for async-function flows -- the function's
+   RESULT PROMISE. */
+JS_BOOL JS_TTFlowSetLocal(JSContext *ctx, JSValueConst flow, int level,
+                          JSAtom name, JSValueConst value);
+/* read a live frame local out of a suspended flow (JS_UNDEFINED when not
+   found): how a host reaches a forked arm's own resolver or iterator to
+   settle that arm's awaits independently. */
+JSValue JS_TTFlowGetLocal(JSContext *ctx, JSValueConst flow, int level,
+                          JSAtom name);
+/* storage footprint of a flow's suspended machine: *pused = bytes its
+   parked chain's arena frames occupy, *preserved = RAM held for them
+   (demand-grown segments track used: N machines cost the sum of their
+   chain depths, not N fixed slabs), *psegments = segment count.
+   Returns 0, or -1 (no exception) when the flow holds no machine. */
+int JS_TTFlowMachineStats(JSContext *ctx, JSValueConst flow, size_t *pused,
+                          size_t *preserved, int *psegments);
+/* cold eviction: serialize a suspended machine (chain + private graph +
+   COW delta) to js_malloc'd bytes and free its RAM -- the handle becomes
+   a completed husk. Hydrate rebuilds a live suspended machine from those
+   bytes (here or in any runtime with the identically rebuilt baseline);
+   resume with JS_TTFlowResumeParked / next() as before. Requires the
+   flow checked out; the live legacy machine refuses. */
+uint8_t *JS_TTMachineEvict(JSContext *ctx, JSValueConst flow, size_t *plen);
+JSValue JS_TTMachineHydrate(JSContext *ctx, const uint8_t *buf, size_t len);
+/* per-flow COW delta: record-once first-write against a baseline property
+   or closure cell, then write through; checkout parks the flow's view
+   (baseline shows pristine values), checkin installs it. Pure swaps. */
+int JS_TTFlowDeltaWriteProp(JSContext *ctx, JSValueConst flow,
+                            JSValueConst obj, JSAtom prop, JSValueConst val);
+int JS_TTFlowDeltaWriteCell(JSContext *ctx, JSValueConst flow,
+                            JSValueConst func_obj, int cv_idx,
+                            JSValueConst val);
+int JS_TTFlowCheckout(JSContext *ctx, JSValueConst flow);
+int JS_TTFlowCheckin(JSContext *ctx, JSValueConst flow);
+int JS_TTFlowDeltaCount(JSContext *ctx, JSValueConst flow);
 /* select which debug info is stripped from the compiled code */
 #define JS_STRIP_SOURCE (1 << 0) /* strip source code */
 #define JS_STRIP_DEBUG  (1 << 1) /* strip all debug info including source code */
