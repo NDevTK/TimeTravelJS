@@ -183,7 +183,8 @@ enum {
     JS_CLASS_ASYNC_GENERATOR,   /* u.async_generator_data */
     JS_CLASS_WEAK_REF,
     JS_CLASS_FINALIZATION_REGISTRY,
-    
+    JS_CLASS_TT_TAGGED,         /* u.tt_tagged (TimeTravelJS tagged value) */
+
     JS_CLASS_INIT_COUNT, /* last entry for predefined classes */
 };
 
@@ -448,6 +449,15 @@ struct JSRuntime {
     /* TimeTravelJS flow serialization: the shared-baseline registry giving
        every baseline heap entity a process-stable id (NULL until captured) */
     struct TTFlowBaseline *tt_flow_baseline;
+    /* TimeTravelJS tagged values: host note lifecycle hooks (all optional;
+       a non-NULL note refuses fork/wire loudly when the hook it needs is
+       missing, and is simply not freed without a free hook) */
+    JSTTNoteCloneFn *tt_note_clone;
+    JSTTNoteSerializeFn *tt_note_serialize;
+    JSTTNoteDeserializeFn *tt_note_deserialize;
+    JSTTNoteFreeFn *tt_note_free;
+    /* tagged-value propagation: derive a result note from operand notes */
+    JSTTCombineFn *tt_combine;
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
@@ -1267,9 +1277,35 @@ struct JSObject {
         } array;    /* 12/20 bytes */
         JSRegExp regexp;    /* JS_CLASS_REGEXP: 8/16 bytes */
         JSValue object_data;    /* for JS_SetObjectData(): 8/16/16 bytes */
+        struct { /* JS_CLASS_TT_TAGGED: a concrete payload plus an opaque
+                    host annotation riding fork/wire/free via the runtime's
+                    note hooks */
+            JSValue payload;
+            void *note;
+        } tt_tagged;
         JSGlobalObject global_object;
     } u;
 };
+
+/* TimeTravelJS: TRUE if v is a tagged value (payload + host note). The
+   gate every propagation chokepoint tests -- two loads on values that
+   are already off the numeric fast paths. */
+static inline BOOL tt_value_is_tagged(JSValueConst v)
+{
+    return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(v)->class_id == JS_CLASS_TT_TAGGED;
+}
+
+/* derive a propagated result's note from the operand notes (NULL without
+   a combine hook: the result is still tagged, just note-less) */
+static inline void *tt_combine_note(JSContext *ctx, int tt_op,
+                                    JSValueConst *args, void **notes, int n)
+{
+    JSTTCombineFn *fn = ctx->rt->tt_combine;
+    if (!fn)
+        return NULL;
+    return fn(ctx, tt_op, args, notes, n);
+}
 
 typedef struct JSMapRecord {
     int ref_count; /* used during enumeration to avoid freeing the record */
@@ -1383,6 +1419,8 @@ static void js_mapped_arguments_finalizer(JSRuntime *rt, JSValue val);
 static void js_mapped_arguments_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 static void js_object_data_finalizer(JSRuntime *rt, JSValue val);
 static void js_object_data_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
+static void js_tt_tagged_finalizer(JSRuntime *rt, JSValue val);
+static void js_tt_tagged_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 static void js_c_function_finalizer(JSRuntime *rt, JSValue val);
 static void js_c_function_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 static void js_bytecode_function_finalizer(JSRuntime *rt, JSValue val);
@@ -2260,6 +2298,10 @@ static JSClassShortDef const js_std_class_def[] = {
     { JS_ATOM_Object, NULL, NULL }, /* JS_CLASS_RAWJSON */
 };
 
+static JSClassShortDef const js_tt_tagged_class_def[] = {
+    { JS_ATOM_TTTagged, js_tt_tagged_finalizer, js_tt_tagged_mark }, /* JS_CLASS_TT_TAGGED */
+};
+
 static int init_class_range(JSRuntime *rt, JSClassShortDef const *tab,
                             int start, int count)
 {
@@ -2341,6 +2383,11 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     /* create the object, array and function classes */
     if (init_class_range(rt, js_std_class_def, JS_CLASS_OBJECT,
                          countof(js_std_class_def)) < 0)
+        goto fail;
+    /* tagged values are host-made (JS_TTMakeTagged), so the class exists in
+       every runtime rather than behind an intrinsic init */
+    if (init_class_range(rt, js_tt_tagged_class_def, JS_CLASS_TT_TAGGED,
+                         countof(js_tt_tagged_class_def)) < 0)
         goto fail;
     rt->class_array[JS_CLASS_ARGUMENTS].exotic = &js_arguments_exotic_methods;
     rt->class_array[JS_CLASS_MAPPED_ARGUMENTS].exotic = &js_arguments_exotic_methods;
@@ -5291,10 +5338,14 @@ static JSValue js_rebalancee_string_rope(JSContext *ctx, JSValueConst rope)
 
 /* op1 and op2 are converted to strings. For convenience, op1 or op2 =
    JS_EXCEPTION are accepted and return JS_EXCEPTION.  */
+static JSValue tt_tagged_concat(JSContext *ctx, JSValue op1, JSValue op2);
+
 static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2)
 {
     JSString *p1, *p2;
 
+    if (unlikely(tt_value_is_tagged(op1) || tt_value_is_tagged(op2)))
+        return tt_tagged_concat(ctx, op1, op2);
     if (unlikely(JS_VALUE_GET_TAG(op1) != JS_TAG_STRING &&
                  JS_VALUE_GET_TAG(op1) != JS_TAG_STRING_ROPE)) {
         op1 = JS_ToStringFree(ctx, op1);
@@ -5366,6 +5417,43 @@ static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2)
         }
     }
     return js_new_string_rope(ctx, op1, op2);
+}
+
+/* TimeTravelJS tagged-value propagation through concatenation (the
+   template-literal engine funnels here via String.prototype.concat, and
+   so does '+' once js_add_slow picks the string branch): unwrap each
+   operand's payload, run the engine's own JS_ConcatString on the
+   concretes, re-wrap the real result with a Combine-derived note. */
+static JSValue tt_tagged_concat(JSContext *ctx, JSValue op1, JSValue op2)
+{
+    JSValueConst args[2];
+    JSValue stk[2], res, wrapped;
+    void *notes[2], *note;
+    int i;
+
+    args[0] = op1;
+    args[1] = op2;
+    for (i = 0; i < 2; i++) {
+        if (tt_value_is_tagged(args[i])) {
+            JSObject *p = JS_VALUE_GET_OBJ(args[i]);
+            stk[i] = JS_DupValue(ctx, p->u.tt_tagged.payload);
+            notes[i] = p->u.tt_tagged.note;
+        } else {
+            stk[i] = JS_DupValue(ctx, args[i]);
+            notes[i] = NULL;
+        }
+    }
+    res = JS_ConcatString(ctx, stk[0], stk[1]);
+    if (JS_IsException(res)) {
+        JS_FreeValue(ctx, op1);
+        JS_FreeValue(ctx, op2);
+        return JS_EXCEPTION;
+    }
+    note = tt_combine_note(ctx, JS_TT_OP_CONCAT, args, notes, 2);
+    wrapped = JS_TTMakeTagged(ctx, res, note);
+    JS_FreeValue(ctx, op1);
+    JS_FreeValue(ctx, op2);
+    return wrapped;
 }
 
 /* Shape support */
@@ -5961,6 +6049,11 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     case JS_CLASS_BIG_INT:
         p->u.object_data = JS_UNDEFINED;
         goto set_exotic;
+    case JS_CLASS_TT_TAGGED:
+        /* mark/finalizer-safe from birth */
+        p->u.tt_tagged.payload = JS_UNDEFINED;
+        p->u.tt_tagged.note = NULL;
+        break;
     case JS_CLASS_REGEXP:
         p->u.regexp.pattern = NULL;
         p->u.regexp.bytecode = NULL;
@@ -6463,6 +6556,25 @@ static void js_object_data_finalizer(JSRuntime *rt, JSValue val)
     JSObject *p = JS_VALUE_GET_OBJ(val);
     JS_FreeValueRT(rt, p->u.object_data);
     p->u.object_data = JS_UNDEFINED;
+}
+
+static void js_tt_tagged_finalizer(JSRuntime *rt, JSValue val)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    if (p->u.tt_tagged.note) {
+        if (rt->tt_note_free)
+            rt->tt_note_free(rt, p->u.tt_tagged.note);
+        p->u.tt_tagged.note = NULL;
+    }
+    JS_FreeValueRT(rt, p->u.tt_tagged.payload);
+    p->u.tt_tagged.payload = JS_UNDEFINED;
+}
+
+static void js_tt_tagged_mark(JSRuntime *rt, JSValueConst val,
+                              JS_MarkFunc *mark_func)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    JS_MarkValue(rt, p->u.tt_tagged.payload, mark_func);
 }
 
 static void js_object_data_mark(JSRuntime *rt, JSValueConst val,
@@ -15343,6 +15455,29 @@ int JS_ToBigInt64(JSContext *ctx, int64_t *pres, JSValueConst val)
     return JS_ToBigInt64Free(ctx, pres, JS_DupValue(ctx, val));
 }
 
+/* TimeTravelJS tagged-value propagation through the value-op slow paths.
+   Every fast guard in the dispatch loop is tag-exact (INT/FLOAT64/STRING/
+   SHORT_BIG_INT), so a tagged operand -- a heap object -- always reaches
+   these helpers; the intercepts at their tops unwrap each operand's
+   payload, re-enter the SAME helper on the concretes (the engine's own
+   operation, never a re-implementation), and re-wrap the real result
+   with a Combine-derived note. A throwing concrete op propagates
+   untouched. The runner kinds parameterize one shared binary core over
+   the helpers' differing signatures. */
+enum {
+    TT_TAGRUN_ADD,            /* js_add_slow */
+    TT_TAGRUN_ARITH,          /* js_binary_arith_slow */
+    TT_TAGRUN_LOGIC,          /* js_binary_logic_slow */
+    TT_TAGRUN_SHR,            /* js_shr_slow */
+    TT_TAGRUN_REL,            /* js_relational_slow */
+    TT_TAGRUN_EQ,             /* js_eq_slow */
+};
+static int tt_tagged_binary(JSContext *ctx, JSValue *sp, int kind, int arg,
+                            int tt_op);
+static int tt_tagged_unary(JSContext *ctx, JSValue *sp, int is_not,
+                           OPCodeEnum op);
+static int tt_tagged_post_inc(JSContext *ctx, JSValue *sp, OPCodeEnum op);
+
 static no_inline __exception int js_unary_arith_slow(JSContext *ctx,
                                                      JSValue *sp,
                                                      OPCodeEnum op)
@@ -15353,6 +15488,8 @@ static no_inline __exception int js_unary_arith_slow(JSContext *ctx,
     JSBigIntBuf buf1;
     JSBigInt *p1;
 
+    if (unlikely(tt_value_is_tagged(sp[-1])))
+        return tt_tagged_unary(ctx, sp, FALSE, op);
     op1 = sp[-1];
     /* fast path for float64 */
     if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)))
@@ -15488,6 +15625,8 @@ static __exception int js_post_inc_slow(JSContext *ctx,
 {
     JSValue op1;
 
+    if (unlikely(tt_value_is_tagged(sp[-1])))
+        return tt_tagged_post_inc(ctx, sp, op);
     /* XXX: allow custom operators */
     op1 = sp[-1];
     op1 = JS_ToNumericFree(ctx, op1);
@@ -15504,6 +15643,8 @@ static no_inline int js_not_slow(JSContext *ctx, JSValue *sp)
 {
     JSValue op1;
 
+    if (unlikely(tt_value_is_tagged(sp[-1])))
+        return tt_tagged_unary(ctx, sp, TRUE, OP_not);
     op1 = sp[-1];
     op1 = JS_ToNumericFree(ctx, op1);
     if (JS_IsException(op1))
@@ -15536,6 +15677,8 @@ static no_inline __exception int js_binary_arith_slow(JSContext *ctx, JSValue *s
     uint32_t tag1, tag2;
     double d1, d2;
 
+    if (unlikely(tt_value_is_tagged(sp[-2]) || tt_value_is_tagged(sp[-1])))
+        return tt_tagged_binary(ctx, sp, TT_TAGRUN_ARITH, op, 0);
     op1 = sp[-2];
     op2 = sp[-1];
     tag1 = JS_VALUE_GET_NORM_TAG(op1);
@@ -15726,6 +15869,8 @@ static no_inline __exception int js_add_slow(JSContext *ctx, JSValue *sp)
     JSValue op1, op2;
     uint32_t tag1, tag2;
 
+    if (unlikely(tt_value_is_tagged(sp[-2]) || tt_value_is_tagged(sp[-1])))
+        return tt_tagged_binary(ctx, sp, TT_TAGRUN_ADD, 0, JS_TT_OP_ADD);
     op1 = sp[-2];
     op2 = sp[-1];
 
@@ -15844,6 +15989,8 @@ static no_inline __exception int js_binary_logic_slow(JSContext *ctx,
     uint32_t tag1, tag2;
     uint32_t v1, v2, r;
 
+    if (unlikely(tt_value_is_tagged(sp[-2]) || tt_value_is_tagged(sp[-1])))
+        return tt_tagged_binary(ctx, sp, TT_TAGRUN_LOGIC, op, 0);
     op1 = sp[-2];
     op2 = sp[-1];
     tag1 = JS_VALUE_GET_NORM_TAG(op1);
@@ -16097,6 +16244,8 @@ static no_inline int js_relational_slow(JSContext *ctx, JSValue *sp,
     int res;
     uint32_t tag1, tag2;
 
+    if (unlikely(tt_value_is_tagged(sp[-2]) || tt_value_is_tagged(sp[-1])))
+        return tt_tagged_binary(ctx, sp, TT_TAGRUN_REL, op, 0);
     op1 = sp[-2];
     op2 = sp[-1];
     tag1 = JS_VALUE_GET_NORM_TAG(op1);
@@ -16243,6 +16392,9 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
     int res;
     uint32_t tag1, tag2;
 
+    if (unlikely(tt_value_is_tagged(sp[-2]) || tt_value_is_tagged(sp[-1])))
+        return tt_tagged_binary(ctx, sp, TT_TAGRUN_EQ, is_neq,
+                                is_neq ? JS_TT_OP_NEQ : JS_TT_OP_EQ);
     op1 = sp[-2];
     op2 = sp[-1];
  redo:
@@ -16364,6 +16516,8 @@ static no_inline int js_shr_slow(JSContext *ctx, JSValue *sp)
     JSValue op1, op2;
     uint32_t v1, v2, r;
 
+    if (unlikely(tt_value_is_tagged(sp[-2]) || tt_value_is_tagged(sp[-1])))
+        return tt_tagged_binary(ctx, sp, TT_TAGRUN_SHR, 0, JS_TT_OP_SHR);
     op1 = sp[-2];
     op2 = sp[-1];
     op1 = JS_ToNumericFree(ctx, op1);
@@ -16393,6 +16547,175 @@ static no_inline int js_shr_slow(JSContext *ctx, JSValue *sp)
     return 0;
  exception:
     sp[-2] = JS_UNDEFINED;
+    sp[-1] = JS_UNDEFINED;
+    return -1;
+}
+
+/* the public JS_TT_OP_* code for an operator opcode */
+static int tt_tt_opcode(OPCodeEnum op)
+{
+    switch(op) {
+    case OP_add:      return JS_TT_OP_ADD;
+    case OP_sub:      return JS_TT_OP_SUB;
+    case OP_mul:      return JS_TT_OP_MUL;
+    case OP_div:      return JS_TT_OP_DIV;
+    case OP_mod:      return JS_TT_OP_MOD;
+    case OP_pow:      return JS_TT_OP_POW;
+    case OP_plus:     return JS_TT_OP_PLUS;
+    case OP_neg:      return JS_TT_OP_NEG;
+    case OP_inc:
+    case OP_post_inc: return JS_TT_OP_INC;
+    case OP_dec:
+    case OP_post_dec: return JS_TT_OP_DEC;
+    case OP_shl:      return JS_TT_OP_SHL;
+    case OP_sar:      return JS_TT_OP_SAR;
+    case OP_shr:      return JS_TT_OP_SHR;
+    case OP_and:      return JS_TT_OP_AND;
+    case OP_or:       return JS_TT_OP_OR;
+    case OP_xor:      return JS_TT_OP_XOR;
+    case OP_not:      return JS_TT_OP_NOT;
+    case OP_lt:       return JS_TT_OP_LT;
+    case OP_lte:      return JS_TT_OP_LTE;
+    case OP_gt:       return JS_TT_OP_GT;
+    case OP_gte:      return JS_TT_OP_GTE;
+    default:          return 0;
+    }
+}
+
+/* the shared binary core: unwrap payloads, re-enter the SAME slow helper
+   on the concretes, re-wrap the real result. Mirrors the helpers' stack
+   contract exactly: consumes sp[-2..-1], result in sp[-2], both slots
+   UNDEFINED on exception. */
+static int tt_tagged_binary(JSContext *ctx, JSValue *sp, int kind, int arg,
+                            int tt_op)
+{
+    JSValueConst args[2];
+    JSValue stk[2], wrapped;
+    void *notes[2], *note;
+    int i, ret;
+
+    args[0] = sp[-2];
+    args[1] = sp[-1];
+    for (i = 0; i < 2; i++) {
+        if (tt_value_is_tagged(args[i])) {
+            JSObject *p = JS_VALUE_GET_OBJ(args[i]);
+            stk[i] = JS_DupValue(ctx, p->u.tt_tagged.payload);
+            notes[i] = p->u.tt_tagged.note;
+        } else {
+            stk[i] = JS_DupValue(ctx, args[i]);
+            notes[i] = NULL;
+        }
+    }
+    switch(kind) {
+    case TT_TAGRUN_ADD:
+        ret = js_add_slow(ctx, stk + 2);
+        break;
+    case TT_TAGRUN_ARITH:
+        ret = js_binary_arith_slow(ctx, stk + 2, arg);
+        tt_op = tt_tt_opcode(arg);
+        break;
+    case TT_TAGRUN_LOGIC:
+        ret = js_binary_logic_slow(ctx, stk + 2, arg);
+        tt_op = tt_tt_opcode(arg);
+        break;
+    case TT_TAGRUN_SHR:
+        ret = js_shr_slow(ctx, stk + 2);
+        break;
+    case TT_TAGRUN_REL:
+        ret = js_relational_slow(ctx, stk + 2, arg);
+        tt_op = tt_tt_opcode(arg);
+        break;
+    default:
+    case TT_TAGRUN_EQ:
+        ret = js_eq_slow(ctx, stk + 2, arg);
+        break;
+    }
+    if (ret)
+        goto fail;                /* the helper consumed and reset stk */
+    note = tt_combine_note(ctx, tt_op, args, notes, 2);
+    wrapped = JS_TTMakeTagged(ctx, stk[0], note);
+    if (JS_IsException(wrapped))
+        goto fail;
+    JS_FreeValue(ctx, sp[-2]);
+    JS_FreeValue(ctx, sp[-1]);
+    sp[-2] = wrapped;
+    sp[-1] = JS_UNDEFINED;
+    return 0;
+ fail:
+    JS_FreeValue(ctx, sp[-2]);
+    JS_FreeValue(ctx, sp[-1]);
+    sp[-2] = JS_UNDEFINED;
+    sp[-1] = JS_UNDEFINED;
+    return -1;
+}
+
+/* the unary twin (OP_plus/neg/inc/dec via js_unary_arith_slow; bitwise ~
+   via js_not_slow): consumes sp[-1], result in sp[-1]. */
+static int tt_tagged_unary(JSContext *ctx, JSValue *sp, int is_not,
+                           OPCodeEnum op)
+{
+    JSValueConst args[1];
+    JSValue stk[1], wrapped;
+    void *notes[1], *note;
+    JSObject *p;
+    int ret;
+
+    args[0] = sp[-1];
+    p = JS_VALUE_GET_OBJ(args[0]);
+    notes[0] = p->u.tt_tagged.note;
+    stk[0] = JS_DupValue(ctx, p->u.tt_tagged.payload);
+    if (is_not)
+        ret = js_not_slow(ctx, stk + 1);
+    else
+        ret = js_unary_arith_slow(ctx, stk + 1, op);
+    if (ret)
+        goto fail;
+    note = tt_combine_note(ctx, tt_tt_opcode(op), args, notes, 1);
+    wrapped = JS_TTMakeTagged(ctx, stk[0], note);
+    if (JS_IsException(wrapped))
+        goto fail;
+    JS_FreeValue(ctx, sp[-1]);
+    sp[-1] = wrapped;
+    return 0;
+ fail:
+    JS_FreeValue(ctx, sp[-1]);
+    sp[-1] = JS_UNDEFINED;
+    return -1;
+}
+
+/* post ++/--: two derived results (the coerced old value at sp[-1], the
+   stored new value at sp[0]), each re-wrapped with its own Combine call. */
+static int tt_tagged_post_inc(JSContext *ctx, JSValue *sp, OPCodeEnum op)
+{
+    JSValueConst args[1];
+    JSValue stk[2], w_old, w_new;
+    void *notes[1], *note;
+    JSObject *p;
+
+    args[0] = sp[-1];
+    p = JS_VALUE_GET_OBJ(args[0]);
+    notes[0] = p->u.tt_tagged.note;
+    stk[0] = JS_DupValue(ctx, p->u.tt_tagged.payload);
+    if (js_post_inc_slow(ctx, stk + 1, op))
+        goto fail0;               /* stk[0] reset; stk[1] never written */
+    note = tt_combine_note(ctx, tt_tt_opcode(op), args, notes, 1);
+    w_old = JS_TTMakeTagged(ctx, stk[0], note);
+    if (JS_IsException(w_old)) {
+        JS_FreeValue(ctx, stk[1]);
+        goto fail0;
+    }
+    note = tt_combine_note(ctx, tt_tt_opcode(op), args, notes, 1);
+    w_new = JS_TTMakeTagged(ctx, stk[1], note);
+    if (JS_IsException(w_new)) {
+        JS_FreeValue(ctx, w_old);
+        goto fail0;
+    }
+    JS_FreeValue(ctx, sp[-1]);
+    sp[-1] = w_old;
+    sp[0] = w_new;
+    return 0;
+ fail0:
+    JS_FreeValue(ctx, sp[-1]);
     sp[-1] = JS_UNDEFINED;
     return -1;
 }
@@ -19430,6 +19753,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
    result itself (String() would otherwise re-dispatch into its
    direct-symbol special case). */
 #define TT_COERCE_SLOT(sl_slot, hintv, deltav, nosymv)                  \
+    /* a tagged value never coerces here: at operator sites the slow    \
+       helper unwraps it, and at key sites the C path throws exactly    \
+       as the in-loop coercion would (no methods to pick) */            \
+    if (!tt_value_is_tagged(*(sl_slot)))                                \
     {                                                                   \
         int cc_step, cc_r;                                              \
         JSValue cc_m, cc_v;                                             \
@@ -38129,7 +38456,9 @@ typedef struct CodeContext {
 
 #define M2(op1, op2)            ((op1) | ((op2) << 8))
 #define M3(op1, op2, op3)       ((op1) | ((op2) << 8) | ((op3) << 16))
-#define M4(op1, op2, op3, op4)  ((op1) | ((op2) << 8) | ((op3) << 16) | ((op4) << 24))
+/* the top byte packs through uint32_t: an opcode >= 128 shifted into the
+   sign bit would be UB in int arithmetic */
+#define M4(op1, op2, op3, op4)  ((op1) | ((op2) << 8) | ((op3) << 16) | (int)((uint32_t)(op4) << 24))
 
 static BOOL code_match(CodeContext *s, int pos, ...)
 {
@@ -41847,7 +42176,7 @@ typedef struct JSPromiseReactionData {
 
 /* -- limits and wire constants -- */
 
-#define TT_FLOW_MAGIC     "TTFL04"
+#define TT_FLOW_MAGIC     "TTFL05"
 #define TT_FLOW_MAGIC_LEN 6
 
 /* header flag bits */
@@ -41868,7 +42197,8 @@ enum {                        /* private record kinds */
     TT_REC_PROMISE_FUNC,      /* resolve/reject capability function          */
     TT_REC_PRESOLVED,         /* the capability pair's shared resolved flag  */
     TT_REC_ASYNC_RESOLVE,     /* async-function await continuation handler   */
-    TT_REC_LAST = TT_REC_ASYNC_RESOLVE
+    TT_REC_TAGGED,            /* JS_CLASS_TT_TAGGED: payload + host note     */
+    TT_REC_LAST = TT_REC_TAGGED
 };
 
 enum {                        /* vref inline subtags */
@@ -42336,6 +42666,10 @@ static int tt_baseline_scan_object(JSContext *ctx, TTFlowBaseline *bl,
     case JS_CLASS_SYMBOL:
     case JS_CLASS_DATE:
         if (tt_baseline_queue_value(ctx, bl, q, p->u.object_data))
+            return -1;
+        break;
+    case JS_CLASS_TT_TAGGED:
+        if (tt_baseline_queue_value(ctx, bl, q, p->u.tt_tagged.payload))
             return -1;
         break;
     case JS_CLASS_GLOBAL_OBJECT:
@@ -44161,6 +44495,8 @@ static int wr_enum_object(TTFlowWr *w, JSObject *p)
     case JS_CLASS_ASYNC_FUNCTION_RESOLVE:
     case JS_CLASS_ASYNC_FUNCTION_REJECT:
         return wr_add_rec(w, TT_REC_ASYNC_RESOLVE, p, NULL);
+    case JS_CLASS_TT_TAGGED:
+        return wr_add_rec(w, TT_REC_TAGGED, p, NULL);
     default:
         return wr_unsupported(w, p);
     }
@@ -44416,6 +44752,18 @@ static int wr_scan_children(TTFlowWr *w, TTFlowWrRec *rec)
             wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
             return -1;
         if (wr_enum_value(w, p->u.object_data))
+            return -1;
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_TAGGED: {
+        /* the payload classifies recursively like any field (by reference
+           if baseline, by value if private); the note is not a graph edge --
+           it travels through the host's note hooks at emission */
+        JSObject *p = rec->ptr;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        if (wr_enum_value(w, p->u.tt_tagged.payload))
             return -1;
         return wr_scan_props(w, p, FALSE);
     }
@@ -44887,6 +45235,34 @@ static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
         case TT_REC_DATAOBJ:
             dbuf_put_leb128(&db, ((JSObject *)rec->ptr)->class_id);
             break;
+        case TT_REC_TAGGED: {
+            /* the host note rides the shell as an opaque blob: present flag,
+               then NoteSerialize's bytes (the read side hands them to
+               NoteDeserialize before the record links) */
+            void *note = ((JSObject *)rec->ptr)->u.tt_tagged.note;
+            if (!note) {
+                dbuf_putc(&db, 0);
+            } else if (!ctx->rt->tt_note_serialize) {
+                JS_ThrowTypeError(ctx, "flow serialization: tagged note "
+                                  "without a NoteSerialize hook");
+                goto fail;
+            } else {
+                DynBuf nb;
+                js_dbuf_init(ctx, &nb);
+                if (ctx->rt->tt_note_serialize(ctx->rt, note, &nb) ||
+                    nb.error || nb.size > UINT32_MAX) {
+                    dbuf_free(&nb);
+                    JS_ThrowTypeError(ctx, "flow serialization: tagged note "
+                                      "serialization failed");
+                    goto fail;
+                }
+                dbuf_putc(&db, 1);
+                dbuf_put_leb128(&db, (uint32_t)nb.size);
+                dbuf_put(&db, nb.buf, nb.size);
+                dbuf_free(&nb);
+            }
+            break;
+        }
         }
     }
 
@@ -45140,6 +45516,18 @@ static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
                             : JS_NULL))
                 goto fail;
             if (wr_put_vref(w, &db, p->u.object_data))
+                goto fail;
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_TAGGED: {
+            JSObject *p = rec->ptr;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            if (wr_put_vref(w, &db, p->u.tt_tagged.payload))
                 goto fail;
             if (wr_put_props(w, &db, p, FALSE))
                 goto fail;
@@ -45995,6 +46383,39 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
             JS_VALUE_GET_OBJ(rec->v)->u.object_data = JS_UNDEFINED;
             break;
         }
+        case TT_REC_TAGGED: {
+            uint32_t has = tt_rd_u8(&r->rd);
+            if (r->rd.err || has > 1)
+                goto trunc;
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_TT_TAGGED);
+            if (JS_IsException(rec->v))
+                goto fail;
+            if (has) {
+                uint32_t nlen = tt_rd_leb(&r->rd);
+                const uint8_t *nb;
+                void *note;
+                if (r->rd.err)
+                    goto trunc;
+                nb = tt_rd_bytes(&r->rd, nlen);
+                if (!nb)
+                    goto trunc;
+                if (!rt->tt_note_deserialize) {
+                    JS_ThrowTypeError(ctx, "flow bytes: tagged note without "
+                                      "a NoteDeserialize hook");
+                    goto fail;
+                }
+                note = rt->tt_note_deserialize(rt, nb, nlen);
+                if (!note) {
+                    JS_ThrowTypeError(ctx, "flow bytes: tagged note "
+                                      "deserialization failed");
+                    goto fail;
+                }
+                /* the shell owns its note from here on: rd_release covers
+                   any later failure through the object finalizer */
+                JS_VALUE_GET_OBJ(rec->v)->u.tt_tagged.note = note;
+            }
+            break;
+        }
         case TT_REC_PROMISE: {
             JSPromiseData *pd;
             rec->v = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_PROMISE);
@@ -46564,6 +46985,20 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
                 goto fail;
             }
             JS_VALUE_GET_OBJ(rec->v)->u.object_data = v;
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        }
+        case TT_REC_TAGGED: {
+            /* the payload is any value a vref can carry (the note already
+               arrived with the shell) */
+            JSValue v;
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            v = rd_get_vref(r);
+            if (JS_IsException(v))
+                goto fail;
+            JS_VALUE_GET_OBJ(rec->v)->u.tt_tagged.payload = v;
             if (rd_read_props(r, rec->v))
                 goto fail;
             break;
@@ -47256,6 +47691,34 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
                 JS_VALUE_GET_OBJ(fk->clone_v[i])->u.object_data =
                     JS_UNDEFINED;
             break;
+        case TT_REC_TAGGED: {
+            /* each arm gets an independent tagged value: its own payload
+               clone (relinked in pass 2) and a NoteClone'd note */
+            JSObject *src = rec->ptr;
+            void *note = src->u.tt_tagged.note;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    JS_CLASS_TT_TAGGED);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            if (note) {
+                void *note2;
+                if (!ctx->rt->tt_note_clone) {
+                    JS_ThrowTypeError(ctx, "flow fork: tagged note without "
+                                      "a NoteClone hook");
+                    goto out;
+                }
+                note2 = ctx->rt->tt_note_clone(ctx->rt, note);
+                if (!note2) {
+                    JS_ThrowTypeError(ctx, "flow fork: tagged note clone "
+                                      "failed");
+                    goto out;
+                }
+                /* the sibling owns its note from here on (fork_release
+                   covers failure through the object finalizer) */
+                JS_VALUE_GET_OBJ(fk->clone_v[i])->u.tt_tagged.note = note2;
+            }
+            break;
+        }
         case TT_REC_ARRAY:
             fk->clone_v[i] = JS_NewArray(ctx);
             if (JS_IsException(fk->clone_v[i]))
@@ -47552,6 +48015,19 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
             if (JS_IsException(v))
                 goto out;
             JS_VALUE_GET_OBJ(fk->clone_v[i])->u.object_data = v;
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        }
+        case TT_REC_TAGGED: {
+            JSObject *src = rec->ptr;
+            JSValue v;
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            v = fork_map_value(fk, src->u.tt_tagged.payload);
+            if (JS_IsException(v))
+                goto out;
+            JS_VALUE_GET_OBJ(fk->clone_v[i])->u.tt_tagged.payload = v;
             if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
                 goto out;
             break;
@@ -48372,6 +48848,66 @@ uint8_t *JS_TTMachineEvict(JSContext *ctx, JSValueConst flow, size_t *plen)
 JSValue JS_TTMachineHydrate(JSContext *ctx, const uint8_t *buf, size_t len)
 {
     return JS_TTFlowDeserialize(ctx, buf, len);
+}
+
+/* -- tagged values: a concrete payload plus an opaque host annotation ------ */
+
+void JS_TTSetNoteHooks(JSRuntime *rt, JSTTNoteCloneFn *clone_fn,
+                       JSTTNoteSerializeFn *serialize_fn,
+                       JSTTNoteDeserializeFn *deserialize_fn,
+                       JSTTNoteFreeFn *free_fn)
+{
+    rt->tt_note_clone = clone_fn;
+    rt->tt_note_serialize = serialize_fn;
+    rt->tt_note_deserialize = deserialize_fn;
+    rt->tt_note_free = free_fn;
+}
+
+void JS_TTSetCombineHook(JSRuntime *rt, JSTTCombineFn *combine)
+{
+    rt->tt_combine = combine;
+}
+
+/* Make a tagged value. Takes ownership of 'payload' and of 'note' (the
+   value owns the note from birth: NoteFree releases it at finalization,
+   whether the value ever traveled or not). */
+JSValue JS_TTMakeTagged(JSContext *ctx, JSValue payload, void *note)
+{
+    JSValue v;
+    JSObject *p;
+    if (JS_IsException(payload))
+        return payload;
+    v = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_TT_TAGGED);
+    if (JS_IsException(v)) {
+        JS_FreeValue(ctx, payload);
+        if (note && ctx->rt->tt_note_free)
+            ctx->rt->tt_note_free(ctx->rt, note);
+        return v;
+    }
+    p = JS_VALUE_GET_OBJ(v);
+    p->u.tt_tagged.payload = payload;
+    p->u.tt_tagged.note = note;
+    return v;
+}
+
+JSValue JS_TTPayload(JSContext *ctx, JSValueConst v)
+{
+    if (!JS_TTIsTagged(v))
+        return JS_ThrowTypeError(ctx, "not a tagged value");
+    return JS_DupValue(ctx, JS_VALUE_GET_OBJ(v)->u.tt_tagged.payload);
+}
+
+void *JS_TTNote(JSValueConst v)
+{
+    if (!JS_TTIsTagged(v))
+        return NULL;
+    return JS_VALUE_GET_OBJ(v)->u.tt_tagged.note;
+}
+
+JS_BOOL JS_TTIsTagged(JSValueConst v)
+{
+    return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(v)->class_id == JS_CLASS_TT_TAGGED;
 }
 /*---------------------------------------------------------------------------*/
 /* end TimeTravelJS flow serialization                                        */
@@ -55951,6 +56487,38 @@ static const JSCFunctionListEntry js_number_proto_funcs[] = {
     JS_CFUNC_DEF("valueOf", 0, js_number_valueOf ),
 };
 
+/* TimeTravelJS: parseInt/parseFloat are pure coercion pipelines (ToString
+   then StringToNumber), so a tagged input propagates: run the pristine
+   builtin on the unwrapped operands, re-wrap the real result with a
+   Combine-derived note. Generic builtin forwarding stays out of scope. */
+static JSValue tt_tagged_parse(JSContext *ctx, JSValueConst this_val,
+                               JSValueConst *argv,
+                               JSValue (*fn)(JSContext *, JSValueConst, int,
+                                             JSValueConst *),
+                               int tt_op, int nops)
+{
+    JSValueConst args2[2];
+    void *notes[2], *note;
+    JSValue res;
+    int i;
+
+    for (i = 0; i < nops; i++) {
+        if (tt_value_is_tagged(argv[i])) {
+            JSObject *p = JS_VALUE_GET_OBJ(argv[i]);
+            args2[i] = p->u.tt_tagged.payload;   /* borrowed */
+            notes[i] = p->u.tt_tagged.note;
+        } else {
+            args2[i] = argv[i];
+            notes[i] = NULL;
+        }
+    }
+    res = fn(ctx, this_val, nops, args2);
+    if (JS_IsException(res))
+        return res;
+    note = tt_combine_note(ctx, tt_op, argv, notes, nops);
+    return JS_TTMakeTagged(ctx, res, note);
+}
+
 static JSValue js_parseInt(JSContext *ctx, JSValueConst this_val,
                            int argc, JSValueConst *argv)
 {
@@ -55958,6 +56526,10 @@ static JSValue js_parseInt(JSContext *ctx, JSValueConst this_val,
     int radix, flags;
     JSValue ret;
 
+    /* argv is padded to the declared arity (2), so both slots exist */
+    if (unlikely(tt_value_is_tagged(argv[0]) || tt_value_is_tagged(argv[1])))
+        return tt_tagged_parse(ctx, this_val, argv, js_parseInt,
+                               JS_TT_OP_PARSE_INT, 2);
     str = JS_ToCString(ctx, argv[0]);
     if (!str)
         return JS_EXCEPTION;
@@ -55983,6 +56555,9 @@ static JSValue js_parseFloat(JSContext *ctx, JSValueConst this_val,
     const char *str, *p;
     JSValue ret;
 
+    if (unlikely(tt_value_is_tagged(argv[0])))
+        return tt_tagged_parse(ctx, this_val, argv, js_parseFloat,
+                               JS_TT_OP_PARSE_FLOAT, 1);
     str = JS_ToCString(ctx, argv[0]);
     if (!str)
         return JS_EXCEPTION;
@@ -56146,6 +56721,17 @@ static JSValue js_string_constructor(JSContext *ctx, JSValueConst new_target,
         if (JS_IsUndefined(new_target) && JS_IsSymbol(argv[0])) {
             JSAtomStruct *p = JS_VALUE_GET_PTR(argv[0]);
             val = JS_ConcatString3(ctx, "Symbol(", JS_AtomToString(ctx, js_get_atom_index(ctx->rt, p)), ")");
+        } else if (JS_IsUndefined(new_target) &&
+                   tt_value_is_tagged(argv[0])) {
+            /* String(tagged): the REAL ToString of the payload, re-wrapped
+               (new String(tagged) keeps today's unknown-object behavior) */
+            JSObject *p = JS_VALUE_GET_OBJ(argv[0]);
+            void *nt = p->u.tt_tagged.note, *note;
+            val = JS_ToString(ctx, p->u.tt_tagged.payload);
+            if (JS_IsException(val))
+                return val;
+            note = tt_combine_note(ctx, JS_TT_OP_TO_STRING, &argv[0], &nt, 1);
+            return JS_TTMakeTagged(ctx, val, note);
         } else {
             val = JS_ToString(ctx, argv[0]);
         }

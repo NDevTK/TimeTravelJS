@@ -105,12 +105,49 @@
  *                               round-trip of an auto-captured delta, the
  *                               per-arm promise-reaction oracle, and that
  *                               completion commits the winning arm's writes.
+ *
+ *   flow-harness taggedtest     tagged values: a JS_TTMakeTagged value
+ *                               (concrete payload + opaque host note) as a
+ *                               first-class citizen of fork / serialize /
+ *                               evict / GC. Asserts the accessor API, a
+ *                               payload<->tagged GC cycle, fork independence
+ *                               (own payload copy per arm, NoteClone'd
+ *                               notes, a mutation in one arm touching
+ *                               nobody), serialize->hydrate and evict->
+ *                               hydrate round trips through NoteSerialize/
+ *                               Deserialize, loud refusals when a needed
+ *                               hook is missing (NULL notes still pass),
+ *                               NoteFree exactly once per abandoned arm,
+ *                               and a note-liveness oracle over the whole
+ *                               run beside the runtime leak oracle.
+ *
+ *   flow-harness combinetest    tagged-value propagation through value-
+ *                               producing operations: any tagged operand
+ *                               of an arithmetic/bitwise/shift/relational/
+ *                               loose-eq op, a concat (including the
+ *                               template-literal engine), or a covered
+ *                               coercion pipeline (unary +, String(),
+ *                               parseInt/parseFloat) yields a tagged
+ *                               result whose payload is the ENGINE's own
+ *                               result on the unwrapped concretes and
+ *                               whose note derives via the Combine hook
+ *                               (right op code, per-operand note array).
+ *                               Asserts exact payloads ("x"+t("y") is
+ *                               "xy", +t("5") is the number 5 -- the real
+ *                               op ran), faithful concrete throws and
+ *                               NaNs, two-tagged combines, strict-eq /
+ *                               typeof / truthiness / property-key
+ *                               coercion staying exactly as today, and a
+ *                               propagated result round-tripping through
+ *                               problem 1's fork + serialize paths.
  */
 #include "quickjs.h"
+#include "cutils.h"     /* DynBuf, for the tagged-value note hooks */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <math.h>
 
 /* the baseline program: MUST be byte-identical in every process. The flow
    exercises: baseline objects (CONFIG/TABLE), nested generators (yield* =
@@ -208,6 +245,13 @@ static const char *BASELINE_SRC =
 "  SHP.then(sink(\"p\" + v));\n"
 "  var w = yield \"wrote:\" + SHOBJ.x + \":\" + SHARR.join(\",\") + \":\" + SHARR.length;\n"
 "  return \"done:\" + SHOBJ.x + \":\" + w;\n"
+"}\n"
+"function* tflow() {\n"
+"  var t = null;\n"
+"  var u = null;\n"
+"  var fed = yield \"t0\";\n"
+"  yield \"t1:\" + (t === null ? \"null\" : typeof t) + \":\" + fed;\n"
+"  return \"t-end\";\n"
 "}\n";
 
 static void die(JSContext *ctx, const char *what)
@@ -2111,6 +2155,760 @@ static int cmd_cowtest(void)
     return 0;
 }
 
+/* -- taggedtest: payload + host note as a first-class round-tripper ------- */
+
+/* the note is a malloc'd C string; the counters are the oracle: every hook
+   call is counted and tg_live tracks blobs the host still owes a free() */
+static int tg_clones, tg_serializes, tg_deserializes, tg_frees, tg_live;
+
+static void *tg_note_clone(JSRuntime *rt, void *note)
+{
+    char *c = strdup((char *)note);
+    (void)rt;
+    if (!c)
+        return NULL;
+    tg_clones++;
+    tg_live++;
+    return c;
+}
+
+static int tg_note_serialize(JSRuntime *rt, void *note, DynBuf *db)
+{
+    (void)rt;
+    tg_serializes++;
+    return dbuf_put(db, (const uint8_t *)note, strlen((char *)note) + 1);
+}
+
+static void *tg_note_deserialize(JSRuntime *rt, const uint8_t *buf, size_t len)
+{
+    char *c;
+    (void)rt;
+    if (len == 0 || len > 4096 || buf[len - 1] != '\0')
+        return NULL;          /* reject malformed blobs loudly */
+    c = malloc(len);
+    if (!c)
+        return NULL;
+    memcpy(c, buf, len);
+    tg_deserializes++;
+    tg_live++;
+    return c;
+}
+
+static void tg_note_free(JSRuntime *rt, void *note)
+{
+    (void)rt;
+    tg_frees++;
+    tg_live--;
+    free(note);
+}
+
+static void tg_set_hooks(JSRuntime *rt)
+{
+    JS_TTSetNoteHooks(rt, tg_note_clone, tg_note_serialize,
+                      tg_note_deserialize, tg_note_free);
+}
+
+static int tg_payload_a(JSContext *ctx, JSValueConst tagged)
+{
+    JSValue p = JS_TTPayload(ctx, tagged);
+    JSValue av;
+    int32_t a = -1;
+    if (JS_IsException(p))
+        die(ctx, "JS_TTPayload");
+    av = JS_GetPropertyStr(ctx, p, "a");
+    if (JS_ToInt32(ctx, &a, av))
+        die(ctx, "payload.a");
+    JS_FreeValue(ctx, av);
+    JS_FreeValue(ctx, p);
+    return (int)a;
+}
+
+static void tg_payload_set_a(JSContext *ctx, JSValueConst tagged, int v)
+{
+    JSValue p = JS_TTPayload(ctx, tagged);
+    if (JS_IsException(p))
+        die(ctx, "JS_TTPayload");
+    if (JS_SetPropertyStr(ctx, p, "a", JS_NewInt32(ctx, v)) < 0)
+        die(ctx, "set payload.a");
+    JS_FreeValue(ctx, p);
+}
+
+/* start tflow() and advance it to the "t0" yield */
+static JSValue tg_start_tflow(JSContext *ctx)
+{
+    JSValue g = eval_val(ctx, "tflow()");
+    JSValue r = JS_Invoke(ctx, g, JS_NewAtom(ctx, "next"), 0, NULL);
+    if (JS_IsException(r))
+        die(ctx, "tflow next");
+    JS_FreeValue(ctx, r);
+    return g;
+}
+
+static int cmd_taggedtest(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    JSValue t, tnil, g, g2, g3, gh, armA, armB, tP, tA, tB, t2, th;
+    JSAtom at_t, at_u;
+    char *H;
+    void *nA, *nB;
+    uint8_t *bytes;
+    size_t blen;
+
+    tg_clones = tg_serializes = tg_deserializes = tg_frees = tg_live = 0;
+    tg_set_hooks(rt);
+    at_t = JS_NewAtom(ctx, "t");
+    at_u = JS_NewAtom(ctx, "u");
+
+    /* --- the value itself: make, inspect, nest ------------------------- */
+    H = strdup("H-note-1");
+    assert(H);
+    tg_live++;                /* H enters the accounting by hand */
+    t = JS_TTMakeTagged(ctx, eval_val(ctx, "({a:1})"), H);
+    if (JS_IsException(t))
+        die(ctx, "JS_TTMakeTagged");
+    assert(JS_TTIsTagged(t));
+    assert(JS_TTNote(t) == H);
+    assert(tg_payload_a(ctx, t) == 1);
+    {
+        /* payload dups preserve identity */
+        JSValue p1 = JS_TTPayload(ctx, t), p2 = JS_TTPayload(ctx, t);
+        assert(JS_VALUE_GET_PTR(p1) == JS_VALUE_GET_PTR(p2));
+        JS_FreeValue(ctx, p1);
+        JS_FreeValue(ctx, p2);
+    }
+    {
+        /* non-tagged probes answer, they do not crash */
+        JSValue plain = eval_val(ctx, "({})");
+        JSValue e;
+        assert(!JS_TTIsTagged(plain));
+        assert(JS_TTNote(plain) == NULL);
+        e = JS_TTPayload(ctx, plain);
+        assert(JS_IsException(e));
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, plain);
+    }
+    {
+        /* nesting: a tagged value is a concrete payload like any other */
+        JSValue inner = JS_TTMakeTagged(ctx, JS_NewInt32(ctx, 5), NULL);
+        JSValue outer2 = JS_TTMakeTagged(ctx, inner, NULL);
+        JSValue got = JS_TTPayload(ctx, outer2);
+        assert(JS_TTIsTagged(got));
+        JS_FreeValue(ctx, got);
+        JS_FreeValue(ctx, outer2);  /* frees inner through the payload edge */
+    }
+    {
+        /* a payload<->tagged cycle collects through the mark edge */
+        JSValue cp = eval_val(ctx, "({})");
+        JSValue ct = JS_TTMakeTagged(ctx, JS_DupValue(ctx, cp), NULL);
+        if (JS_IsException(ct))
+            die(ctx, "cycle make");
+        if (JS_SetPropertyStr(ctx, cp, "cyc", JS_DupValue(ctx, ct)) < 0)
+            die(ctx, "cycle prop");
+        JS_FreeValue(ctx, cp);
+        JS_FreeValue(ctx, ct);
+        JS_RunGC(rt);
+    }
+    printf("TAGGED:make/inspect/nest/gc-cycle ok\n");
+
+    /* --- a suspended flow holds t in a local; fork the flow ------------ */
+    g = tg_start_tflow(ctx);
+    if (!JS_TTFlowSetLocal(ctx, g, 0, at_t, t)) {
+        fprintf(stderr, "FAIL: inject t into tflow\n");
+        return 1;
+    }
+    armA = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(armA))
+        die(ctx, "fork armA");
+    armB = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(armB))
+        die(ctx, "fork armB");
+    assert(tg_clones == 2);   /* one NoteClone per arm */
+
+    tP = JS_TTFlowGetLocal(ctx, g, 0, at_t);
+    tA = JS_TTFlowGetLocal(ctx, armA, 0, at_t);
+    tB = JS_TTFlowGetLocal(ctx, armB, 0, at_t);
+    assert(JS_TTIsTagged(tP) && JS_TTIsTagged(tA) && JS_TTIsTagged(tB));
+    /* the parent's local IS t; each arm's is an independent value */
+    assert(JS_VALUE_GET_PTR(tP) == JS_VALUE_GET_PTR(t));
+    assert(JS_VALUE_GET_PTR(tA) != JS_VALUE_GET_PTR(t));
+    assert(JS_VALUE_GET_PTR(tB) != JS_VALUE_GET_PTR(t));
+    assert(JS_VALUE_GET_PTR(tA) != JS_VALUE_GET_PTR(tB));
+    nA = JS_TTNote(tA);
+    nB = JS_TTNote(tB);
+    assert(nA && nB && nA != H && nB != H && nA != nB);
+    assert(strcmp((char *)nA, "H-note-1") == 0);
+    assert(strcmp((char *)nB, "H-note-1") == 0);
+    /* a payload mutation in one arm touches nobody else */
+    tg_payload_set_a(ctx, tA, 99);
+    assert(tg_payload_a(ctx, tA) == 99);
+    assert(tg_payload_a(ctx, tB) == 1);
+    assert(tg_payload_a(ctx, tP) == 1);
+    assert(tg_payload_a(ctx, t) == 1);
+    printf("TAGGED:fork independence ok (NoteClone x%d)\n", tg_clones);
+
+    /* --- serialize -> hydrate ------------------------------------------ */
+    bytes = JS_TTFlowSerialize(ctx, g, &blen);
+    if (!bytes)
+        die(ctx, "serialize");
+    assert(tg_serializes == 1);
+    g2 = JS_TTFlowDeserialize(ctx, bytes, blen);
+    if (JS_IsException(g2))
+        die(ctx, "deserialize");
+    assert(tg_deserializes == 1);
+    t2 = JS_TTFlowGetLocal(ctx, g2, 0, at_t);
+    assert(JS_TTIsTagged(t2));
+    assert(JS_VALUE_GET_PTR(t2) != JS_VALUE_GET_PTR(t));
+    assert(tg_payload_a(ctx, t2) == 1);
+    {
+        void *n2 = JS_TTNote(t2);
+        assert(n2 && n2 != H && strcmp((char *)n2, "H-note-1") == 0);
+    }
+    printf("TAGGED:serialize->hydrate ok (%u bytes)\n", (unsigned)blen);
+
+    /* --- truncation at every byte refuses loudly, note-leak-free -------- */
+    {
+        int live_before = tg_live;
+        size_t cut;
+        for (cut = 0; cut < blen; cut++) {
+            JSValue bad = JS_TTFlowDeserialize(ctx, bytes, cut);
+            assert(JS_IsException(bad));
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        }
+        /* cuts that deserialized the note before failing freed it again
+           through the shell's finalizer */
+        assert(tg_live == live_before);
+    }
+    printf("TAGGED:truncation fuzz ok\n");
+
+    /* --- loud refusals without hooks; NULL notes still pass ------------ */
+    JS_TTSetNoteHooks(rt, NULL, NULL, NULL, NULL);
+    {
+        uint8_t *b0;
+        size_t l0;
+        JSValue e;
+        b0 = JS_TTFlowSerialize(ctx, g, &l0);
+        assert(b0 == NULL);   /* non-NULL note, no NoteSerialize hook */
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        e = JS_TTFlowFork(ctx, g);
+        assert(JS_IsException(e));  /* non-NULL note, no NoteClone hook */
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        /* bytes carrying a note refuse to hydrate without the hook */
+        e = JS_TTFlowDeserialize(ctx, bytes, blen);
+        assert(JS_IsException(e));
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    js_free(ctx, bytes);
+    tnil = JS_TTMakeTagged(ctx, JS_NewInt32(ctx, 7), NULL);
+    g3 = tg_start_tflow(ctx);
+    if (!JS_TTFlowSetLocal(ctx, g3, 0, at_u, tnil)) {
+        fprintf(stderr, "FAIL: inject u into tflow\n");
+        return 1;
+    }
+    {
+        uint8_t *b1;
+        size_t l1;
+        JSValue g3h, u2, pv;
+        int32_t iv = 0;
+        b1 = JS_TTFlowSerialize(ctx, g3, &l1);
+        if (!b1)
+            die(ctx, "serialize NULL-note flow");
+        g3h = JS_TTFlowDeserialize(ctx, b1, l1);
+        if (JS_IsException(g3h))
+            die(ctx, "deserialize NULL-note flow");
+        js_free(ctx, b1);
+        u2 = JS_TTFlowGetLocal(ctx, g3h, 0, at_u);
+        assert(JS_TTIsTagged(u2));
+        assert(JS_TTNote(u2) == NULL);
+        pv = JS_TTPayload(ctx, u2);
+        if (JS_ToInt32(ctx, &iv, pv))
+            die(ctx, "NULL-note payload");
+        assert(iv == 7);
+        JS_FreeValue(ctx, pv);
+        JS_FreeValue(ctx, u2);
+        JS_FreeValue(ctx, g3h);
+    }
+    tg_set_hooks(rt);
+    printf("TAGGED:hookless refusals + NULL-note pass ok\n");
+
+    /* --- evict -> hydrate (cold bytes) --------------------------------- */
+    {
+        uint8_t *eb;
+        size_t el;
+        int sers = tg_serializes, desers = tg_deserializes;
+        eb = JS_TTMachineEvict(ctx, g, &el);
+        if (!eb)
+            die(ctx, "evict");
+        assert(tg_serializes == sers + 1);
+        /* the host reference keeps the parent's value alive across the
+           eviction: its note must NOT have been freed */
+        assert(JS_TTNote(t) == H);
+        gh = JS_TTMachineHydrate(ctx, eb, el);
+        if (JS_IsException(gh))
+            die(ctx, "hydrate");
+        js_free(ctx, eb);
+        assert(tg_deserializes == desers + 1);
+        th = JS_TTFlowGetLocal(ctx, gh, 0, at_t);
+        assert(JS_TTIsTagged(th));
+        assert(tg_payload_a(ctx, th) == 1);
+        {
+            void *nh = JS_TTNote(th);
+            assert(nh && strcmp((char *)nh, "H-note-1") == 0);
+        }
+    }
+    printf("TAGGED:evict->hydrate ok\n");
+
+    /* --- abandoning a forked arm frees its note exactly once ------------ */
+    {
+        int frees_before = tg_frees;
+        JS_FreeValue(ctx, tB);    /* drop the read handle first */
+        tB = JS_UNDEFINED;
+        JS_FreeValue(ctx, armB);  /* abandon the arm without resuming */
+        armB = JS_UNDEFINED;
+        assert(tg_frees == frees_before + 1);
+    }
+    printf("TAGGED:abandoned arm frees its note exactly once ok\n");
+
+    /* --- the surviving arm resumes and completes normally --------------- */
+    {
+        int frees_before = tg_frees;
+        char tr[512];
+        if (JS_TTFlowCheckin(ctx, armA))
+            die(ctx, "checkin armA");
+        collect_flow(ctx, armA, 0, tr, sizeof(tr));
+        assert(strstr(tr, "t1:object:0"));
+        assert(strstr(tr, "t-end"));
+        /* completion freed the frame; our tA dup still pins the arm's
+           value (and so its note) */
+        assert(tg_frees == frees_before);
+        JS_FreeValue(ctx, tA);
+        tA = JS_UNDEFINED;
+        assert(tg_frees == frees_before + 1);
+    }
+    printf("TAGGED:surviving arm completes ok\n");
+
+    /* --- teardown: every note followed its value ------------------------ */
+    JS_FreeAtom(ctx, at_t);
+    JS_FreeAtom(ctx, at_u);
+    JS_FreeValue(ctx, t);
+    JS_FreeValue(ctx, tnil);
+    JS_FreeValue(ctx, tP);
+    JS_FreeValue(ctx, t2);
+    JS_FreeValue(ctx, th);
+    JS_FreeValue(ctx, g);
+    JS_FreeValue(ctx, g2);
+    JS_FreeValue(ctx, g3);
+    JS_FreeValue(ctx, gh);
+    JS_FreeValue(ctx, armA);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);       /* the leak/double-free oracle */
+    assert(tg_live == 0);     /* the note-liveness oracle */
+    printf("TAGGED:teardown ok (clones=%d serializes=%d deserializes=%d "
+           "frees=%d)\n", tg_clones, tg_serializes, tg_deserializes, tg_frees);
+    return 0;
+}
+
+/* -- combinetest: propagation through value-producing operations ---------- */
+
+/* the Combine hook: derive "C<op>(a,b)" from the operand notes ("-" for an
+   untagged operand) and log what the engine reported */
+static int cb_calls, cb_last_op, cb_last_n, cb_last_mask;
+
+static void *tg_combine(JSContext *ctx, int op, JSValueConst *args,
+                        void **notes, int n)
+{
+    char buf[512];
+    size_t off;
+    char *out;
+    int i;
+    (void)ctx;
+    (void)args;
+    cb_calls++;
+    cb_last_op = op;
+    cb_last_n = n;
+    cb_last_mask = 0;
+    off = (size_t)snprintf(buf, sizeof(buf), "C%d(", op);
+    for (i = 0; i < n && off < sizeof(buf) - 8; i++) {
+        if (notes[i])
+            cb_last_mask |= 1 << i;
+        off += (size_t)snprintf(buf + off, sizeof(buf) - off, "%s%s",
+                                i ? "," : "",
+                                notes[i] ? (char *)notes[i] : "-");
+    }
+    if (off < sizeof(buf) - 2)
+        snprintf(buf + off, sizeof(buf) - off, ")");
+    out = strdup(buf);
+    if (out)
+        tg_live++;                /* freed by tg_note_free with its value */
+    return out;
+}
+
+/* install tagged(payload, strdup(note_str)) as a global */
+static void ct_set_tagged(JSContext *ctx, const char *name, JSValue payload,
+                          const char *note_str)
+{
+    char *note = NULL;
+    JSValue t, glob;
+    if (note_str) {
+        note = strdup(note_str);
+        assert(note);
+        tg_live++;
+    }
+    t = JS_TTMakeTagged(ctx, payload, note);
+    if (JS_IsException(t))
+        die(ctx, "MakeTagged global");
+    glob = JS_GetGlobalObject(ctx);
+    if (JS_SetPropertyStr(ctx, glob, name, t) < 0)
+        die(ctx, "set tagged global");
+    JS_FreeValue(ctx, glob);
+}
+
+/* evaluate; the result MUST be tagged; return a dup of its payload */
+static JSValue ct_eval_payload(JSContext *ctx, const char *expr)
+{
+    JSValue v = eval_val(ctx, expr);
+    JSValue p;
+    if (!JS_TTIsTagged(v)) {
+        fprintf(stderr, "FAIL: %s did not produce a tagged value\n", expr);
+        exit(1);
+    }
+    p = JS_TTPayload(ctx, v);
+    JS_FreeValue(ctx, v);
+    return p;
+}
+
+static void ct_check_combine(const char *expr, int want_op, int want_mask,
+                             int want_n)
+{
+    if (want_op >= 0 && cb_last_op != want_op) {
+        fprintf(stderr, "FAIL: %s: Combine op %d, want %d\n", expr,
+                cb_last_op, want_op);
+        exit(1);
+    }
+    if (want_mask >= 0 && cb_last_mask != want_mask) {
+        fprintf(stderr, "FAIL: %s: Combine note mask %d, want %d\n", expr,
+                cb_last_mask, want_mask);
+        exit(1);
+    }
+    if (want_n >= 0 && cb_last_n != want_n) {
+        fprintf(stderr, "FAIL: %s: Combine n %d, want %d\n", expr,
+                cb_last_n, want_n);
+        exit(1);
+    }
+}
+
+/* tagged result with an exact-int payload + the Combine record */
+static void ct_expect_int(JSContext *ctx, const char *expr, int want,
+                          int want_op, int want_mask, int want_n)
+{
+    JSValue p;
+    int32_t got = -1;
+    cb_calls = 0;
+    cb_last_op = -1;
+    p = ct_eval_payload(ctx, expr);
+    if (JS_VALUE_GET_TAG(p) != JS_TAG_INT) {
+        fprintf(stderr, "FAIL: %s: payload tag %d, want int\n", expr,
+                (int)JS_VALUE_GET_TAG(p));
+        exit(1);
+    }
+    if (JS_ToInt32(ctx, &got, p))
+        die(ctx, expr);
+    JS_FreeValue(ctx, p);
+    if (got != want) {
+        fprintf(stderr, "FAIL: %s: payload %d, want %d\n", expr, got, want);
+        exit(1);
+    }
+    ct_check_combine(expr, want_op, want_mask, want_n);
+}
+
+/* tagged result with a double payload */
+static void ct_expect_num(JSContext *ctx, const char *expr, double want,
+                          int want_op)
+{
+    JSValue p;
+    double got = 0;
+    cb_calls = 0;
+    cb_last_op = -1;
+    p = ct_eval_payload(ctx, expr);
+    if (JS_ToFloat64(ctx, &got, p))
+        die(ctx, expr);
+    JS_FreeValue(ctx, p);
+    if (got != want) {
+        fprintf(stderr, "FAIL: %s: payload %g, want %g\n", expr, got, want);
+        exit(1);
+    }
+    ct_check_combine(expr, want_op, -1, -1);
+}
+
+/* tagged result with an exact-string payload (ropes flatten on compare) */
+static void ct_expect_string(JSContext *ctx, const char *expr,
+                             const char *want, int want_op)
+{
+    JSValue p;
+    const char *s;
+    uint32_t tag;
+    cb_calls = 0;
+    cb_last_op = -1;
+    p = ct_eval_payload(ctx, expr);
+    tag = JS_VALUE_GET_TAG(p);
+    if (tag != JS_TAG_STRING && tag != JS_TAG_STRING_ROPE) {
+        fprintf(stderr, "FAIL: %s: payload tag %d, want string\n", expr,
+                (int)tag);
+        exit(1);
+    }
+    s = JS_ToCString(ctx, p);
+    if (!s || strcmp(s, want)) {
+        fprintf(stderr, "FAIL: %s: payload \"%s\", want \"%s\"\n", expr,
+                s ? s : "?", want);
+        exit(1);
+    }
+    JS_FreeCString(ctx, s);
+    JS_FreeValue(ctx, p);
+    ct_check_combine(expr, want_op, -1, -1);
+}
+
+/* tagged result with a boolean payload */
+static void ct_expect_bool(JSContext *ctx, const char *expr, int want,
+                           int want_op, int want_mask)
+{
+    JSValue p;
+    cb_calls = 0;
+    cb_last_op = -1;
+    p = ct_eval_payload(ctx, expr);
+    if (JS_VALUE_GET_TAG(p) != JS_TAG_BOOL || JS_ToBool(ctx, p) != want) {
+        fprintf(stderr, "FAIL: %s: payload not the boolean %d\n", expr, want);
+        exit(1);
+    }
+    JS_FreeValue(ctx, p);
+    ct_check_combine(expr, want_op, want_mask, -1);
+}
+
+/* the result must be CONCRETE (untagged) and stringify to 'want' */
+static void ct_expect_concrete(JSContext *ctx, const char *expr,
+                               const char *want)
+{
+    JSValue v = eval_val(ctx, expr);
+    const char *s;
+    if (JS_TTIsTagged(v)) {
+        fprintf(stderr, "FAIL: %s: unexpectedly tagged\n", expr);
+        exit(1);
+    }
+    s = JS_ToCString(ctx, v);
+    if (!s || strcmp(s, want)) {
+        fprintf(stderr, "FAIL: %s == \"%s\", want \"%s\"\n", expr,
+                s ? s : "?", want);
+        exit(1);
+    }
+    JS_FreeCString(ctx, s);
+    JS_FreeValue(ctx, v);
+}
+
+static void ct_expect_throws(JSContext *ctx, const char *expr,
+                             const char *needle)
+{
+    JSValue v = JS_Eval(ctx, expr, strlen(expr), "combine.js",
+                        JS_EVAL_TYPE_GLOBAL);
+    JSValue e;
+    const char *msg;
+    if (!JS_IsException(v)) {
+        JS_FreeValue(ctx, v);
+        fprintf(stderr, "FAIL: %s did not throw\n", expr);
+        exit(1);
+    }
+    e = JS_GetException(ctx);
+    msg = JS_ToCString(ctx, e);
+    if (needle && (!msg || !strstr(msg, needle))) {
+        fprintf(stderr, "FAIL: %s threw \"%s\", want substring \"%s\"\n",
+                expr, msg ? msg : "?", needle);
+        exit(1);
+    }
+    JS_FreeCString(ctx, msg);
+    JS_FreeValue(ctx, e);
+}
+
+static int cmd_combinetest(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    JSAtom at_t;
+
+    tg_clones = tg_serializes = tg_deserializes = tg_frees = tg_live = 0;
+    cb_calls = 0;
+    tg_set_hooks(rt);
+    JS_TTSetCombineHook(rt, tg_combine);
+    at_t = JS_NewAtom(ctx, "t");
+
+    ct_set_tagged(ctx, "T5", JS_NewInt32(ctx, 5), "H5");
+    ct_set_tagged(ctx, "T6", JS_NewInt32(ctx, 6), "H6");
+    ct_set_tagged(ctx, "T2", JS_NewInt32(ctx, 2), "H2");
+    ct_set_tagged(ctx, "T3", JS_NewInt32(ctx, 3), "H3");
+    ct_set_tagged(ctx, "T9", JS_NewInt32(ctx, 9), "H9");
+    ct_set_tagged(ctx, "TY", eval_val(ctx, "'y'"), "HY");
+    ct_set_tagged(ctx, "TAB", eval_val(ctx, "'ab'"), "HAB");
+    ct_set_tagged(ctx, "TQ", eval_val(ctx, "'q'"), "HQ");
+    ct_set_tagged(ctx, "TS5", eval_val(ctx, "'5'"), "HS5");
+    ct_set_tagged(ctx, "T42S", eval_val(ctx, "'42'"), "H42");
+    ct_set_tagged(ctx, "TSYM", eval_val(ctx, "Symbol('s')"), "HSYM");
+    ct_set_tagged(ctx, "TOBJ", eval_val(ctx, "({})"), "HOBJ");
+    ct_set_tagged(ctx, "TKEY", eval_val(ctx, "'k'"), "HKEY");
+
+    /* --- arithmetic / bitwise: payload is the engine's own result ------ */
+    ct_expect_int(ctx, "T5 + 1", 6, JS_TT_OP_ADD, 1, 2);
+    ct_expect_int(ctx, "1 + T5", 6, JS_TT_OP_ADD, 2, 2);
+    ct_expect_int(ctx, "T5 * 2", 10, JS_TT_OP_MUL, 1, 2);
+    ct_expect_int(ctx, "T5 - 1", 4, JS_TT_OP_SUB, 1, 2);
+    ct_expect_num(ctx, "T5 / 2", 2.5, JS_TT_OP_DIV);
+    ct_expect_int(ctx, "T5 % 2", 1, JS_TT_OP_MOD, 1, 2);
+    ct_expect_int(ctx, "T2 ** T3", 8, JS_TT_OP_POW, 3, 2);
+    ct_expect_int(ctx, "T6 & 3", 2, JS_TT_OP_AND, 1, 2);
+    ct_expect_int(ctx, "T6 | 1", 7, JS_TT_OP_OR, 1, 2);
+    ct_expect_int(ctx, "T6 ^ 1", 7, JS_TT_OP_XOR, 1, 2);
+    ct_expect_int(ctx, "T6 << 1", 12, JS_TT_OP_SHL, 1, 2);
+    ct_expect_int(ctx, "T6 >> 1", 3, JS_TT_OP_SAR, 1, 2);
+    ct_expect_int(ctx, "T6 >>> 1", 3, JS_TT_OP_SHR, 1, 2);
+    ct_expect_int(ctx, "~T6", -7, JS_TT_OP_NOT, 1, 1);
+    ct_expect_int(ctx, "-T5", -5, JS_TT_OP_NEG, 1, 1);
+    printf("COMBINE:arithmetic/bitwise ok\n");
+
+    /* --- inc/dec (pre, post, and through a local) ---------------------- */
+    ct_expect_int(ctx, "var z1 = T5; ++z1", 6, JS_TT_OP_INC, 1, 1);
+    ct_expect_int(ctx, "var z2 = T5; z2--", 5, JS_TT_OP_DEC, 1, 1);
+    assert(cb_calls == 2);        /* post: old and new both derived */
+    ct_expect_int(ctx, "z2", 4, -1, -1, -1);
+    ct_expect_int(ctx, "(function(){ var n = 1; n += T5; return n; })()",
+                  6, JS_TT_OP_ADD, 2, 2);
+    printf("COMBINE:inc/dec + add_loc ok\n");
+
+    /* --- concat: the exact engine string, wherever + or templates run -- */
+    ct_expect_string(ctx, "'x' + TY", "xy", JS_TT_OP_ADD);
+    ct_expect_string(ctx, "TAB + 'cd'", "abcd", JS_TT_OP_ADD);
+    ct_expect_string(ctx, "TAB + ''", "ab", JS_TT_OP_ADD);
+    ct_expect_string(ctx, "`p${TQ}r`", "pqr", JS_TT_OP_CONCAT);
+    assert(cb_calls == 2);        /* one Combine per concat step */
+    ct_expect_string(ctx, "'x'.concat(TY, 'z')", "xyz", JS_TT_OP_CONCAT);
+    ct_expect_string(ctx, "(function(){ var s = 'x'; s += TY; return s; })()",
+                     "xy", JS_TT_OP_ADD);
+    printf("COMBINE:concat/templates ok\n");
+
+    /* --- coercions: the REAL coercion of the inner payload ------------- */
+    {
+        JSValue p;
+        cb_calls = 0;
+        p = ct_eval_payload(ctx, "+TS5");
+        /* the number 5, not the string "5", not NaN: the real ToNumber ran */
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT &&
+               JS_VALUE_GET_INT(p) == 5);
+        JS_FreeValue(ctx, p);
+        ct_check_combine("+TS5", JS_TT_OP_PLUS, 1, 1);
+    }
+    ct_expect_string(ctx, "String(T9)", "9", JS_TT_OP_TO_STRING);
+    ct_expect_int(ctx, "parseInt(T42S)", 42, JS_TT_OP_PARSE_INT, 1, 2);
+    ct_expect_int(ctx, "parseInt(T42S, 16)", 66, JS_TT_OP_PARSE_INT, 1, 2);
+    ct_expect_int(ctx, "parseFloat(T42S)", 42, JS_TT_OP_PARSE_FLOAT, 1, 1);
+    {
+        /* a concretely-NaN op stays faithfully NaN (never a masked throw) */
+        JSValue p;
+        double d = 0;
+        cb_calls = 0;
+        p = ct_eval_payload(ctx, "TOBJ * 1");
+        assert(!JS_IsException(p));
+        assert(JS_VALUE_GET_TAG(p) != JS_TAG_STRING);
+        if (JS_ToFloat64(ctx, &d, p))
+            die(ctx, "TOBJ * 1 payload");
+        assert(isnan(d));
+        JS_FreeValue(ctx, p);
+        ct_check_combine("TOBJ * 1", JS_TT_OP_MUL, 1, 2);
+    }
+    printf("COMBINE:coercions ok\n");
+
+    /* --- two tagged operands ------------------------------------------- */
+    ct_expect_int(ctx, "T2 + T3", 5, JS_TT_OP_ADD, 3, 2);
+    printf("COMBINE:two tagged operands ok\n");
+
+    /* --- relational / loose equality produce tagged booleans ----------- */
+    ct_expect_bool(ctx, "T5 < 6", 1, JS_TT_OP_LT, 1);
+    ct_expect_bool(ctx, "T5 > 6", 0, JS_TT_OP_GT, 1);
+    ct_expect_bool(ctx, "T5 <= T5", 1, JS_TT_OP_LTE, 3);
+    ct_expect_bool(ctx, "T2 == 2", 1, JS_TT_OP_EQ, 1);
+    ct_expect_bool(ctx, "T2 != 2", 0, JS_TT_OP_NEQ, 1);
+    printf("COMBINE:relational/loose-eq ok\n");
+
+    /* --- a throwing concrete op propagates the real error -------------- */
+    cb_calls = 0;
+    ct_expect_throws(ctx, "TSYM * 1", "symbol");
+    assert(cb_calls == 0);        /* no Combine on a failed op */
+    printf("COMBINE:faithful throw ok\n");
+
+    /* --- out-of-scope behavior is EXACTLY today's ----------------------- */
+    ct_expect_concrete(ctx, "T5 === 5", "false");   /* identity, no unwrap */
+    ct_expect_concrete(ctx, "T5 === T5", "true");
+    ct_expect_concrete(ctx, "typeof T5", "object");
+    ct_expect_concrete(ctx, "T5 ? 1 : 2", "1");     /* truthiness: problem 3 */
+    ct_expect_throws(ctx, "({})[TKEY]", NULL);      /* key coercion throws */
+    ct_expect_throws(ctx, "var ko = {}; ko[TKEY] = 1", NULL);
+    ct_expect_throws(ctx, "String.prototype.charAt.call(TAB, 0)", NULL);
+    ct_expect_throws(ctx, "new String(T9)", NULL);
+    printf("COMBINE:out-of-scope unchanged ok\n");
+
+    /* --- a propagated result rides problem 1's graph paths -------------- */
+    {
+        JSValue R, g, arm, tA, g2, t2;
+        uint8_t *bytes;
+        size_t blen;
+        char want_note[64];
+        int clones0;
+        snprintf(want_note, sizeof(want_note), "C%d(H5,-)", JS_TT_OP_ADD);
+        R = eval_val(ctx, "T5 + 1");
+        assert(JS_TTIsTagged(R));
+        assert(JS_TTNote(R) && strcmp((char *)JS_TTNote(R), want_note) == 0);
+        g = tg_start_tflow(ctx);
+        if (!JS_TTFlowSetLocal(ctx, g, 0, at_t, R)) {
+            fprintf(stderr, "FAIL: inject propagated result\n");
+            return 1;
+        }
+        clones0 = tg_clones;
+        arm = JS_TTFlowFork(ctx, g);
+        if (JS_IsException(arm))
+            die(ctx, "fork with propagated result");
+        assert(tg_clones == clones0 + 1);
+        tA = JS_TTFlowGetLocal(ctx, arm, 0, at_t);
+        assert(JS_TTIsTagged(tA));
+        assert(JS_TTNote(tA) != JS_TTNote(R));
+        assert(strcmp((char *)JS_TTNote(tA), want_note) == 0);
+        bytes = JS_TTFlowSerialize(ctx, g, &blen);
+        if (!bytes)
+            die(ctx, "serialize propagated result");
+        g2 = JS_TTFlowDeserialize(ctx, bytes, blen);
+        if (JS_IsException(g2))
+            die(ctx, "hydrate propagated result");
+        js_free(ctx, bytes);
+        t2 = JS_TTFlowGetLocal(ctx, g2, 0, at_t);
+        assert(JS_TTIsTagged(t2));
+        assert(strcmp((char *)JS_TTNote(t2), want_note) == 0);
+        {
+            JSValue p = JS_TTPayload(ctx, t2);
+            assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT &&
+                   JS_VALUE_GET_INT(p) == 6);
+            JS_FreeValue(ctx, p);
+        }
+        JS_FreeValue(ctx, tA);
+        JS_FreeValue(ctx, t2);
+        JS_FreeValue(ctx, R);
+        JS_FreeValue(ctx, g);
+        JS_FreeValue(ctx, g2);
+        JS_FreeValue(ctx, arm);
+    }
+    printf("COMBINE:propagated result round-trips ok\n");
+
+    /* --- teardown -------------------------------------------------------- */
+    JS_FreeAtom(ctx, at_t);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);       /* the leak/double-free oracle */
+    assert(tg_live == 0);     /* every note (operand + combined) freed */
+    printf("COMBINE:teardown ok (combines=%d)\n", cb_calls);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 3 && !strcmp(argv[1], "emit"))
@@ -2137,6 +2935,10 @@ int main(int argc, char **argv)
         return cmd_asynctest();
     if (argc >= 2 && !strcmp(argv[1], "cowtest"))
         return cmd_cowtest();
+    if (argc >= 2 && !strcmp(argv[1], "taggedtest"))
+        return cmd_taggedtest();
+    if (argc >= 2 && !strcmp(argv[1], "combinetest"))
+        return cmd_combinetest();
     fprintf(stderr, "usage: flow-harness emit|resume <file> | selftest\n");
     return 2;
 }
