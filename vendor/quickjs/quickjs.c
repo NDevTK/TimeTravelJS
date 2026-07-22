@@ -18836,10 +18836,12 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
    never straddles segments -- when the current segment cannot hold a
    request, allocation continues in a fresh (or kept-for-reuse) successor
    segment. The runtime's own execution arena is one fixed 2 MB segment
-   (exhaustion IS the engine's recursion limit); per-machine arenas start
-   at a demand-sized sliver and double up to TT_ARENA_SEG_MAX, capped at
-   the same 2 MB total, so N suspended machines cost the sum of their
-   actual chain depths, not N slabs. */
+   (exhaustion IS the engine's recursion limit, exact and
+   snapshot-stable); per-machine arenas start at a demand-sized sliver,
+   double up to TT_ARENA_SEG_MAX (then scale geometrically for deep
+   chains) and are UNBOUNDED in total -- a machine's depth stops at the
+   runtime memory limit, not at a cap -- so N suspended machines cost the
+   sum of their actual chain depths, not N slabs. */
 #define TT_FRAME_ARENA_SIZE (2 * 1024 * 1024)
 #define TT_ARENA_SEG_MIN    1024
 #define TT_ARENA_SEG_MAX    (64 * 1024)
@@ -18913,13 +18915,21 @@ static void tt_arena_flush_graveyard(JSRuntime *rt)
 
 /* enter the segment after 'cur' that can hold an aligned block of 'need'
    bytes: reuse a kept successor when it fits, else append a fresh
-   demand-sized one (dropping a too-small stale tail). Returns NULL at the
-   total growth cap or OOM. */
+   demand-sized one (dropping a too-small stale tail). Growable (machine)
+   arenas have NO total cap — the runtime memory limit (ultimately the
+   RAM floor) is the bound, surfaced as a catchable stack overflow at the
+   push site. Small chains keep the historical 1 KB→64 KB doubling so N
+   suspended machines still cost the sum of their actual depths; once a
+   chain outgrows eight max segments the per-segment ceiling scales to
+   total/8, keeping deep machines at O(log + constant) segments with at
+   most ~12.5% slack. Segments never move, so growth cannot disturb live
+   frames or the wire format's parent-relative offsets. Returns NULL on
+   OOM. */
 static TTArenaSeg *tt_arena_seg_append(JSRuntime *rt, TTArenaSeg *cur,
                                        size_t need, size_t *ptotal)
 {
     TTArenaSeg *seg;
-    size_t want, cap_left;
+    size_t want, seg_cap;
     uint8_t *storage;
 
     if (cur && cur->next) {
@@ -18927,18 +18937,14 @@ static TTArenaSeg *tt_arena_seg_append(JSRuntime *rt, TTArenaSeg *cur,
             return cur->next;
         tt_arena_seg_free_tail(rt, cur, ptotal);
     }
-    if (*ptotal >= TT_FRAME_ARENA_SIZE)
-        return NULL;
-    cap_left = TT_FRAME_ARENA_SIZE - *ptotal;
+    seg_cap = TT_ARENA_SEG_MAX;
+    if (*ptotal / 8 > seg_cap)
+        seg_cap = *ptotal / 8;
     want = cur ? cur->size * 2 : TT_ARENA_SEG_MIN;
-    if (want > TT_ARENA_SEG_MAX)
-        want = TT_ARENA_SEG_MAX;
+    if (want > seg_cap)
+        want = seg_cap;
     if (want < need)
         want = need;
-    if (want > cap_left)
-        want = cap_left;
-    if (want < need)
-        return NULL;
     seg = js_malloc_rt(rt, sizeof(*seg) + want + 16);
     if (!seg)
         return NULL;
@@ -45091,9 +45097,9 @@ static int wr_enum_state(TTFlowWr *w, JSAsyncFunctionState *st)
 static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
 {
     JSRuntime *rt = w->ctx->rt;
-    JSStackFrame *chain[256];
+    JSStackFrame **chain;
     int n = 0, i;
-    JSStackFrame *sf;
+    JSStackFrame *sf, *walk_from;
     uint8_t *chain_top;
     TTArenaSeg *chain_seg;
 
@@ -45114,13 +45120,11 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
         chain_seg = rt->tt_arena_seg;
     }
 
+    /* the chain is as deep as the machine's arena is — unbounded. Count,
+       then collect into an exact heap array. */
+    walk_from = sf;
     while (sf && sf != &base->frame) {
-        if (n >= (int)countof(chain)) {
-            JS_ThrowTypeError(w->ctx, "flow serialization: parked chain too "
-                              "deep");
-            return -1;
-        }
-        chain[n++] = sf;
+        n++;
         sf = sf->prev_frame;
     }
     if (sf != &base->frame) {
@@ -45128,7 +45132,13 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
                           "is not the parked machine");
         return -1;
     }
-    chain[n++] = sf;
+    n++;
+    chain = js_malloc(w->ctx, sizeof(*chain) * n);
+    if (!chain)
+        goto fail_chain;
+    for (sf = walk_from, i = 0; i < n - 1; i++, sf = sf->prev_frame)
+        chain[i] = sf;
+    chain[n - 1] = sf;
     /* base first */
     for (i = n - 1; i >= 0; i--) {
         JSStackFrame *f = chain[i];
@@ -45144,7 +45154,7 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
                     JS_ThrowTypeError(w->ctx, "flow serialization: "
                                       "unsupported chained state frame kind "
                                       "%d", kind);
-                    return -1;
+                    goto fail_chain;
                 }
                 gshape = (f->tt_aux_i >> 8) & 0xff;
                 if (gshape != TT_GENSHAPE_METHOD &&
@@ -45154,22 +45164,22 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
                     JS_ThrowTypeError(w->ctx, "flow serialization: "
                                       "unsupported generator splice shape %d",
                                       gshape);
-                    return -1;
+                    goto fail_chain;
                 }
                 if (!JS_IsUndefined(f->tt_ctor_this)) {
                     JS_ThrowTypeError(w->ctx, "flow serialization: chained "
                                       "frame carries a side block");
-                    return -1;
+                    goto fail_chain;
                 }
             } else if (kind != TT_FRAME_GEN && kind != TT_FRAME_ENTRY) {
                 JS_ThrowTypeError(w->ctx, "flow serialization: base frame "
                                   "kind %d is not transplantable", kind);
-                return -1;
+                goto fail_chain;
             }
             if (wr_add_frame(w, f, 0, 1))
-                return -1;
+                goto fail_chain;
             if (wr_enum_state(w, st))
-                return -1;
+                goto fail_chain;
         } else {
             int kind = f->tt_frame_kind;
             if (kind != TT_FRAME_CALL && kind != TT_FRAME_CALL_METHOD &&
@@ -45177,23 +45187,23 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
                 JS_ThrowTypeError(w->ctx, "flow serialization: arena frame "
                                   "kind %d is not transplantable (reflective "
                                   "machinery in the chain)", kind);
-                return -1;
+                goto fail_chain;
             }
             if (f->tt_aux != NULL || !JS_IsUndefined(f->tt_ctor_this) ||
                 !JS_IsUndefined(f->tt_new_target)) {
                 JS_ThrowTypeError(w->ctx, "flow serialization: arena frame "
                                   "carries continuation state");
-                return -1;
+                goto fail_chain;
             }
             if (f->cur_sp == NULL) {
                 JS_ThrowInternalError(w->ctx, "flow serialization: parked "
                                       "frame without a saved sp");
-                return -1;
+                goto fail_chain;
             }
             if (wr_add_frame(w, f, 1, 1))
-                return -1;
+                goto fail_chain;
             if (wr_enum_value(w, f->cur_func))
-                return -1;
+                goto fail_chain;
         }
     }
     /* contiguity: the arena extent must hold exactly the chain's arena
@@ -45222,7 +45232,7 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
             if (!seg) {
                 JS_ThrowTypeError(w->ctx, "flow serialization: chain frame "
                                   "outside the machine's arena");
-                return -1;
+                goto fail_chain;
             }
             if (expect &&
                 !((seg == cs && (uint8_t *)f == expect) ||
@@ -45230,7 +45240,7 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
                    size > (size_t)(cs->limit - expect)))) {
                 JS_ThrowTypeError(w->ctx, "flow serialization: foreign arena "
                                   "blocks inside the parked chain");
-                return -1;
+                goto fail_chain;
             }
             cs = seg;
             expect = (uint8_t *)f + size;
@@ -45238,11 +45248,15 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
         if (expect && (expect != chain_top || cs != chain_seg)) {
             JS_ThrowTypeError(w->ctx, "flow serialization: arena extent does "
                               "not end at the parked top");
-            return -1;
+            goto fail_chain;
         }
     }
     w->machine = TRUE;
+    js_free(w->ctx, chain);
     return 0;
+ fail_chain:
+    js_free(w->ctx, chain);
+    return -1;
 }
 
 static int wr_enum_varref(TTFlowWr *w, JSVarRef *vr)

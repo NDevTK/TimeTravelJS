@@ -197,6 +197,7 @@
 #include <string.h>
 #include <assert.h>
 #include <math.h>
+#include <time.h>
 
 /* the baseline program: MUST be byte-identical in every process. The flow
    exercises: baseline objects (CONFIG/TABLE), nested generators (yield* =
@@ -1623,6 +1624,177 @@ static int cmd_deep(void)
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     printf("DEEP:teardown ok\n");
+    return 0;
+}
+
+/* unbounded: remove-the-last-bound oracle. A machine recurses FAR past
+   the old 2 MB per-machine arena cap: the legacy machine parks at a
+   legacy-safe depth, forks into a handle, and the handle resumes with the
+   step hook armed so it descends another forty thousand rec levels INSIDE
+   its own arena and re-parks near the bottom -- a ~10+ MB chain spanning
+   dozens of never-moved segments. Asserts the footprint really exceeds
+   the old cap while reserved RAM still tracks used bytes (the hard
+   Σ-depth bound), that serialization is byte-STABLE across the growth
+   (serialize -> hydrate -> re-serialize gives identical bytes, and the
+   same again through evict -> hydrate), and that two independent
+   hydrations resume across every segment boundary -- all the way down and
+   all the way back up -- to identical completions. */
+#define UNB_TOTAL 46000
+#define UNB_LEGACY 6000
+static int cmd_unbounded(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    ParkPlan plan;
+    JSValue g, drive_fn, armU, h1, hE;
+    uint8_t *s1, *s2, *s3, *ev;
+    size_t l1, l2, l3, el, used = 0, reserved = 0;
+    int segs = 0, parked = 0, done = 0;
+    size_t tcap = 256 * 1024;
+    char *tr1 = malloc(tcap), *trE = malloc(tcap);
+
+    assert(tr1 && trE);
+
+    {
+        JSValue fn = get_global(ctx, "deepflow");
+        JSValue arg = JS_NewInt32(ctx, UNB_TOTAL);
+        g = JS_Call(ctx, fn, JS_UNDEFINED, 1, (JSValueConst *)&arg);
+        if (JS_IsException(g))
+            die(ctx, "deepflow()");
+        JS_FreeValue(ctx, fn);
+    }
+
+    /* park the legacy machine at a depth its fixed 2 MB arena allows */
+    plan.line = baseline_line_of("return rec(n - 1, a) + 0");
+    plan.countdown = UNB_LEGACY;
+    plan.parked_line = 0;
+    plan.fork_here = 0;
+    plan.forked = JS_UNDEFINED;
+    JS_TTSetStepHandler(rt, park_handler, &plan);
+    JS_TTSetStepFilename(ctx, "baseline.js");
+    JS_TTEnableStep(rt, 1);
+    drive_fn = get_global(ctx, "drive");
+    {
+        JSValueConst args[1] = { g };
+        JSValue ret = JS_TTCallArgs(ctx, drive_fn, JS_UNDEFINED, 1, args,
+                                    &parked);
+        if (JS_IsException(ret))
+            die(ctx, "unbounded drive");
+        if (!parked) {
+            fprintf(stderr, "FATAL unbounded machine did not park\n");
+            return 1;
+        }
+        JS_FreeValue(ctx, ret);
+    }
+    JS_TTEnableStep(rt, 0);
+
+    armU = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(armU))
+        die(ctx, "unbounded fork");
+
+    {   /* discard the legacy machine through the abort path: only the
+           handle's own arena carries the recursion from here on */
+        JSValue ret = JS_TTCallResume(ctx, 1, &parked);
+        if (parked)
+            die(ctx, "abort did not complete");
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+
+    /* resume the handle and let it recurse the remaining ~40 000 levels
+       inside its own arena, re-parking near the bottom */
+    plan.countdown = UNB_TOTAL - UNB_LEGACY - 200;
+    plan.parked_line = 0;
+    JS_TTEnableStep(rt, 1);
+    {
+        JSValue v = JS_TTFlowResumeParked(ctx, armU, 0, &done, &parked);
+        if (JS_IsException(v))
+            die(ctx, "unbounded deep resume");
+        if (!parked) {
+            fprintf(stderr, "FATAL handle did not re-park deep\n");
+            return 1;
+        }
+        JS_FreeValue(ctx, v);
+    }
+    JS_TTEnableStep(rt, 0);
+
+    if (JS_TTFlowMachineStats(ctx, armU, &used, &reserved, &segs)) {
+        fprintf(stderr, "FAIL unbounded handle has no machine\n");
+        return 1;
+    }
+    printf("UNBOUNDED:machine used=%zu reserved=%zu segments=%d\n",
+           used, reserved, segs);
+    assert(used > 2 * (size_t)(2 * 1024 * 1024)); /* far past the old cap */
+    assert(segs >= 10);                           /* many never-moved segments */
+    assert(reserved <= used + used / 4 + 65536);  /* growth tracks depth: the
+                                                     hard bound, with the
+                                                     documented <=12.5% slack
+                                                     plus one open segment */
+
+    /* byte-stability across the growth: serialize -> hydrate ->
+       re-serialize must reproduce the exact bytes */
+    s1 = JS_TTFlowSerialize(ctx, armU, &l1);
+    if (!s1)
+        die(ctx, "unbounded serialize");
+    h1 = JS_TTFlowDeserialize(ctx, s1, l1);
+    if (JS_IsException(h1))
+        die(ctx, "unbounded deserialize");
+    s2 = JS_TTFlowSerialize(ctx, h1, &l2);
+    if (!s2)
+        die(ctx, "unbounded re-serialize");
+    if (l1 != l2 || memcmp(s1, s2, l1) != 0) {
+        fprintf(stderr, "FAIL re-serialization differs (%zu vs %zu bytes)\n",
+                l1, l2);
+        return 1;
+    }
+    printf("UNBOUNDED:re-serialization byte-identical (%zu bytes)\n", l1);
+
+    /* ... and the same through a full evict -> hydrate cycle */
+    ev = JS_TTMachineEvict(ctx, armU, &el);
+    if (!ev)
+        die(ctx, "unbounded evict");
+    hE = JS_TTMachineHydrate(ctx, ev, el);
+    if (JS_IsException(hE))
+        die(ctx, "unbounded hydrate");
+    js_free(ctx, ev);
+    s3 = JS_TTFlowSerialize(ctx, hE, &l3);
+    if (!s3)
+        die(ctx, "unbounded post-evict serialize");
+    if (l1 != l3 || memcmp(s1, s3, l1) != 0) {
+        fprintf(stderr, "FAIL evict/hydrate serialization differs "
+                "(%zu vs %zu bytes)\n", l1, l3);
+        return 1;
+    }
+    printf("UNBOUNDED:evict/hydrate byte-stable (%zu bytes)\n", el);
+    js_free(ctx, s1);
+    js_free(ctx, s2);
+    js_free(ctx, s3);
+
+    /* two independent hydrations unwind every level and every segment
+       boundary back up to identical completions */
+    resume_first(ctx, h1, tr1, tcap);
+    collect_flow(ctx, h1, 0, tr1 + strlen(tr1), tcap - strlen(tr1));
+    resume_first(ctx, hE, trE, tcap);
+    collect_flow(ctx, hE, 0, trE + strlen(trE), tcap - strlen(trE));
+    if (strcmp(tr1, trE) != 0) {
+        fprintf(stderr, "FAIL hydrated futures diverge\n");
+        return 1;
+    }
+    assert(strstr(tr1, "deep:"));
+    assert(strstr(tr1, "deep-done:"));
+    printf("UNBOUNDED:futures identical, %zu trace bytes\n", strlen(tr1));
+
+    free(tr1);
+    free(trE);
+    JS_FreeValue(ctx, drive_fn);
+    JS_FreeValue(ctx, g);
+    JS_FreeValue(ctx, armU);
+    JS_FreeValue(ctx, h1);
+    JS_FreeValue(ctx, hE);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    printf("PASS: unbounded machine arena (depth %d, past-cap growth, "
+           "byte-stable)\n", UNB_TOTAL);
     return 0;
 }
 
@@ -3924,6 +4096,8 @@ int main(int argc, char **argv)
         return cmd_forkhere();
     if (argc >= 2 && !strcmp(argv[1], "mass"))
         return cmd_mass();
+    if (argc >= 2 && !strcmp(argv[1], "unbounded"))
+        return cmd_unbounded();
     if (argc >= 2 && !strcmp(argv[1], "deep"))
         return cmd_deep();
     if (argc >= 2 && !strcmp(argv[1], "evict"))

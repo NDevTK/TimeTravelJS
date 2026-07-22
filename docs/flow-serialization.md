@@ -333,11 +333,18 @@ realloc-that-moves — live frames carry parent-relative aliases and
 open-cell storage pointers, so a block's address is forever. A block
 never straddles segments: when the current segment cannot hold a push,
 allocation continues in a fresh segment sized to the demand (first
-segment ≥ 1 KB, then doubling to a 64 KB ceiling, total capped at the
-same 2 MB the fixed arena enforces, so the recursion limit keeps its
-order of magnitude). The runtime's own execution arena is the degenerate
-case — one fixed 2 MB segment whose exhaustion *is* the engine's
-snapshot-stable recursion limit — so normal execution is unchanged.
+segment ≥ 1 KB, then doubling to a 64 KB ceiling that scales
+geometrically once a chain outgrows it — at most ~12.5% slack). A
+machine's total is **unbounded**: its depth stops at the runtime memory
+limit — ultimately the RAM floor — not at a cap, surfaced as the same
+catchable stack overflow. The runtime's own execution arena is the
+degenerate case — one fixed 2 MB segment whose exhaustion *is* the
+engine's snapshot-stable recursion limit — so normal execution is
+unchanged. The `unbounded` harness command holds the claim to bytes: a
+machine parked 46 000 frames deep (a ~10 MB, ~40-segment chain, five
+times the old cap) re-serializes byte-identically, round-trips through
+evict → hydrate to the same bytes, and two independent hydrations
+resume across every segment boundary to identical completions.
 
 The hot paths stay hot: push is the same bump-and-compare with a slow
 path that enters the next segment; pop is LIFO release to a mark, with a
