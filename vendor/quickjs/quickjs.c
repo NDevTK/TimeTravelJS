@@ -35654,8 +35654,16 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
             }
         }
 
-        /* initialize the global variables */
-        ret_val = JS_Call(ctx, m->func_obj, JS_TRUE, 0, NULL);
+        /* initialize the global variables. This runs the module bytecode's
+           hoisting prologue only (InitializeEnvironment: declarations, no
+           user statements) — linking, not program execution, so it is not
+           a step the debugger could ever park on: mask the step hook. */
+        {
+            BOOL saved_step = ctx->rt->tt_step_enabled;
+            ctx->rt->tt_step_enabled = FALSE;
+            ret_val = JS_Call(ctx, m->func_obj, JS_TRUE, 0, NULL);
+            ctx->rt->tt_step_enabled = saved_step;
+        }
         if (JS_IsException(ret_val))
             goto fail;
         JS_FreeValue(ctx, ret_val);
@@ -36224,16 +36232,14 @@ static JSValue js_async_module_execution_fulfilled(JSContext *ctx, JSValueConst 
     return JS_UNDEFINED;
 }
 
-static int js_execute_async_module(JSContext *ctx, JSModuleDef *m)
+/* The .then wiring tail of js_execute_async_module, over the body's
+   already-created result promise (consumed). Split out so the stackless
+   module evaluator can run the body in-loop and then wire identically. */
+static int js_execute_async_module_tail(JSContext *ctx, JSModuleDef *m,
+                                        JSValue promise)
 {
-    JSValue promise, m_obj;
-    JSValue resolve_funcs[2], ret_val;
-#ifdef DUMP_MODULE_EXEC
-    js_dump_module(ctx, __func__, m);
-#endif
-    promise = js_async_function_call(ctx, m->func_obj, JS_UNDEFINED, 0, NULL, 0);
-    if (JS_IsException(promise))
-        return -1;
+    JSValue m_obj, resolve_funcs[2], ret_val;
+
     m_obj = JS_NewModuleValue(ctx, m);
     resolve_funcs[0] = JS_NewCFunctionData(ctx, js_async_module_execution_fulfilled, 0, 0, 1, (JSValueConst *)&m_obj);
     resolve_funcs[1] = JS_NewCFunctionData(ctx, js_async_module_execution_rejected, 0, 0, 1, (JSValueConst *)&m_obj);
@@ -36244,6 +36250,18 @@ static int js_execute_async_module(JSContext *ctx, JSModuleDef *m)
     JS_FreeValue(ctx, resolve_funcs[1]);
     JS_FreeValue(ctx, promise);
     return 0;
+}
+
+static int js_execute_async_module(JSContext *ctx, JSModuleDef *m)
+{
+    JSValue promise;
+#ifdef DUMP_MODULE_EXEC
+    js_dump_module(ctx, __func__, m);
+#endif
+    promise = js_async_function_call(ctx, m->func_obj, JS_UNDEFINED, 0, NULL, 0);
+    if (JS_IsException(promise))
+        return -1;
+    return js_execute_async_module_tail(ctx, m, promise);
 }
 
 /* return < 0 in case of exception. *pvalue contains the exception. */
@@ -36483,10 +36501,14 @@ typedef struct TTModEval {
     int sp, size;
     JSModuleDef *scc_top;  /* SCC chain through m->stack_prev */
     int index;             /* [[DFSIndex]] counter */
-    /* the in-flight synchronous body (set while it runs / is parked) */
+    /* the in-flight module body (set while it runs / is parked) */
     JSAsyncFunctionState *body;
     JSModuleDef *body_m;
     JSValue body_promise;
+    int body_is_async;     /* a top-level-await body: first segment ran
+                              in-loop; completion wires the async-module
+                              then-handlers instead of checking the
+                              promise synchronously */
 } TTModEval;
 
 static void tt_modeval_free(JSRuntime *rt, TTModEval *me)
@@ -36591,6 +36613,7 @@ static int tt_modeval_body_start(JSContext *ctx, TTModEval *me,
         me->body = s;
         me->body_m = m;
         me->body_promise = promise;
+        me->body_is_async = 0;
         return 1;
     }
     raw = async_func_finish(ctx, s, raw);
@@ -36611,6 +36634,45 @@ static int tt_modeval_body_start(JSContext *ctx, TTModEval *me,
             return -1;
         }
     }
+    return 0;
+}
+
+/* Start a top-level-await module body in-loop (the ExecuteAsyncModule
+   half): its first segment runs parkable; the await continuations resume
+   under the job pump as before. Returns 1 when parked, 0 otherwise.
+   Failures mirror the classic caller, which ignores
+   js_execute_async_module's result. */
+static int tt_modeval_body_start_async(JSContext *ctx, TTModEval *me,
+                                       JSModuleDef *m)
+{
+    JSRuntime *rt = ctx->rt;
+    JSAsyncFunctionState *s;
+    JSValue promise, raw;
+
+    s = async_func_init(ctx, m->func_obj, JS_UNDEFINED, 0, NULL);
+    if (!s)
+        return 0;
+    promise = JS_NewPromiseCapability(ctx, s->resolving_funcs);
+    if (JS_IsException(promise)) {
+        async_func_free(rt, s);
+        return 0;
+    }
+    tt_async_flow_link(ctx, promise, s);
+    rt->tt_park_ok = TRUE;
+    raw = JS_CallInternal(ctx, JS_MKPTR(JS_TAG_INT, s), s->this_val,
+                          JS_UNDEFINED, s->argc, s->frame.arg_buf,
+                          JS_CALL_FLAG_GENERATOR);
+    if (rt->tt_parked_frame) {
+        me->body = s;
+        me->body_m = m;
+        me->body_promise = promise;
+        me->body_is_async = 1;
+        return 1;
+    }
+    raw = async_func_finish(ctx, s, raw);
+    js_async_function_post(ctx, s, raw);
+    async_func_free(rt, s);
+    js_execute_async_module_tail(ctx, m, promise);
     return 0;
 }
 
@@ -36676,13 +36738,9 @@ static JSValue tt_modeval_run(JSContext *ctx, int *pparked)
             m->async_evaluation = TRUE;
             m->async_evaluation_timestamp =
                 rt->module_async_evaluation_next_timestamp++;
-            {
-                /* classic C halves; their awaits resume under the parkable
-                   job pump. Mask park support for the inline segment. */
-                BOOL saved = rt->tt_park_ok;
-                rt->tt_park_ok = FALSE;
-                js_execute_async_module(ctx, m);
-                rt->tt_park_ok = saved;
+            if (tt_modeval_body_start_async(ctx, me, m)) {
+                *pparked = 1;
+                return JS_UNDEFINED;
             }
         } else if (m->init_func) {
             /* C module init: no JS runs */
@@ -36781,7 +36839,6 @@ static JSValue tt_modeval_body_resumed(JSContext *ctx, JSValue raw,
     JSValue promise = me->body_promise;
     JSValue err;
     JSPromiseStateEnum state;
-    TTModEvalFrame *f;
 
     me->body = NULL;
     me->body_m = NULL;
@@ -36790,6 +36847,13 @@ static JSValue tt_modeval_body_resumed(JSContext *ctx, JSValue raw,
     raw = async_func_finish(ctx, s, raw);
     js_async_function_post(ctx, s, raw);
     async_func_free(rt, s);
+    if (me->body_is_async) {
+        /* top-level-await body: wire the async-module then-handlers;
+           completion/rejection flows through the job queue */
+        me->body_is_async = 0;
+        js_execute_async_module_tail(ctx, m, promise);
+        goto post_body;
+    }
     state = JS_PromiseState(ctx, promise);
     if (state == JS_PROMISE_FULFILLED) {
         JS_FreeValue(ctx, promise);
@@ -36803,6 +36867,8 @@ static JSValue tt_modeval_body_resumed(JSContext *ctx, JSValue raw,
         err = JS_GetException(ctx);
         goto fail;
     }
+
+ post_body:
 
     /* the body belonged to the top DFS frame: run its post-body half
        (SCC pop + frame pop with parent notification), then continue */
