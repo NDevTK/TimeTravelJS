@@ -89,6 +89,22 @@
  *                               hydrates, and pumps to a byte-identical
  *                               continuation -- the microtask firing
  *                               exactly once per living copy.
+ *
+ *   flow-harness cowtest        automatic transparent COW: two forked arms
+ *                               run ORDINARY program code (sharedObj.x = v;
+ *                               sharedArr.push(...); sharedP.then(...)) with
+ *                               no host DeltaWrite calls; the engine captures
+ *                               baseline pre-images into the checked-in
+ *                               flow's delta automatically. Asserts per-arm
+ *                               isolation, pristine baseline when nobody is
+ *                               checked in, shared pointer identity, the
+ *                               exact delta record count (flow-private
+ *                               objects are never captured), zero
+ *                               allocation on the second write to an
+ *                               already-captured cell, serialize/hydrate
+ *                               round-trip of an auto-captured delta, the
+ *                               per-arm promise-reaction oracle, and that
+ *                               completion commits the winning arm's writes.
  */
 #include "quickjs.h"
 #include <stdio.h>
@@ -179,6 +195,19 @@ static const char *BASELINE_SRC =
 "  Promise.resolve(\"m\").then(function (v) { MLOG.push(\"micro:\" + v); return v; });\n"
 "  var got = await new Promise(function (res) { r = res; });\n"
 "  return \"mf:got=\" + got;\n"
+"}\n"
+"var SHOBJ = { x: 0 };\n"
+"var SHARR = [];\n"
+"var SHP_RES = null;\n"
+"var SHP = new Promise(function (r) { SHP_RES = r; });\n"
+"function* cowflow() {\n"
+"  var v = yield \"ready\";\n"
+"  SHOBJ.x = v;\n"
+"  SHOBJ.x = v + 10;\n"
+"  SHARR.push(\"arm\" + v);\n"
+"  SHP.then(sink(\"p\" + v));\n"
+"  var w = yield \"wrote:\" + SHOBJ.x + \":\" + SHARR.join(\",\") + \":\" + SHARR.length;\n"
+"  return \"done:\" + SHOBJ.x + \":\" + w;\n"
 "}\n";
 
 static void die(JSContext *ctx, const char *what)
@@ -1921,6 +1950,167 @@ static int cmd_asynctest(void)
     return 0;
 }
 
+/* one next(arg) on a generator flow, its .value stringified into buf */
+static void next_str(JSContext *ctx, JSValueConst g, JSValueConst arg,
+                     char *buf, size_t cap)
+{
+    JSValue r = JS_Invoke(ctx, (JSValue)g, JS_NewAtom(ctx, "next"), 1,
+                          (JSValueConst *)&arg);
+    JSValue val;
+    const char *s;
+    if (JS_IsException(r))
+        die(ctx, "next(arg)");
+    val = JS_GetPropertyStr(ctx, r, "value");
+    s = JS_ToCString(ctx, val);
+    snprintf(buf, cap, "%s", s ? s : "?");
+    JS_FreeCString(ctx, s);
+    JS_FreeValue(ctx, val);
+    JS_FreeValue(ctx, r);
+}
+
+/* automatic transparent COW: ordinary program writes to shared objects
+   are captured per flow -- no host DeltaWrite calls anywhere below */
+static int cmd_cowtest(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx = new_baseline_ctx(&rt);
+    JSValue g, armA, armB, h, feed;
+    uint8_t *bytes;
+    size_t blen;
+    void *shobj_ptr;
+    char out[512];
+
+    {   /* start cowflow to its "ready" yield */
+        JSValue fn = get_global(ctx, "cowflow");
+        g = JS_Call(ctx, fn, JS_UNDEFINED, 0, NULL);
+        if (JS_IsException(g))
+            die(ctx, "cowflow()");
+        JS_FreeValue(ctx, fn);
+        next_str(ctx, g, JS_UNDEFINED, out, sizeof(out));
+        assert(strcmp(out, "ready") == 0);
+    }
+    {
+        JSValue o = eval_val(ctx, "SHOBJ");
+        shobj_ptr = JS_VALUE_GET_PTR(o);
+        JS_FreeValue(ctx, o);
+    }
+    if (JS_TTFlowCheckout(ctx, g))
+        die(ctx, "checkout");
+    armA = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(armA))
+        die(ctx, "fork armA");
+    armB = JS_TTFlowFork(ctx, g);
+    if (JS_IsException(armB))
+        die(ctx, "fork armB");
+
+    /* arm A writes shared state in ORDINARY program code */
+    if (JS_TTFlowCheckin(ctx, armA))
+        die(ctx, "checkin armA");
+    feed = JS_NewInt32(ctx, 1);
+    next_str(ctx, armA, feed, out, sizeof(out));
+    assert(strcmp(out, "wrote:11:arm1:1") == 0);
+    expect_str(ctx, "SHOBJ.x", "11", "armA view live");
+    expect_str(ctx, "SHARR.join(',')", "arm1", "armA array view");
+    {   /* shared identity: the very same object, isolated value */
+        JSValue o = eval_val(ctx, "SHOBJ");
+        assert(JS_VALUE_GET_PTR(o) == shobj_ptr);
+        JS_FreeValue(ctx, o);
+    }
+    assert(JS_TTFlowDeltaCount(ctx, armA) == 3);  /* SHOBJ, SHARR, SHP */
+    {   /* dedup: a second write to a captured cell allocates NOTHING */
+        JSMemoryUsage m0, m1;
+        JSValue shobj = eval_val(ctx, "SHOBJ");
+        JS_ComputeMemoryUsage(rt, &m0);
+        JS_SetPropertyStr(ctx, shobj, "x", JS_NewInt32(ctx, 11));
+        JS_ComputeMemoryUsage(rt, &m1);
+        assert(m1.malloc_count == m0.malloc_count);
+        assert(JS_TTFlowDeltaCount(ctx, armA) == 3);
+        JS_FreeValue(ctx, shobj);
+    }
+    if (JS_TTFlowCheckout(ctx, armA))
+        die(ctx, "checkout armA");
+    expect_str(ctx, "SHOBJ.x", "0", "baseline pristine after armA");
+    expect_str(ctx, "SHARR.length", "0", "baseline array pristine");
+    printf("COW:armA isolated, baseline pristine, dedup alloc-free\n");
+
+    /* arm B: only its own writes, blind to armA's */
+    if (JS_TTFlowCheckin(ctx, armB))
+        die(ctx, "checkin armB");
+    feed = JS_NewInt32(ctx, 2);
+    next_str(ctx, armB, feed, out, sizeof(out));
+    assert(strcmp(out, "wrote:12:arm2:1") == 0);
+    if (JS_TTFlowCheckout(ctx, armB))
+        die(ctx, "checkout armB");
+    expect_str(ctx, "SHOBJ.x", "0", "baseline pristine after armB");
+    expect_str(ctx, "SHARR.length", "0", "baseline array pristine 2");
+    printf("COW:armB isolated from armA\n");
+
+    /* auto-captured delta round-trips the wire: PROP + ARRAY + PROMISE */
+    bytes = JS_TTFlowSerialize(ctx, armB, &blen);
+    if (!bytes)
+        die(ctx, "serialize armB");
+    printf("COW:armB auto-delta -> %u bytes\n", (unsigned)blen);
+    h = JS_TTFlowDeserialize(ctx, bytes, blen);
+    if (JS_IsException(h))
+        die(ctx, "hydrate armB");
+    js_free(ctx, bytes);
+    JS_FreeValue(ctx, armB);          /* the hydrated copy takes its place */
+    if (JS_TTFlowCheckin(ctx, h))
+        die(ctx, "checkin h");
+    expect_str(ctx, "SHOBJ.x", "12", "hydrated auto-delta view");
+    expect_str(ctx, "SHARR.join(',')", "arm2", "hydrated array view");
+    if (JS_TTFlowCheckout(ctx, h))
+        die(ctx, "checkout h");
+    expect_str(ctx, "SHOBJ.x", "0", "pristine after hydrated view");
+    printf("COW:auto-captured delta round-tripped\n");
+
+    /* the promise oracle: both arms hold a .then on baseline SHP; each
+       settle fires ONLY that arm's reaction (reaction lists, the settled
+       state, and the capability's resolved flag all ride the delta) */
+    if (JS_TTFlowCheckin(ctx, armA))
+        die(ctx, "checkin armA 2");
+    JS_FreeValue(ctx, eval_val(ctx, "SHP_RES('sv')"));
+    pump_all(ctx, rt, NULL);
+    expect_str(ctx, "SINK.join(',')", "p1:sv", "armA ran only its reaction");
+    if (JS_TTFlowCheckout(ctx, armA))
+        die(ctx, "checkout armA 2");
+    expect_str(ctx, "SINK.length", "0", "SINK pristine between arms");
+    if (JS_TTFlowCheckin(ctx, h))
+        die(ctx, "checkin h 2");
+    JS_FreeValue(ctx, eval_val(ctx, "SHP_RES('sw')"));
+    pump_all(ctx, rt, NULL);
+    expect_str(ctx, "SINK.join(',')", "p2:sw", "h ran only its reaction");
+    if (JS_TTFlowCheckout(ctx, h))
+        die(ctx, "checkout h 2");
+    expect_str(ctx, "SINK.length", "0", "SINK pristine at the end");
+    printf("COW:per-arm promise reactions (the #4 oracle)\n");
+
+    /* completion while checked in commits; the last commit wins */
+    if (JS_TTFlowCheckin(ctx, armA))
+        die(ctx, "checkin armA 3");
+    feed = JS_NewString(ctx, "za");
+    next_str(ctx, armA, feed, out, sizeof(out));
+    JS_FreeValue(ctx, feed);
+    assert(strcmp(out, "done:11:za") == 0);
+    if (JS_TTFlowCheckin(ctx, h))
+        die(ctx, "checkin h 3");
+    feed = JS_NewString(ctx, "zb");
+    next_str(ctx, h, feed, out, sizeof(out));
+    JS_FreeValue(ctx, feed);
+    assert(strcmp(out, "done:12:zb") == 0);
+    expect_str(ctx, "SHOBJ.x", "12", "last commit wins");
+    expect_str(ctx, "SHARR.join(',')", "arm2", "last array commit wins");
+    printf("COW:completion commits\n");
+
+    JS_FreeValue(ctx, g);
+    JS_FreeValue(ctx, armA);
+    JS_FreeValue(ctx, h);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);       /* the leak oracle */
+    printf("COW:teardown ok\n");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 3 && !strcmp(argv[1], "emit"))
@@ -1945,6 +2135,8 @@ int main(int argc, char **argv)
         return cmd_evict();
     if (argc >= 2 && !strcmp(argv[1], "asynctest"))
         return cmd_asynctest();
+    if (argc >= 2 && !strcmp(argv[1], "cowtest"))
+        return cmd_cowtest();
     fprintf(stderr, "usage: flow-harness emit|resume <file> | selftest\n");
     return 2;
 }

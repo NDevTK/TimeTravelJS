@@ -213,12 +213,14 @@ the host drops it unresumed. The rules:
 ## The per-flow COW delta
 
 A flow's first-writes against shared baseline state are records of
-`(target, saved)` where target is a property slot `(obj, atom)` or a closure
-cell (`JSVarRef`), and `saved` always owns *the value not currently
-installed*:
+`(target, saved)` where target is a property slot `(obj, atom)`, a closure
+cell (`JSVarRef`), or a structural snapshot (see the automatic-COW section
+below), and `saved` always owns *the value not currently installed*:
 
-- `JS_TTFlowDeltaWriteProp/Cell` records the pre-image once (moving it into
-  the record), then writes through — the flow's view lives in the heap.
+- The engine records the pre-image once per target (capture is automatic —
+  see below; `JS_TTFlowDeltaWriteProp/Cell` remain as the host escape
+  hatch for injecting a chosen value), then writes through — the flow's
+  view lives in the heap.
 - `JS_TTFlowCheckout` swaps every record newest-first: the baseline shows
   pristine values, the records hold the flow's view. This is the state
   flows serialize in (enforced), so the wire's delta *is* the flow's view.
@@ -415,7 +417,7 @@ Afterwards the flow is an ordinary suspended generator, driven with
 `next()`. A flow parked inside the *live legacy* machine is refused with
 a pointer to `JS_TTCallResume`.
 
-## Wire format (`TTFL02`)
+## Wire format (`TTFL04`)
 
 ```
 header    magic, baseline fingerprint (u64), baseline count, flags
@@ -431,7 +433,12 @@ frames    the TrampFrame chain, base first: owner byte (state | arena);
 payloads  per record: prototype, properties (atomref, 6-bit shape flags,
           kind-specific payload), fast elements, closure cells, state
           fields; then per frame: the owned live JSValue range
-delta     (target, value) records: PROP obj+atom / CELL ref, then the view
+delta     per-kind pre-image records: PROP obj+atom+saved, PROPX
+          +presence+flags, CELL ref+saved, ARRAY element vector+length,
+          PROMISE full state/reaction snapshot, PRESOLVED flag, ODATA
+          slot, DEAD tombstone (MAP/ABUF refuse: fork-only for now)
+jobs      the flow's captured pending job queue: per job, kind byte
+          (reaction | thenable) + argument vrefs
 root      handle kind + vref (generator object) or base state index
 ```
 
@@ -487,6 +494,70 @@ with the pending microtask firing exactly once. The asynctest harness
 drives all three, including a `for await` loop over a flow-private async
 iterator forked mid-loop into independently-fed arms.
 
+## Automatic transparent COW
+
+Program writes are isolated without any host call: while a flow is checked
+in, the first mutation to each piece of *baseline* state records its
+pre-image into that flow's delta, then mutates. Flow-private objects — ones
+the running flow created — are never captured; that is the load-bearing
+O(shared-state-touched) invariant.
+
+**Classification is a birthmark, not a lookup.** `tt_baseline_add` stamps
+one bit on every registered `JSObject`/`JSVarRef`
+(`p->tt_baseline`) when the baseline registry is minted, and object/varref
+birth clears it. The checked-in flow sits in a runtime register
+(`rt->tt_cow_flow`, set last by `Checkin`, cleared first by `Checkout`,
+by completion, and by the finalizer). The hot-path gate is two loads:
+
+```c
+#define TT_COW_HIT(ctx, pobj) \
+    (unlikely((ctx)->rt->tt_cow_flow != NULL) && (pobj)->tt_baseline)
+```
+
+With no flow checked in (or a flow touching only its own objects) every
+mutation site costs one predictable branch. Because `Checkin`/`Checkout`
+run their swaps with the register cleared, the swaps themselves never
+re-capture.
+
+**Every mutation site funnels through a chokepoint.** Property set (both
+the generic path and the interpreter's inline-cache fast path), property
+add (`add_property`) and delete (`delete_property`), fast-array element
+stores and `length` changes, `Array.prototype.push`'s fast case, closure
+cell writes (a `TT_COW_CELL_CHECK` beside the interpreter's var_ref
+stores), promise reaction-list appends (`perform_promise_then`) and
+settlement (`fulfill_or_reject_promise`, the capability pair's
+already-resolved flag), `Map`/`Set` insert/delete/clear, typed-array and
+DataView stores plus the mutating typed-array builtins (fill, set,
+copyWithin, reverse, sort) via their backing `ArrayBuffer`, and `Date`'s
+`SetThisTimeValue`. A dedup index (pointer-keyed hash in the delta) makes
+the second write to an already-captured cell allocation-free.
+
+**Structural targets snapshot, value targets swap.** Beyond `PROP`/`CELL`
+slot records, the delta holds: `PROPX` (a presence toggle for adds and
+deletes — four states cover add-then-delete round trips, with `DEAD` as
+the revivable tombstone), `ARRAY` (the fast array's element vector +
+length, swapped as a unit), `PROMISE` (the full `JSPromiseData` snapshot
+including both reaction lists — this is what makes `baselineP.then(cb)`
+per-flow: each arm's reaction lives only in that arm's delta),
+`PRESOLVED` (the resolve/reject pair's shared flag), `MAP` (the whole
+`JSMapState`, cloned), `ABUF` (the byte image), and `ODATA` (`Date`'s
+time value). All kinds fork; `MAP`/`ABUF` refuse the wire for now
+(loudly).
+
+Mutations the delta cannot yet model refuse with a specific `TypeError`
+rather than leak across flows: prototype changes to a baseline object,
+fast-array demotion (sparse/exotic conversion), weak collections, shared
+`ArrayBuffer`s, and deleting a baseline accessor property. Accessor
+*redefinition* via `defineProperty` on a baseline object is the known
+uncovered edge (plain data-slot redefinition is covered).
+
+The cowtest harness drives the contract end to end: two forked arms run
+ordinary `sharedObj.x = v; sharedArr.push(...); sharedP.then(...)` code,
+each sees only its own writes while the baseline stays pristine and
+pointer-identical, capture adds zero allocation on a repeat write, the
+auto-captured delta serializes/hydrates, and finishing an arm commits its
+view (last completion wins).
+
 ## Scope and limits (v1)
 
 - **Generator flows** (including nested `yield*` chains, flow-private
@@ -509,7 +580,12 @@ iterator forked mid-loop into independently-fed arms.
   heap bigints, `Symbol.for`) are refused with the class named in the
   error; *baseline* objects of any class pass by id. Promises and their
   capability/continuation functions are fully supported (above).
-- Delta targets must be plain own data properties or detached cells.
+- Delta targets: plain own data properties, presence toggles, closure
+  cells, fast arrays, promises, resolve-capability flags, `Date` time
+  values fork *and* serialize; `Map`/`Set` state and `ArrayBuffer` bytes
+  fork but refuse the wire for now. Prototype changes, fast-array
+  demotion, weak collections and SharedArrayBuffers refuse capture
+  outright (loud `TypeError` at the mutation).
 - A flow checks out only between jobs: a job parked mid-run
   (`tt_job_kind` set) must finish through `JS_TTCallResume` first.
 - `JS_TTBaselineCapture` should run before flows start (it forces autoinit
