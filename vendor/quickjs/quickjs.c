@@ -14209,9 +14209,10 @@ static int JS_ToInt64Free(JSContext *ctx, int64_t *pres, JSValue val)
                 /* remainder modulo 2^64 */
                 v = (u.u64 & (((uint64_t)1 << 52) - 1)) | ((uint64_t)1 << 52);
                 ret = v << ((e - 1023) - 52);
-                /* take the sign into account */
+                /* take the sign into account (negation modulo 2^64:
+                   INT64_MIN negates to itself) */
                 if (u.u64 >> 63)
-                    ret = -ret;
+                    ret = (int64_t)(0 - (uint64_t)ret);
             } else {
                 ret = 0; /* also handles NaN and +inf */
             }
@@ -14275,9 +14276,10 @@ static int JS_ToInt32Free(JSContext *ctx, int32_t *pres, JSValue val)
                 v = (u.u64 & (((uint64_t)1 << 52) - 1)) | ((uint64_t)1 << 52);
                 v = v << ((e - 1023) - 52 + 32);
                 ret = v >> 32;
-                /* take the sign into account */
+                /* take the sign into account (negation modulo 2^32:
+                   INT32_MIN negates to itself) */
                 if (u.u64 >> 63)
-                    ret = -ret;
+                    ret = (int32_t)(0 - (uint32_t)ret);
             } else {
                 ret = 0; /* also handles NaN and +inf */
             }
@@ -71410,6 +71412,8 @@ static JSValue js_typed_array_toReversed(JSContext *ctx, JSValueConst this_val,
 
 static void slice_memcpy(uint8_t *dst, const uint8_t *src, size_t len)
 {
+    if (len == 0)
+        return; /* dst/src may be NULL (zero-length views) */
     if (dst + len <= src || dst >= src + len) {
         /* no overlap: can use memcpy */
         memcpy(dst, src, len);
