@@ -386,8 +386,18 @@ struct JSRuntime {
         uint8_t op;   /* 0 eq, 1 includes, 2 startsWith, 3 endsWith, 4 indexOf */
         char a[TT_CMP_STRMAX];
         char b[TT_CMP_STRMAX];
+        /* the host note of the tagged value this token probed (BORROWED
+           from that value -- valid while it lives; NULL for a compare
+           of concretes). Ties a recorded token to WHICH tracked input
+           was searched, since the C-builtin path has no result note to
+           hang the correlation on. Not part of dedup identity. */
+        void *note;
     } tt_cmp[TT_CMP_MAX];
     int tt_cmp_len;
+    /* staged journal note for the entry the CURRENT tagged string-search
+       re-entry is about to record (transient: set and restored around
+       one C call, never live across a park) */
+    void *tt_cmp_note_pending;
     /* TimeTravelJS stackless interpreter state. All interpreter frames live
        in this arena (linear memory), so when no native C frame is below the
        dispatch loop, suspending is just returning to the host and resuming
@@ -8000,9 +8010,15 @@ static void tt_cmp_store(JSRuntime *rt, struct TTCmpEnt *e)
     for (i = 0; i < rt->tt_cmp_len; i++) {
         if (rt->tt_cmp[i].h == h && rt->tt_cmp[i].op == e->op &&
             !memcmp(rt->tt_cmp[i].a, e->a, TT_CMP_STRMAX) &&
-            !memcmp(rt->tt_cmp[i].b, e->b, TT_CMP_STRMAX))
+            !memcmp(rt->tt_cmp[i].b, e->b, TT_CMP_STRMAX)) {
+            /* dedup keeps one entry per token: a tagged occurrence
+               still ties its note to the entry */
+            if (rt->tt_cmp_note_pending)
+                rt->tt_cmp[i].note = rt->tt_cmp_note_pending;
             return;
+        }
     }
+    e->note = rt->tt_cmp_note_pending;
     rt->tt_cmp[rt->tt_cmp_len++] = *e;
 }
 
@@ -57195,6 +57211,67 @@ static JSValue js_string_toWellFormed(JSContext *ctx, JSValueConst this_val,
 }
 
 static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv, int lastIndexOf);
+static JSValue js_string_includes(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv, int magic);
+
+/* String.prototype.{indexOf,lastIndexOf} / {includes,startsWith,endsWith}
+   with a tagged receiver, needle, or position: unwrap each tagged operand
+   to its payload (borrowed), re-enter the SAME builtin on the concretes
+   -- the existing C search, and the existing journal call now recording
+   the PAYLOAD strings -- with the primary operand's note staged so the
+   journal entry ties the token to the tracked value it probed (receiver's
+   note first, else the needle's; a tagged position alone names nothing).
+   The concrete result (indexOf's integer, includes' boolean) re-wraps
+   with a Combine-derived note, exactly like the parse pipelines. A
+   nested tagged payload re-intercepts one level per pass (the journal
+   entry then carries the note nearest the concrete string); a throwing
+   concrete call propagates untouched. */
+static JSValue tt_tagged_str_search(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv,
+                                    int magic, int is_index_of)
+{
+    JSValueConst orig[3];
+    JSValueConst args2[3];
+    void *notes[3], *note, *prev_pending;
+    JSValue ret, wrapped;
+    int i, n, argc2, tt_op;
+
+    argc2 = argc > 2 ? 2 : argc;
+    n = 1 + (argc2 > 1 ? 2 : 1);      /* this + needle (+ position) */
+    orig[0] = this_val;
+    orig[1] = argv[0];                /* padded to arity 1 */
+    orig[2] = argc2 > 1 ? argv[1] : JS_UNDEFINED;
+    for (i = 0; i < 3; i++) {
+        if (i < n && tt_value_is_tagged(orig[i])) {
+            JSObject *p = JS_VALUE_GET_OBJ(orig[i]);
+            args2[i] = p->u.tt_tagged.payload;   /* borrowed */
+            notes[i] = p->u.tt_tagged.note;
+        } else {
+            args2[i] = orig[i];
+            notes[i] = NULL;
+        }
+    }
+    prev_pending = ctx->rt->tt_cmp_note_pending;
+    if (notes[0] || notes[1])
+        ctx->rt->tt_cmp_note_pending = notes[0] ? notes[0] : notes[1];
+    if (is_index_of)
+        ret = js_string_indexOf(ctx, args2[0], argc2, args2 + 1, magic);
+    else
+        ret = js_string_includes(ctx, args2[0], argc2, args2 + 1, magic);
+    ctx->rt->tt_cmp_note_pending = prev_pending;
+    if (JS_IsException(ret))
+        return ret;
+    if (is_index_of)
+        tt_op = magic ? JS_TT_OP_LAST_INDEX_OF : JS_TT_OP_INDEX_OF;
+    else
+        tt_op = JS_TT_OP_INCLUDES + magic;
+    note = tt_combine_note(ctx, tt_op, orig, notes, n);
+    wrapped = JS_TTMakeTagged(ctx, ret, note);
+    return wrapped;
+}
+
+static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv, int lastIndexOf)
 {
     JSValue str, v;
@@ -57202,6 +57279,11 @@ static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     JSString *p1;
 
+    if (unlikely(tt_value_is_tagged(this_val) ||
+                 tt_value_is_tagged(argv[0]) ||
+                 (argc >= 2 && tt_value_is_tagged(argv[1]))))
+        return tt_tagged_str_search(ctx, this_val, argc, argv,
+                                    lastIndexOf, TRUE);
     /* concolic journal: user code probing an external string's content */
     if (JS_VALUE_GET_TAG(this_val) == JS_TAG_STRING && argc >= 1 &&
         JS_VALUE_GET_TAG(argv[0]) == JS_TAG_STRING &&
@@ -57275,6 +57357,11 @@ static JSValue js_string_includes(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     JSString *p1;
 
+    if (unlikely(tt_value_is_tagged(this_val) ||
+                 tt_value_is_tagged(argv[0]) ||
+                 (argc >= 2 && tt_value_is_tagged(argv[1]))))
+        return tt_tagged_str_search(ctx, this_val, argc, argv,
+                                    magic, FALSE);
     /* concolic journal: format checks — includes/startsWith/endsWith.
        op: magic 0 → 1 (includes), 1 → 2 (startsWith), 2 → 3 (endsWith) */
     if (JS_VALUE_GET_TAG(this_val) == JS_TAG_STRING && argc >= 1 &&
@@ -73613,14 +73700,20 @@ int JS_TTCmpCount(JSRuntime *rt)
 }
 
 /* op: 0 eq, 1 includes, 2 startsWith, 3 endsWith, 4 indexOf. The returned
-   strings point into the runtime journal (NUL-terminated, ASCII). */
-int JS_TTCmpGet(JSRuntime *rt, int i, int *op, const char **a, const char **b)
+   strings point into the runtime journal (NUL-terminated, ASCII). *note
+   (out param optional: pass NULL if uninterested) receives the host note
+   of the tagged value the token probed -- BORROWED from that value,
+   valid while it lives; NULL for a compare of concretes. */
+int JS_TTCmpGet(JSRuntime *rt, int i, int *op, const char **a, const char **b,
+                void **note)
 {
     if (i < 0 || i >= rt->tt_cmp_len)
         return -1;
     *op = rt->tt_cmp[i].op;
     *a = rt->tt_cmp[i].a;
     *b = rt->tt_cmp[i].b;
+    if (note)
+        *note = rt->tt_cmp[i].note;
     return 0;
 }
 
@@ -76992,7 +77085,7 @@ EXPORT("tt_cmp_json") char *tt_cmp_json(void)
     w = out;
     *w++ = '[';
     for (i = 0; i < n; i++) {
-        if (JS_TTCmpGet(g_rt, i, &op, &a, &b))
+        if (JS_TTCmpGet(g_rt, i, &op, &a, &b, NULL))
             break;
         if (i)
             *w++ = ',';

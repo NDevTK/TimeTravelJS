@@ -978,7 +978,11 @@ void JS_TTSetStepFilename(JSContext *ctx, const char *filename);
    the machine. op: 0 eq, 1 includes, 2 startsWith, 3 endsWith, 4 indexOf. */
 void JS_TTCmpClear(JSRuntime *rt);
 int JS_TTCmpCount(JSRuntime *rt);
-int JS_TTCmpGet(JSRuntime *rt, int i, int *op, const char **a, const char **b);
+/* note (optional out param, pass NULL if uninterested): the host note of
+   the tagged value the recorded token probed -- BORROWED from that value
+   (valid while it lives), NULL for a compare of concretes. */
+int JS_TTCmpGet(JSRuntime *rt, int i, int *op, const char **a, const char **b,
+                void **note);
 /* Script-level let/const/class bindings (global lexical environment). */
 JSValue JS_TTGlobalLexicals(JSContext *ctx);
 /* Clear the runtime's stack-frame chain (fresh session over a rewound heap). */
@@ -1126,7 +1130,14 @@ JS_BOOL JS_TTIsTagged(JSValueConst v);
    TypeError at the field) when its walk reaches a tagged value, rather
    than silently de-tagging it into "{}"; forwarding -- serialize with
    the payload substituted, wrap the result string with a combined
-   note -- is the documented follow-up.
+   note -- is the documented follow-up. The string-search builtins
+   (indexOf/lastIndexOf/includes/startsWith/endsWith) forward: a tagged
+   receiver, needle, or position unwraps to its payload, the engine's
+   own search runs on the concretes, the comparison journal records the
+   payload token WITH the tagged operand's note (JS_TTCmpGet), and the
+   result (integer / boolean) re-wraps with a combined note. Reaching
+   them through a tagged receiver still requires Function.prototype.call
+   -- method lookup on the wrapper is the property-forwarding follow-up.
    The 'op' the hook receives: */
 enum {
     JS_TT_OP_ADD = 1,         /* also string concatenation via + */
@@ -1158,6 +1169,11 @@ enum {
     JS_TT_OP_PARSE_FLOAT,
     JS_TT_OP_STRICT_EQ,       /* === (also the switch case-compare) */
     JS_TT_OP_STRICT_NEQ,      /* !== */
+    JS_TT_OP_INDEX_OF,        /* String.prototype.indexOf */
+    JS_TT_OP_LAST_INDEX_OF,   /* String.prototype.lastIndexOf */
+    JS_TT_OP_INCLUDES,        /* String.prototype.includes */
+    JS_TT_OP_STARTS_WITH,     /* String.prototype.startsWith */
+    JS_TT_OP_ENDS_WITH,       /* String.prototype.endsWith */
 };
 /* Derive the RESULT note from the operand notes (NULL entries = untagged
    operands). args are the ORIGINAL operand values (tagged wrappers

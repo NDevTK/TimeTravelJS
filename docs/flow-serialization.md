@@ -579,6 +579,35 @@ for the wrapper, then wrap the result string with a Combine-derived
 note (a `JS_TT_OP_JSON` code), because a string derived from a tracked
 value stays tracked.
 
+## Builtin forwarding: the string-search five
+
+`String.prototype.indexOf` / `lastIndexOf` / `includes` / `startsWith` /
+`endsWith` — the concolic journal's native probes — now **forward**. A
+tagged receiver, needle, or position argument unwraps to its payload and
+the engine's own C search re-runs on the concretes (one intercept at the
+top of each builtin, re-entering itself — no re-implementation). Three
+things happen at once:
+
+- **Search on payloads**: `includes.call(tagged("abc"), "b")` searches
+  `"abc"`, a tagged needle searches for its payload, and a tagged
+  position unwraps to its numeric payload for the offset. (Reaching the
+  builtin through a tagged receiver still needs `Function.prototype.call`
+  — method *lookup* on the wrapper is the property-forwarding follow-up.)
+- **Journal correctly**: the entry records the payload token (never a
+  wrapper stringification) **with the tagged operand's note** — the
+  receiver's, else the needle's — in a new `TTCmpEnt.note` field
+  surfaced by `JS_TTCmpGet` (borrowed from the value; NULL for concrete
+  compares; dedup keeps one entry per token and a tagged occurrence
+  ties its note to it). One entry per call, exactly as concretely.
+- **Forward the result**: the concrete integer/boolean re-wraps via the
+  Combine hook (`JS_TT_OP_INDEX_OF` / `_LAST_INDEX_OF` / `_INCLUDES` /
+  `_STARTS_WITH` / `_ENDS_WITH` with the original operands), so a
+  search over a tracked string yields a tracked result that branches
+  through the cond hook and rides fork + serialize→hydrate intact.
+
+The all-concrete path is byte-identical and allocation-free — the
+intercept is a tag test per operand already in hand.
+
 The combinetest harness drives the oracle: exact payloads for
 arithmetic/bitwise/shift (`tagged(5)+1 → 6`, `tagged(6)&3 → 2`), concat
 in every form (`"x"+tagged("y") → "xy"`, templates via
@@ -600,7 +629,10 @@ nowhere else (`!`, `Boolean()`, `??`/`?.` all silent, `??` unwrapping
 the payload for its nullish test), `JSON.stringify` refusing loudly at
 the named field (`at 'k'`, `at '0'`, nested; payload `toJSON` not
 consulted; a replacer swap serializes; untagged structures
-byte-identical, pretty-printing included), unchanged out-of-scope
+byte-identical, pretty-printing included), the search five unwrapping
+each operand (receiver via `.call`, needle, position), journaling the
+payload token with the right note and exactly one entry per call, and
+re-wrapping results that branch and round-trip, unchanged out-of-scope
 behavior (typeof, tagged property keys, `new String(tagged)`), and
 propagated results riding problem 1's fork and serialize→hydrate paths
 with their notes intact — including a cond observation stream that is

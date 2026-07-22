@@ -152,11 +152,19 @@
  *                               today, JSON.stringify refusing loudly at
  *                               the named field instead of silently
  *                               de-tagging (payload toJSON not consulted;
- *                               untagged structures byte-identical), and
- *                               propagated results (including a strict-eq
- *                               boolean and a cond observation stream)
- *                               riding problem 1's fork + serialize
- *                               paths.
+ *                               untagged structures byte-identical), the
+ *                               string search builtins (indexOf/
+ *                               lastIndexOf/includes/startsWith/endsWith)
+ *                               searching the PAYLOAD, journaling the
+ *                               payload token with the tagged operand's
+ *                               note (JS_TTCmpGet), and re-wrapping the
+ *                               result (tagged receiver via .call, tagged
+ *                               needle, tagged position for the offset;
+ *                               concretes byte-identical with a NULL
+ *                               journal note), and propagated results
+ *                               (a strict-eq boolean, a search integer,
+ *                               a cond observation stream) riding
+ *                               problem 1's fork + serialize paths.
  */
 #include "quickjs.h"
 #include "cutils.h"     /* DynBuf, for the tagged-value note hooks */
@@ -2581,6 +2589,37 @@ static void tg_cond(JSContext *ctx, void *note, int taken_true)
                  cnd_last_note, taken_true);
 }
 
+/* a no-op step handler: opens the comparison-journal gate (which requires
+   a handler installed) without enabling stepping */
+static int tg_step_noop(JSContext *ctx, int line, int col, int depth,
+                        int parkable, void *opaque)
+{
+    (void)ctx; (void)line; (void)col; (void)depth; (void)parkable;
+    (void)opaque;
+    return 0;
+}
+
+/* find a journal entry (op, a, b); nonnegative index if present, with the
+   entry's note (borrowed) in *note_out */
+static int ct_journal_find(JSRuntime *rt, int want_op, const char *wa,
+                           const char *wb, void **note_out)
+{
+    int i, op;
+    const char *a, *b;
+    void *nt;
+
+    for (i = 0; i < JS_TTCmpCount(rt); i++) {
+        if (JS_TTCmpGet(rt, i, &op, &a, &b, &nt))
+            break;
+        if (op == want_op && !strcmp(a, wa) && !strcmp(b, wb)) {
+            if (note_out)
+                *note_out = nt;
+            return i;
+        }
+    }
+    return -1;
+}
+
 /* install tagged(payload, strdup(note_str)) as a global */
 static void ct_set_tagged(JSContext *ctx, const char *name, JSValue payload,
                           const char *note_str)
@@ -2788,6 +2827,8 @@ static int cmd_combinetest(void)
     ct_set_tagged(ctx, "TES", eval_val(ctx, "''"), "HES");
     ct_set_tagged(ctx, "TJ", eval_val(ctx, "({toJSON(){ return 'tj'; }})"),
                   "HJ");
+    ct_set_tagged(ctx, "TSTR", eval_val(ctx, "'abc'"), "HS");
+    ct_set_tagged(ctx, "TB", eval_val(ctx, "'b'"), "HB");
     {
         /* TNEST = tagged(tagged(0)): nested payloads recurse for
            truthiness; a conditional observes only the OUTER note */
@@ -3144,6 +3185,87 @@ static int cmd_combinetest(void)
         "{\n \"a\": [\n  1,\n  {\n   \"z\": 2\n  }\n ]\n}");
     printf("COMBINE:JSON.stringify refusal ok\n");
 
+    /* --- string search builtins: unwrap, journal payload+note, forward - */
+    {
+        JSValue p;
+        void *jn;
+        char want[64];
+
+        /* the journal gates on a step handler being installed; a no-op
+           handler opens it without enabling stepping */
+        JS_TTSetStepHandler(rt, tg_step_noop, NULL);
+        JS_TTCmpClear(rt);
+
+        /* tagged receiver, via .call (method lookup on the wrapper is
+           the property-forwarding follow-up): payload search, payload
+           token in the journal WITH the receiver's note, tagged result */
+        cb_calls = 0;
+        p = ct_eval_payload(ctx,
+                            "String.prototype.includes.call(TSTR, 'b')");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_BOOL && JS_ToBool(ctx, p) == 1);
+        JS_FreeValue(ctx, p);
+        ct_check_combine("includes(TSTR)", JS_TT_OP_INCLUDES, 1, 2);
+        assert(ct_journal_find(rt, 1, "abc", "b", &jn) >= 0);
+        assert(jn && strcmp((char *)jn, "HS") == 0);
+
+        cb_calls = 0;
+        p = ct_eval_payload(ctx,
+                            "String.prototype.startsWith.call(TSTR, 'ab')");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_BOOL && JS_ToBool(ctx, p) == 1);
+        JS_FreeValue(ctx, p);
+        ct_check_combine("startsWith(TSTR)", JS_TT_OP_STARTS_WITH, 1, 2);
+        assert(ct_journal_find(rt, 2, "abc", "ab", &jn) >= 0);
+        assert(jn && strcmp((char *)jn, "HS") == 0);
+
+        cb_calls = 0;
+        p = ct_eval_payload(ctx,
+                            "String.prototype.endsWith.call(TSTR, 'bc')");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_BOOL && JS_ToBool(ctx, p) == 1);
+        JS_FreeValue(ctx, p);
+        ct_check_combine("endsWith(TSTR)", JS_TT_OP_ENDS_WITH, 1, 2);
+        assert(ct_journal_find(rt, 3, "abc", "bc", &jn) >= 0);
+        assert(jn && strcmp((char *)jn, "HS") == 0);
+
+        /* indexOf / lastIndexOf forward the integer */
+        ct_expect_int(ctx, "String.prototype.indexOf.call(TSTR, 'c')", 2,
+                      JS_TT_OP_INDEX_OF, 1, 2);
+        assert(ct_journal_find(rt, 4, "abc", "c", &jn) >= 0);
+        assert(jn && strcmp((char *)jn, "HS") == 0);
+        ct_expect_int(ctx, "String.prototype.lastIndexOf.call(TSTR, 'b')",
+                      1, JS_TT_OP_LAST_INDEX_OF, 1, 2);
+
+        /* tagged needle on a concrete receiver: the argument's note */
+        JS_TTCmpClear(rt);
+        ct_expect_bool(ctx, "'xbx'.includes(TB)", 1, JS_TT_OP_INCLUDES, 2);
+        assert(ct_journal_find(rt, 1, "xbx", "b", &jn) >= 0);
+        assert(jn && strcmp((char *)jn, "HB") == 0);
+        assert(JS_TTCmpCount(rt) == 1);   /* one entry per call, never
+                                             double-journaled */
+
+        /* a tagged position unwraps for the offset; it names no token */
+        ct_expect_int(ctx, "'abcabc'.indexOf('c', T2)", 2,
+                      JS_TT_OP_INDEX_OF, 4, 3);
+        assert(ct_journal_find(rt, 4, "abcabc", "c", &jn) >= 0);
+        assert(jn == NULL);
+
+        /* both concrete: plain result, entry note NULL */
+        cb_calls = 0;
+        ct_expect_concrete(ctx, "'xy'.includes('y')", "true");
+        assert(cb_calls == 0);
+        assert(ct_journal_find(rt, 1, "xy", "y", &jn) >= 0 && jn == NULL);
+
+        /* the tagged result branches once through the cond hook */
+        cnd_calls = 0;
+        snprintf(want, sizeof(want), "C%d(HS,-)", JS_TT_OP_INCLUDES);
+        ct_expect_concrete(ctx,
+            "String.prototype.includes.call(TSTR, 'b') ? 'y' : 'n'", "y");
+        assert(cnd_calls == 1 && cnd_last_taken == 1 &&
+               strcmp(cnd_last_note, want) == 0);
+
+        JS_TTSetStepHandler(rt, NULL, NULL);
+    }
+    printf("COMBINE:string search builtins ok\n");
+
     /* --- a throwing concrete op propagates the real error -------------- */
     cb_calls = 0;
     ct_expect_throws(ctx, "TSYM * 1", "symbol");
@@ -3319,6 +3441,57 @@ static int cmd_combinetest(void)
         JS_FreeValue(ctx, g2);
     }
     printf("COMBINE:cond observation rides fork/hydrate ok\n");
+
+    /* --- a forwarded search result rides the same graph paths ----------- */
+    {
+        JSValue R, g, arm, tA, g2, t2, pp;
+        uint8_t *bytes;
+        size_t blen;
+        char want_note[64];
+
+        snprintf(want_note, sizeof(want_note), "C%d(HS,-)",
+                 JS_TT_OP_INDEX_OF);
+        R = eval_val(ctx, "String.prototype.indexOf.call(TSTR, 'c')");
+        assert(JS_TTIsTagged(R));
+        assert(JS_TTNote(R) && strcmp((char *)JS_TTNote(R), want_note) == 0);
+        pp = JS_TTPayload(ctx, R);
+        assert(JS_VALUE_GET_TAG(pp) == JS_TAG_INT &&
+               JS_VALUE_GET_INT(pp) == 2);
+        JS_FreeValue(ctx, pp);
+        g = tg_start_tflow(ctx);
+        if (!JS_TTFlowSetLocal(ctx, g, 0, at_t, R)) {
+            fprintf(stderr, "FAIL: inject search result\n");
+            return 1;
+        }
+        arm = JS_TTFlowFork(ctx, g);
+        if (JS_IsException(arm))
+            die(ctx, "fork with search result");
+        tA = JS_TTFlowGetLocal(ctx, arm, 0, at_t);
+        assert(JS_TTIsTagged(tA));
+        assert(JS_TTNote(tA) != JS_TTNote(R));
+        assert(strcmp((char *)JS_TTNote(tA), want_note) == 0);
+        bytes = JS_TTFlowSerialize(ctx, g, &blen);
+        if (!bytes)
+            die(ctx, "serialize search result");
+        g2 = JS_TTFlowDeserialize(ctx, bytes, blen);
+        if (JS_IsException(g2))
+            die(ctx, "hydrate search result");
+        js_free(ctx, bytes);
+        t2 = JS_TTFlowGetLocal(ctx, g2, 0, at_t);
+        assert(JS_TTIsTagged(t2));
+        assert(strcmp((char *)JS_TTNote(t2), want_note) == 0);
+        pp = JS_TTPayload(ctx, t2);
+        assert(JS_VALUE_GET_TAG(pp) == JS_TAG_INT &&
+               JS_VALUE_GET_INT(pp) == 2);
+        JS_FreeValue(ctx, pp);
+        JS_FreeValue(ctx, tA);
+        JS_FreeValue(ctx, t2);
+        JS_FreeValue(ctx, R);
+        JS_FreeValue(ctx, g);
+        JS_FreeValue(ctx, arm);
+        JS_FreeValue(ctx, g2);
+    }
+    printf("COMBINE:search result round-trips ok\n");
 
     /* --- teardown -------------------------------------------------------- */
     JS_FreeAtom(ctx, at_t);
