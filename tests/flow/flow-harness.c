@@ -170,11 +170,18 @@
  *                               unwrapped so plain method calls reach
  *                               the forwarded builtins, tagged keys
  *                               still refusing, untagged gets
- *                               byte-identical), and propagated results
- *                               (a strict-eq boolean, a search integer,
- *                               a get result, a cond observation stream)
- *                               riding problem 1's fork + serialize
- *                               paths.
+ *                               byte-identical), property sets
+ *                               forwarding as the get's inverse (writes
+ *                               land on the payload -- never the
+ *                               wrapper -- through setters/exotics with
+ *                               tagged values stored as-is, and a write
+ *                               to a BASELINE payload routing through
+ *                               automatic COW: one deduped delta,
+ *                               isolated at checkout), and propagated
+ *                               results (a strict-eq boolean, a search
+ *                               integer, a get result, a cond
+ *                               observation stream) riding problem 1's
+ *                               fork + serialize paths.
  */
 #include "quickjs.h"
 #include "cutils.h"     /* DynBuf, for the tagged-value note hooks */
@@ -3381,6 +3388,109 @@ static int cmd_combinetest(void)
         ct_expect_concrete(ctx, "[4,5,6][1]", "5");
     }
     printf("COMBINE:property get forwards ok\n");
+
+    /* --- property set forwards to the payload (get/set inverses) ------- */
+    {
+        JSValue p, tg, pay, f;
+
+        /* the write hits the payload: a second tagged get reads it
+           back, the raw payload holds it, the wrapper owns nothing */
+        cb_calls = 0;
+        p = ct_eval_payload(ctx,
+            "(function(){ TGO.foo = 5; return TGO.foo; })()");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 5);
+        JS_FreeValue(ctx, p);
+        ct_check_combine("TGO.foo readback", JS_TT_OP_GET_FIELD, 1, 2);
+        p = ct_eval_payload(ctx, "TGO.foo");   /* second get agrees */
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 5);
+        JS_FreeValue(ctx, p);
+        tg = eval_val(ctx, "TGO");
+        pay = JS_TTPayload(ctx, tg);
+        f = JS_GetPropertyStr(ctx, pay, "foo");
+        assert(JS_VALUE_GET_TAG(f) == JS_TAG_INT && JS_VALUE_GET_INT(f) == 5);
+        JS_FreeValue(ctx, f);
+        JS_FreeValue(ctx, pay);
+        JS_FreeValue(ctx, tg);
+        /* enumeration is not forwarded, so keys of the WRAPPER prove
+           the write never landed there */
+        ct_expect_concrete(ctx, "Object.keys(TGO).length", "0");
+
+        /* a tagged value stores AS-IS; read-back flattens with the
+           combined note (receiver + stored value, mask 5, arity 3) */
+        cb_calls = 0;
+        p = ct_eval_payload(ctx,
+            "(function(){ TGO.bar = T9; return TGO.bar; })()");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 9);
+        JS_FreeValue(ctx, p);
+        ct_check_combine("TGO.bar", JS_TT_OP_GET_FIELD, 5, 3);
+
+        /* a payload setter runs with the payload as `this` */
+        ct_set_tagged(ctx, "TSET",
+                      eval_val(ctx, "({v: 0, set s(x) { this.v = x * 2; }})"),
+                      "HSET");
+        ct_expect_int(ctx, "TSET.s = 4, TSET.v", 8, JS_TT_OP_GET_FIELD, 1, 2);
+
+        /* string payload: the payload's exotic set semantics -- silent
+           no-op in sloppy code, the REAL TypeError in strict, and no
+           wrapper property ever appears */
+        p = ct_eval_payload(ctx,
+            "(function(){ TSTR[0] = 'x'; return TSTR[0]; })()");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_STRING);
+        {
+            const char *s0 = JS_ToCString(ctx, p);
+            assert(s0 && strcmp(s0, "a") == 0);
+            JS_FreeCString(ctx, s0);
+        }
+        JS_FreeValue(ctx, p);
+        ct_expect_throws(ctx,
+            "(function(){ 'use strict'; TSTR[0] = 'x'; })()", NULL);
+        ct_expect_concrete(ctx, "Object.keys(TSTR).length", "0");
+
+        /* a throwing set propagates unwrapped */
+        ct_expect_throws(ctx, "TNULL.x = 1", "null");
+
+        /* tagged KEYS still refuse -- on tagged receivers too */
+        ct_expect_throws(ctx, "TGO[TKEY] = 1", NULL);
+
+        /* untagged writes byte-identical */
+        ct_expect_concrete(ctx,
+            "(function(){ var o = {}; o.w = 3; o.w = 4; return o.w; })()",
+            "4");
+    }
+    printf("COMBINE:property set forwards ok\n");
+
+    /* --- a forwarded write to a BASELINE payload routes through COW ---- */
+    {
+        JSValue p, gcw;
+        int n0;
+
+        /* TCFG wraps the baseline CONFIG object itself (created before
+           checkin so the global-set is not captured) */
+        ct_set_tagged(ctx, "TCFG", eval_val(ctx, "CONFIG"), "HC");
+        gcw = tg_start_tflow(ctx);
+        if (JS_TTFlowCheckin(ctx, gcw))
+            die(ctx, "checkin for cow set");
+        n0 = JS_TTFlowDeltaCount(ctx, gcw);
+        ct_expect_concrete(ctx, "TCFG.limit = 99", "99");
+        /* the forwarded write recorded a first-write delta on CONFIG */
+        assert(JS_TTFlowDeltaCount(ctx, gcw) == n0 + 1);
+        p = ct_eval_payload(ctx, "TCFG.limit");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 99);
+        JS_FreeValue(ctx, p);
+        ct_expect_concrete(ctx, "CONFIG.limit", "99");  /* live in-timeline */
+        /* dedup: a second write to the captured prop adds no delta */
+        ct_expect_concrete(ctx, "TCFG.limit = 100", "100");
+        assert(JS_TTFlowDeltaCount(ctx, gcw) == n0 + 1);
+        if (JS_TTFlowCheckout(ctx, gcw))
+            die(ctx, "checkout for cow set");
+        /* outside the timeline the baseline is pristine: isolation */
+        ct_expect_concrete(ctx, "CONFIG.limit", "3");
+        p = ct_eval_payload(ctx, "TCFG.limit");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 3);
+        JS_FreeValue(ctx, p);
+        JS_FreeValue(ctx, gcw);
+    }
+    printf("COMBINE:set-forwarding routes through COW ok\n");
 
     /* --- a throwing concrete op propagates the real error -------------- */
     cb_calls = 0;

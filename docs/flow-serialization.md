@@ -649,8 +649,32 @@ provenance. Three sharp edges, by design:
 A throwing forwarded get (payload `null`/`undefined`, a throwing
 getter) propagates unwrapped. Payload getters run as plain C calls
 (defer slots disarmed) so their results flow back through the wrap
-rather than a parked frame. Property **set**, method-receiver semantics
-beyond the above, and enumeration/`in`/`has` are named follow-ups.
+rather than a parked frame.
+
+## Property set forwards to the payload
+
+The write side mirrors the read side, making get and set exact
+inverses on the payload. A set on a tagged **receiver** forwards at
+`JS_SetPropertyInternal`'s receiver branch (one class-id compare, the
+`TT_COW_HIT` fast-miss shape) plus a defensive test on the interpreter's
+inline fast-set path — that path is own-property-gated and a wrapper
+never owns properties, but the test keeps "nothing ever writes the
+wrapper" structural. The forward re-enters **the engine's own set on
+the payload**: own/inherited setters run with the payload as `this`,
+string/array exotic behavior applies (`tagged("abc")[0] = "x"` is the
+payload's silent sloppy no-op / real strict TypeError, never a wrapper
+property), a throwing set propagates unwrapped, and — the load-bearing
+property — **automatic COW capture composes**: a forwarded write to a
+baseline payload inside a checked-in flow records the same first-write
+delta a direct write records (asserted via the delta count, deduped on
+the second write, isolated after checkout), because the real set path
+runs, nothing re-implemented. A tagged **value** being stored is stored
+as-is — no unwrap, no extra wrap; the get forward flattens it with a
+combined note on read-back. Tagged **keys** still refuse on any
+receiver (the key coerces before the receiver forwards). `delete`,
+`defineProperty`, `Reflect.set` receiver-mixing, and enumeration stay
+named follow-ups; `Object.keys(tagged)` remains the wrapper's own
+(empty) view, which the suite uses to prove writes never land there.
 
 The combinetest harness drives the oracle: exact payloads for
 arithmetic/bitwise/shift (`tagged(5)+1 → 6`, `tagged(6)&3 → 2`), concat
@@ -682,8 +706,14 @@ inherited/missing, nested payloads with the outer note, stored tagged
 values flattening with mask 5 arity 3, functions passing through
 unwrapped into working plain method calls, throwing gets unwrapped,
 tagged keys still refusing on any receiver, untagged gets
-byte-identical), unchanged out-of-scope behavior (typeof, tagged
-property keys, `new String(tagged)`), and
+byte-identical), property sets forwarding (a second get and the raw
+payload both see the write while the wrapper owns nothing, tagged
+values stored as-is and flattened on read-back, payload setters with
+payload `this`, string exotic sloppy/strict semantics, throwing and
+tagged-key sets refusing, and a baseline-payload write recording
+exactly one deduped COW delta that checkout isolates), unchanged
+out-of-scope behavior (typeof, tagged property keys,
+`new String(tagged)`), and
 propagated results riding problem 1's fork and serialize→hydrate paths
 with their notes intact — including a cond observation stream that is
 byte-identical across the original, a forked arm, and a hydrated copy.

@@ -1135,8 +1135,15 @@ JS_BOOL JS_TTIsTagged(JSValueConst v);
    result returns unwrapped: method lookup is resolution, not a data
    derivation -- the tagged receiver stays `this`, which is how a plain
    taggedString.includes("y") call reaches the forwarded search
-   builtins. Property SET, method-receiver semantics beyond that, and
-   enumeration/has stay named follow-ups. Property-KEY coercion is
+   builtins. Property SET forwards symmetrically: the write lands on
+   the payload through the engine's own set path -- setters run with
+   the payload as `this`, string/array exotics apply, and the
+   automatic-COW capture fires for a baseline payload exactly as for a
+   direct write (flow isolation composes). A tagged VALUE being stored
+   is stored as-is (the get forward flattens on read-back), and a
+   throwing set propagates unwrapped. delete / defineProperty /
+   Reflect.set receiver-mixing, method-receiver semantics beyond the
+   above, and enumeration/has stay named follow-ups. Property-KEY coercion is
    untouched: a tagged key still refuses (ToPrimitive on a tagged value
    throws the same TypeError the empty wrapper produced before
    forwarding -- unsupported coercion pipelines stay loud worklist

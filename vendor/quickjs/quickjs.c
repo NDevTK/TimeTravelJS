@@ -10473,6 +10473,38 @@ static void js_free_desc(JSContext *ctx, JSPropertyDescriptor *desc)
    freed by the function. 'flags' is a bitmask of JS_PROP_THROW and
    JS_PROP_THROW_STRICT. 'this_obj' is the receiver. If obj !=
    this_obj, then obj must be an object (Reflect.set case). */
+/* TimeTravelJS: property SET on a tagged receiver forwards to the
+   payload -- the engine's own set, re-entered on the payload, so the
+   write lands on the payload's own/inherited setter or data slot (the
+   payload is the setter `this`), array/string exotics apply, and the
+   automatic-COW capture on that path fires exactly as for a direct
+   write to a baseline payload: flow isolation composes because the
+   REAL set path runs, nothing is re-implemented or bypassed. The
+   stored value is stored AS-IS -- a tagged v stays tagged in the
+   payload slot (no unwrap, no extra wrap); the get forward flattens
+   and combines on read-back, making get and set inverses. A nested
+   tagged payload writes through to the deepest concrete payload (the
+   get forward's shape). A throwing set (payload null/undefined, a
+   non-writable property in strict mode, a throwing setter) propagates
+   unwrapped. Payload setters are forced down the plain C call path
+   (defer slots disarmed) so their status flows back here, not into a
+   parked frame. delete / defineProperty / Reflect.set receiver-mixing
+   / enumeration stay named follow-ups. */
+static int tt_tagged_set(JSContext *ctx, JSValueConst t, JSAtom prop,
+                         JSValue val, int flags)
+{
+    JSObject *pt = JS_VALUE_GET_OBJ(t);
+    JSValueConst payload = pt->u.tt_tagged.payload;
+
+    if (unlikely(ctx->rt->tt_defer_slot != NULL))
+        ctx->rt->tt_defer_slot = NULL;
+    if (unlikely(ctx->rt->tt_defer_pending != NULL))
+        ctx->rt->tt_defer_pending = NULL;
+    while (unlikely(tt_value_is_tagged(payload)))
+        payload = JS_VALUE_GET_OBJ(payload)->u.tt_tagged.payload;
+    return JS_SetPropertyInternal(ctx, payload, prop, val, payload, flags);
+}
+
 int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
                            JSAtom prop, JSValue val, JSValueConst this_obj, int flags)
 {
@@ -10513,6 +10545,12 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
         p1 = JS_VALUE_GET_OBJ(obj);
         if (unlikely(p != p1))
             goto retry2;
+        /* TimeTravelJS: a set on a tagged RECEIVER forwards to its
+           payload (tt_tagged_set). A tagged KEY never reaches here:
+           ToPropertyKey refuses it -- the pinned path. Reflect.set
+           receiver-mixing (obj != this_obj) stays a follow-up. */
+        if (unlikely(p1->class_id == JS_CLASS_TT_TAGGED))
+            return tt_tagged_set(ctx, obj, prop, val, flags);
     }
 
     /* fast path if obj == this_obj */
@@ -22395,6 +22433,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-2];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
+                    /* TimeTravelJS: a tagged receiver forwards through
+                       the generic path (a wrapper never owns props, so
+                       this is defensive: the fast path is own-prop
+                       gated, but nothing may ever write the wrapper);
+                       untagged receivers pay this one class-id compare */
+                    if (unlikely(p->class_id == JS_CLASS_TT_TAGGED))
+                        goto put_field_slow_path;
                     prs = find_own_property(&pr, p, atom);
                     if (!prs)
                         goto put_field_slow_path;
