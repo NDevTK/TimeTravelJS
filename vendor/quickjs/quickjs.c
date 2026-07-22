@@ -8896,6 +8896,75 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     return 0;
 }
 
+/* TimeTravelJS: property GET on a tagged receiver forwards to the
+   payload -- the engine's own get, so a string payload's length/index
+   exotics and an object payload's own/inherited/getter lookups all
+   resolve against the payload (which is also the getter `this`) -- and
+   the result stays tracked: wrapped with a note combined from
+   JS_TT_OP_GET_FIELD over {receiver, key}. A nested tagged payload
+   reads off the DEEPEST concrete payload and wraps once with the outer
+   note (the truthiness recursion shape). Two deliberate carve-outs: a
+   FUNCTION result returns unwrapped -- method lookup is resolution,
+   not a data derivation, and the receiver (which get_field2 keeps as
+   `this`) stays the tracked carrier the builtin intercepts then see --
+   and a stored value that is itself tagged flattens to a SINGLE
+   wrapper over its payload, the stored value joining the hook args
+   with its note (never wrapper-in-wrapper). A throwing forwarded get
+   (payload null/undefined, a throwing getter) propagates unwrapped.
+   Payload getters are forced down the plain C call path (defer slots
+   disarmed) so their result flows back through this wrap instead of a
+   parked frame. Property SET, method-receiver semantics, and
+   enumeration/has stay named follow-ups. */
+static JSValue tt_tagged_get(JSContext *ctx, JSValueConst t, JSAtom prop)
+{
+    JSObject *pt = JS_VALUE_GET_OBJ(t);
+    JSValueConst payload = pt->u.tt_tagged.payload;
+    JSValueConst args[3];
+    void *notes[3], *note;
+    JSValue v, key_val, res;
+    int n;
+
+    if (unlikely(ctx->rt->tt_defer_slot != NULL))
+        ctx->rt->tt_defer_slot = NULL;
+    if (unlikely(ctx->rt->tt_defer_pending != NULL))
+        ctx->rt->tt_defer_pending = NULL;
+    while (unlikely(tt_value_is_tagged(payload)))
+        payload = JS_VALUE_GET_OBJ(payload)->u.tt_tagged.payload;
+    v = JS_GetPropertyInternal(ctx, payload, prop, payload, 0);
+    if (JS_IsException(v))
+        return v;
+    if (JS_IsFunction(ctx, v))
+        return v;
+    key_val = JS_AtomToValue(ctx, prop);
+    if (JS_IsException(key_val)) {
+        JS_FreeValue(ctx, v);
+        return key_val;
+    }
+    args[0] = t;
+    args[1] = key_val;
+    notes[0] = pt->u.tt_tagged.note;
+    notes[1] = NULL;
+    n = 2;
+    if (unlikely(tt_value_is_tagged(v))) {
+        JSValueConst pv = v;
+        JSValue inner;
+        args[2] = v;
+        notes[2] = JS_VALUE_GET_OBJ(v)->u.tt_tagged.note;
+        n = 3;
+        while (tt_value_is_tagged(pv))
+            pv = JS_VALUE_GET_OBJ(pv)->u.tt_tagged.payload;
+        inner = JS_DupValue(ctx, pv);
+        note = tt_combine_note(ctx, JS_TT_OP_GET_FIELD, args, notes, n);
+        JS_FreeValue(ctx, v);
+        v = inner;
+    } else {
+        note = tt_combine_note(ctx, JS_TT_OP_GET_FIELD, args, notes, n);
+    }
+    JS_FreeValue(ctx, key_val);
+    res = JS_TTMakeTagged(ctx, v, note);
+    return res;
+}
+
 JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                JSAtom prop, JSValueConst this_obj,
                                BOOL throw_ref_error)
@@ -8951,6 +9020,11 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
             return JS_UNDEFINED;
     } else {
         p = JS_VALUE_GET_OBJ(obj);
+        /* TimeTravelJS: a tagged RECEIVER forwards the get to its
+           payload and keeps the result tracked. (A tagged KEY never
+           reaches here: ToPropertyKey refuses it -- the pinned path.) */
+        if (unlikely(p->class_id == JS_CLASS_TT_TAGGED))
+            return tt_tagged_get(ctx, obj, prop);
     }
 
     for(;;) {
@@ -11826,6 +11900,17 @@ static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint)
     JSValue method, ret;
     if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
         return val;
+    /* TimeTravelJS: a tagged value still refuses coercion here -- the
+       pinned behavior of every UNSUPPORTED pipeline (supported ones
+       intercept before ever reaching ToPrimitive). Without this,
+       property-get forwarding would leak the payload's toString /
+       valueOf / Symbol.toPrimitive into the probes below and silently
+       de-tag. Same TypeError the empty null-proto wrapper produced
+       before forwarding existed. */
+    if (unlikely(tt_value_is_tagged(val))) {
+        JS_FreeValue(ctx, val);
+        return JS_ThrowTypeError(ctx, "toPrimitive");
+    }
     force_ordinary = hint & HINT_FORCE_ORDINARY;
     hint &= ~HINT_FORCE_ORDINARY;
     if (!force_ordinary) {
@@ -22213,6 +22298,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-1];                                           \
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {   \
                     p = JS_VALUE_GET_OBJ(obj);                          \
+                    /* TimeTravelJS: a tagged receiver forwards through \
+                       the generic path (the inline walk would complete \
+                       the null-proto miss itself); untagged receivers  \
+                       pay this one class-id compare */                 \
+                    if (unlikely(p->class_id == JS_CLASS_TT_TAGGED))    \
+                        goto name ## _slow_path;                        \
                     for(;;) {                                           \
                         prs = find_own_property(&pr, p, atom);          \
                         if (prs) {                                      \
@@ -61632,7 +61723,13 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
 
     /* check for object.toJSON method */
     /* ECMA specifies this is done only for Object and BigInt */
-    if (JS_IsObject(val) || JS_IsBigInt(ctx, val)) {
+    /* TimeTravelJS: skip the probe for a tagged value -- v1 pins that a
+       payload's toJSON is NOT consulted (property-get forwarding would
+       otherwise resolve it here and silently de-tag through it); the
+       final switch below still refuses, and a replacer still gets its
+       chance to swap the tagged value for a concrete one first. */
+    if ((JS_IsObject(val) && !tt_value_is_tagged(val)) ||
+        JS_IsBigInt(ctx, val)) {
         JSValue f = JS_GetProperty(ctx, val, JS_ATOM_toJSON);
         if (JS_IsException(f))
             goto exception;

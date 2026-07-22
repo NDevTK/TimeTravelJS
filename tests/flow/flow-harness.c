@@ -161,10 +161,20 @@
  *                               result (tagged receiver via .call, tagged
  *                               needle, tagged position for the offset;
  *                               concretes byte-identical with a NULL
- *                               journal note), and propagated results
+ *                               journal note), property gets forwarding
+ *                               to the payload (length/index exotics,
+ *                               own/getter/inherited/missing props,
+ *                               nested payloads wrapping once with the
+ *                               outer note, stored tagged values
+ *                               flattening, functions passing through
+ *                               unwrapped so plain method calls reach
+ *                               the forwarded builtins, tagged keys
+ *                               still refusing, untagged gets
+ *                               byte-identical), and propagated results
  *                               (a strict-eq boolean, a search integer,
- *                               a cond observation stream) riding
- *                               problem 1's fork + serialize paths.
+ *                               a get result, a cond observation stream)
+ *                               riding problem 1's fork + serialize
+ *                               paths.
  */
 #include "quickjs.h"
 #include "cutils.h"     /* DynBuf, for the tagged-value note hooks */
@@ -2829,6 +2839,27 @@ static int cmd_combinetest(void)
                   "HJ");
     ct_set_tagged(ctx, "TSTR", eval_val(ctx, "'abc'"), "HS");
     ct_set_tagged(ctx, "TB", eval_val(ctx, "'b'"), "HB");
+    ct_set_tagged(ctx, "TGO", eval_val(ctx, "({a: 5})"), "HG");
+    ct_set_tagged(ctx, "TGG",
+                  eval_val(ctx, "({a: 21, get g() { return this.a * 2; }})"),
+                  "HGG");
+    ct_set_tagged(ctx, "TCH",
+                  eval_val(ctx, "Object.create({ip: 11})"), "HCH");
+    ct_set_tagged(ctx, "TSV", eval_val(ctx, "({v: T5})"), "HSV");
+    {
+        /* TNN = tagged(tagged({z: 9})): nested payload with a data prop */
+        char *n_in = strdup("HNI"), *n_out = strdup("HNO");
+        JSValue t_in, glob;
+        assert(n_in && n_out);
+        tg_live += 2;
+        t_in = JS_TTMakeTagged(ctx, eval_val(ctx, "({z: 9})"), n_in);
+        assert(!JS_IsException(t_in));
+        glob = JS_GetGlobalObject(ctx);
+        if (JS_SetPropertyStr(ctx, glob, "TNN",
+                              JS_TTMakeTagged(ctx, t_in, n_out)) < 0)
+            die(ctx, "set TNN");
+        JS_FreeValue(ctx, glob);
+    }
     {
         /* TNEST = tagged(tagged(0)): nested payloads recurse for
            truthiness; a conditional observes only the OUTER note */
@@ -3266,6 +3297,91 @@ static int cmd_combinetest(void)
     }
     printf("COMBINE:string search builtins ok\n");
 
+    /* --- property get forwards to the payload and stays tracked -------- */
+    {
+        JSValue p;
+        const char *s;
+        char want[64];
+
+        /* string payload: length + index via the payload's exotic
+           string behavior */
+        ct_expect_int(ctx, "TSTR.length", 3, JS_TT_OP_GET_FIELD, 1, 2);
+        cb_calls = 0;
+        p = ct_eval_payload(ctx, "TSTR[0]");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_STRING);
+        s = JS_ToCString(ctx, p);
+        assert(s && strcmp(s, "a") == 0);
+        JS_FreeCString(ctx, s);
+        JS_FreeValue(ctx, p);
+        ct_check_combine("TSTR[0]", JS_TT_OP_GET_FIELD, 1, 2);
+
+        /* object payload: own, getter (payload `this`), inherited, and
+           a missing key (tracked undefined with provenance) */
+        ct_expect_int(ctx, "TGO.a", 5, JS_TT_OP_GET_FIELD, 1, 2);
+        ct_expect_int(ctx, "TGG.g", 42, JS_TT_OP_GET_FIELD, 1, 2);
+        ct_expect_int(ctx, "TCH.ip", 11, JS_TT_OP_GET_FIELD, 1, 2);
+        cb_calls = 0;
+        p = ct_eval_payload(ctx, "TGO.missing");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_UNDEFINED);
+        JS_FreeValue(ctx, p);
+        ct_check_combine("TGO.missing", JS_TT_OP_GET_FIELD, 1, 2);
+
+        /* a FUNCTION result returns unwrapped (method lookup is
+           resolution, not a data read: no Combine) */
+        cb_calls = 0;
+        ct_expect_concrete(ctx, "typeof TGO.hasOwnProperty", "function");
+        assert(cb_calls == 0);
+
+        /* ...which makes a PLAIN method call work: lookup resolves off
+           the payload's prototype, the wrapper stays `this`, and the
+           search-builtin intercept takes over -- journal included */
+        JS_TTSetStepHandler(rt, tg_step_noop, NULL);
+        JS_TTCmpClear(rt);
+        cb_calls = 0;
+        p = ct_eval_payload(ctx, "TSTR.includes('b')");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_BOOL && JS_ToBool(ctx, p) == 1);
+        JS_FreeValue(ctx, p);
+        assert(cb_calls == 1 && cb_last_op == JS_TT_OP_INCLUDES);
+        {
+            void *jn;
+            assert(ct_journal_find(rt, 1, "abc", "b", &jn) >= 0);
+            assert(jn && strcmp((char *)jn, "HS") == 0);
+        }
+        JS_TTSetStepHandler(rt, NULL, NULL);
+
+        /* nested tagged payload: reads off the deepest payload, ONE
+           wrap with the OUTER note (observed through the cond hook) */
+        cnd_calls = 0;
+        snprintf(want, sizeof(want), "C%d(HNO,-)", JS_TT_OP_GET_FIELD);
+        ct_expect_concrete(ctx, "TNN.z ? 'y' : 'n'", "y");
+        assert(cnd_calls == 1 && cnd_last_taken == 1 &&
+               strcmp(cnd_last_note, want) == 0);
+
+        /* a stored tagged value flattens: the result is a SINGLE
+           wrapper over the stored payload, and the stored value joins
+           the hook args with its note (mask 1|4, arity 3) */
+        cb_calls = 0;
+        p = ct_eval_payload(ctx, "TSV.v");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT &&
+               JS_VALUE_GET_INT(p) == 5);
+        JS_FreeValue(ctx, p);
+        ct_check_combine("TSV.v", JS_TT_OP_GET_FIELD, 5, 3);
+
+        /* a throwing forwarded get propagates unwrapped */
+        ct_expect_throws(ctx, "TNULL.x", "null");
+
+        /* tagged KEYS stay pinned -- on concrete and tagged receivers
+           alike the key refuses before any forwarding */
+        ct_expect_throws(ctx, "({a:1})[TKEY]", NULL);
+        ct_expect_throws(ctx, "TGO[TKEY]", NULL);
+
+        /* untagged gets are byte-identical */
+        ct_expect_concrete(ctx, "({a:7}).a", "7");
+        ct_expect_concrete(ctx, "'xyz'.length", "3");
+        ct_expect_concrete(ctx, "[4,5,6][1]", "5");
+    }
+    printf("COMBINE:property get forwards ok\n");
+
     /* --- a throwing concrete op propagates the real error -------------- */
     cb_calls = 0;
     ct_expect_throws(ctx, "TSYM * 1", "symbol");
@@ -3492,6 +3608,56 @@ static int cmd_combinetest(void)
         JS_FreeValue(ctx, g2);
     }
     printf("COMBINE:search result round-trips ok\n");
+
+    /* --- a forwarded property read rides the same graph paths ----------- */
+    {
+        JSValue R, g, arm, tA, g2, t2, pp;
+        uint8_t *bytes;
+        size_t blen;
+        char want_note[64];
+
+        snprintf(want_note, sizeof(want_note), "C%d(HS,-)",
+                 JS_TT_OP_GET_FIELD);
+        R = eval_val(ctx, "TSTR.length");
+        assert(JS_TTIsTagged(R));
+        assert(JS_TTNote(R) && strcmp((char *)JS_TTNote(R), want_note) == 0);
+        pp = JS_TTPayload(ctx, R);
+        assert(JS_VALUE_GET_TAG(pp) == JS_TAG_INT &&
+               JS_VALUE_GET_INT(pp) == 3);
+        JS_FreeValue(ctx, pp);
+        g = tg_start_tflow(ctx);
+        if (!JS_TTFlowSetLocal(ctx, g, 0, at_t, R)) {
+            fprintf(stderr, "FAIL: inject get result\n");
+            return 1;
+        }
+        arm = JS_TTFlowFork(ctx, g);
+        if (JS_IsException(arm))
+            die(ctx, "fork with get result");
+        tA = JS_TTFlowGetLocal(ctx, arm, 0, at_t);
+        assert(JS_TTIsTagged(tA));
+        assert(strcmp((char *)JS_TTNote(tA), want_note) == 0);
+        bytes = JS_TTFlowSerialize(ctx, g, &blen);
+        if (!bytes)
+            die(ctx, "serialize get result");
+        g2 = JS_TTFlowDeserialize(ctx, bytes, blen);
+        if (JS_IsException(g2))
+            die(ctx, "hydrate get result");
+        js_free(ctx, bytes);
+        t2 = JS_TTFlowGetLocal(ctx, g2, 0, at_t);
+        assert(JS_TTIsTagged(t2));
+        assert(strcmp((char *)JS_TTNote(t2), want_note) == 0);
+        pp = JS_TTPayload(ctx, t2);
+        assert(JS_VALUE_GET_TAG(pp) == JS_TAG_INT &&
+               JS_VALUE_GET_INT(pp) == 3);
+        JS_FreeValue(ctx, pp);
+        JS_FreeValue(ctx, tA);
+        JS_FreeValue(ctx, t2);
+        JS_FreeValue(ctx, R);
+        JS_FreeValue(ctx, g);
+        JS_FreeValue(ctx, arm);
+        JS_FreeValue(ctx, g2);
+    }
+    printf("COMBINE:get result round-trips ok\n");
 
     /* --- teardown -------------------------------------------------------- */
     JS_FreeAtom(ctx, at_t);

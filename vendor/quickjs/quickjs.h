@@ -1125,8 +1125,23 @@ JS_BOOL JS_TTIsTagged(JSValueConst v);
    compiler-internal exact-undefined probes (parameter and destructuring
    defaults) are NOT comparisons and never unwrap: a tagged value -- even
    one whose payload is undefined -- does not trigger a default.
-   Property-KEY coercion is untouched: a tagged key throws exactly as an
-   unknown object key does today. JSON.stringify REFUSES loudly (a named
+   Property GET on a tagged RECEIVER forwards to the payload -- the
+   engine's own get, so a string payload's length/index exotics and an
+   object payload's own/inherited/getter lookups resolve against the
+   payload -- and the result stays tracked (JS_TT_OP_GET_FIELD with the
+   receiver and the key; a nested tagged payload reads off the deepest
+   payload with ONE outer-note wrap; a stored tagged value flattens to
+   a single wrapper joining the hook args with its note). A FUNCTION
+   result returns unwrapped: method lookup is resolution, not a data
+   derivation -- the tagged receiver stays `this`, which is how a plain
+   taggedString.includes("y") call reaches the forwarded search
+   builtins. Property SET, method-receiver semantics beyond that, and
+   enumeration/has stay named follow-ups. Property-KEY coercion is
+   untouched: a tagged key still refuses (ToPrimitive on a tagged value
+   throws the same TypeError the empty wrapper produced before
+   forwarding -- unsupported coercion pipelines stay loud worklist
+   entries and never leak the payload's toString/valueOf into a silent
+   de-tag). JSON.stringify REFUSES loudly (a named
    TypeError at the field) when its walk reaches a tagged value, rather
    than silently de-tagging it into "{}"; forwarding -- serialize with
    the payload substituted, wrap the result string with a combined
@@ -1174,6 +1189,7 @@ enum {
     JS_TT_OP_INCLUDES,        /* String.prototype.includes */
     JS_TT_OP_STARTS_WITH,     /* String.prototype.startsWith */
     JS_TT_OP_ENDS_WITH,       /* String.prototype.endsWith */
+    JS_TT_OP_GET_FIELD,       /* property get on a tagged receiver */
 };
 /* Derive the RESULT note from the operand notes (NULL entries = untagged
    operands). args are the ORIGINAL operand values (tagged wrappers

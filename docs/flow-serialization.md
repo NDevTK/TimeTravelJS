@@ -608,6 +608,50 @@ things happen at once:
 The all-concrete path is byte-identical and allocation-free — the
 intercept is a tag test per operand already in hand.
 
+## Property get forwards to the payload
+
+Reading a property of a tagged value used to hit the wrapper's null
+prototype (`tagged("abc").length` → `undefined`, `.includes` →
+TypeError). A get on a tagged **receiver** now forwards to the payload
+at the property-get chokepoint — one `JS_CLASS_TT_TAGGED` compare in
+the interpreter's inline field walk (routing to the generic path, since
+the inline walk would complete the null-proto miss itself) and one in
+`JS_GetPropertyInternal`, the `TT_COW_HIT` fast-miss shape; untagged
+receivers pay a single predictable class-id test and are otherwise
+byte-identical. The forward runs **the engine's own get against the
+payload** (string length/index exotics, own/inherited props, getters
+with the payload as `this`; a nested tagged payload reads off the
+deepest payload), and the result stays tracked:
+`JS_TTMakeTagged(v, Combine(JS_TT_OP_GET_FIELD, {receiver, key},
+{note, NULL}))` — a missing key yields a *tracked* `undefined` with
+provenance. Three sharp edges, by design:
+
+- **A FUNCTION result returns unwrapped** — method lookup is
+  resolution, not a data derivation. The receiver stays `this` (the
+  compiler's `get_field2` keeps it), so `taggedString.includes("y")`
+  now works as a *plain call*: lookup resolves `String.prototype.
+  includes` off the payload, and the tagged `this` flows into the
+  forwarded search builtins — journal, note, and tagged result intact.
+  This closes the `.call`-only caveat.
+- **A stored tagged value flattens**: `tagged({v: taggedFive}).v` is a
+  single wrapper over `5`, the stored value joining the hook args with
+  its note — never wrapper-in-wrapper.
+- **Tagged keys stay pinned and cannot cross with receivers**:
+  `obj[taggedKey]` (and `taggedReceiver[taggedKey]` — the key coerces
+  first) still refuses. `JS_ToPrimitiveFree` now refuses tagged values
+  explicitly with the same `TypeError` the empty wrapper produced
+  before, so get-forwarding can never leak the payload's `toString`/
+  `valueOf`/`Symbol.toPrimitive` into a coercion pipeline and silently
+  de-tag — unsupported pipelines stay loud worklist entries. The
+  `JSON.stringify` `toJSON` probe likewise skips tagged values,
+  keeping the v1 "payload `toJSON` not consulted" pin.
+
+A throwing forwarded get (payload `null`/`undefined`, a throwing
+getter) propagates unwrapped. Payload getters run as plain C calls
+(defer slots disarmed) so their results flow back through the wrap
+rather than a parked frame. Property **set**, method-receiver semantics
+beyond the above, and enumeration/`in`/`has` are named follow-ups.
+
 The combinetest harness drives the oracle: exact payloads for
 arithmetic/bitwise/shift (`tagged(5)+1 → 6`, `tagged(6)&3 → 2`), concat
 in every form (`"x"+tagged("y") → "xy"`, templates via
@@ -630,10 +674,16 @@ the payload for its nullish test), `JSON.stringify` refusing loudly at
 the named field (`at 'k'`, `at '0'`, nested; payload `toJSON` not
 consulted; a replacer swap serializes; untagged structures
 byte-identical, pretty-printing included), the search five unwrapping
-each operand (receiver via `.call`, needle, position), journaling the
-payload token with the right note and exactly one entry per call, and
-re-wrapping results that branch and round-trip, unchanged out-of-scope
-behavior (typeof, tagged property keys, `new String(tagged)`), and
+each operand (receiver via `.call` or plain method call, needle,
+position), journaling the payload token with the right note and exactly
+one entry per call, and re-wrapping results that branch and round-trip,
+property gets forwarding (string length/index, object own/getter/
+inherited/missing, nested payloads with the outer note, stored tagged
+values flattening with mask 5 arity 3, functions passing through
+unwrapped into working plain method calls, throwing gets unwrapped,
+tagged keys still refusing on any receiver, untagged gets
+byte-identical), unchanged out-of-scope behavior (typeof, tagged
+property keys, `new String(tagged)`), and
 propagated results riding problem 1's fork and serialize→hydrate paths
 with their notes intact — including a cond observation stream that is
 byte-identical across the original, a forked arm, and a hydrated copy.
