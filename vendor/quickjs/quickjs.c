@@ -458,6 +458,9 @@ struct JSRuntime {
     JSTTNoteFreeFn *tt_note_free;
     /* tagged-value propagation: derive a result note from operand notes */
     JSTTCombineFn *tt_combine;
+    /* tagged-value conditionals: observe a control-flow branch over a
+       tagged value (payload-truthiness branch + the tested note) */
+    JSTTCondFn *tt_cond;
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
@@ -11944,7 +11947,16 @@ static int JS_ToBoolFree(JSContext *ctx, JSValue val)
         {
             JSObject *p = JS_VALUE_GET_OBJ(val);
             BOOL ret;
-            ret = !p->is_HTMLDDA;
+            if (unlikely(p->class_id == JS_CLASS_TT_TAGGED)) {
+                /* a tagged value reports its PAYLOAD's truthiness
+                   (nested tagged payloads recurse). No hook here:
+                   internal coercions must stay unobserved -- only the
+                   control-flow branch opcodes fire the cond hook. */
+                ret = JS_ToBoolFree(ctx,
+                                    JS_DupValue(ctx, p->u.tt_tagged.payload));
+            } else {
+                ret = !p->is_HTMLDDA;
+            }
             JS_FreeValue(ctx, val);
             return ret;
         }
@@ -11963,6 +11975,26 @@ static int JS_ToBoolFree(JSContext *ctx, JSValue val)
 int JS_ToBool(JSContext *ctx, JSValueConst val)
 {
     return JS_ToBoolFree(ctx, JS_DupValue(ctx, val));
+}
+
+/* TimeTravelJS: a control-flow branch over a tagged value. The branch
+   takes the PAYLOAD-truthiness side (JS_ToBoolFree above recurses
+   through nested tagged payloads), and the per-runtime cond hook
+   observes it -- exactly once per conditional evaluated, with the
+   OUTER note of the tested value. Only the branch opcodes call this;
+   every other ToBool (lnot, Boolean(), internal protocol coercions)
+   stays a silent value coercion. Consumes v; the hook runs before the
+   free so the borrowed note cannot dangle. */
+static int tt_tagged_branch_bool(JSContext *ctx, JSValue v)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(v);
+    int res;
+
+    res = JS_ToBoolFree(ctx, JS_DupValue(ctx, p->u.tt_tagged.payload));
+    if (ctx->rt->tt_cond)
+        ctx->rt->tt_cond(ctx, p->u.tt_tagged.note, res);
+    JS_FreeValue(ctx, v);
+    return res;
 }
 
 static int skip_spaces(const char *pc)
@@ -21490,6 +21522,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 4;
                 if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
                     res = JS_VALUE_GET_INT(op1);
+                } else if (unlikely(tt_value_is_tagged(op1))) {
+                    res = tt_tagged_branch_bool(ctx, op1);
                 } else {
                     res = JS_ToBoolFree(ctx, op1);
                 }
@@ -21511,6 +21545,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* quick and dirty test for JS_TAG_INT, JS_TAG_BOOL, JS_TAG_NULL and JS_TAG_UNDEFINED */
                 if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
                     res = JS_VALUE_GET_INT(op1);
+                } else if (unlikely(tt_value_is_tagged(op1))) {
+                    res = tt_tagged_branch_bool(ctx, op1);
                 } else {
                     res = JS_ToBoolFree(ctx, op1);
                 }
@@ -21532,6 +21568,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 1;
                 if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
                     res = JS_VALUE_GET_INT(op1);
+                } else if (unlikely(tt_value_is_tagged(op1))) {
+                    res = tt_tagged_branch_bool(ctx, op1);
                 } else {
                     res = JS_ToBoolFree(ctx, op1);
                 }
@@ -21552,6 +21590,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 1;
                 if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
                     res = JS_VALUE_GET_INT(op1);
+                } else if (unlikely(tt_value_is_tagged(op1))) {
+                    res = tt_tagged_branch_bool(ctx, op1);
                 } else {
                     res = JS_ToBoolFree(ctx, op1);
                 }
@@ -23883,11 +23923,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_nop):
             BREAK;
         CASE(OP_is_undefined_or_null):
-            if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_UNDEFINED ||
-                JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_NULL) {
-                goto set_true;
-            } else {
-                goto free_and_set_false;
+            {
+                /* TimeTravelJS: the nullish probe (??, ?., ??=, the
+                   iterator-return protocol) reads a tagged operand's
+                   PAYLOAD (nested tagged payloads recurse). Nullishness
+                   is identity of the payload, not truthiness, so the
+                   cond hook never fires here. */
+                JSValueConst npv = sp[-1];
+                while (unlikely(tt_value_is_tagged(npv)))
+                    npv = JS_VALUE_GET_OBJ(npv)->u.tt_tagged.payload;
+                if (JS_VALUE_GET_TAG(npv) == JS_TAG_UNDEFINED ||
+                    JS_VALUE_GET_TAG(npv) == JS_TAG_NULL) {
+                    /* free the wrapper (a no-op for a concrete
+                       null/undefined operand) */
+                    JS_FreeValue(ctx, sp[-1]);
+                    goto set_true;
+                } else {
+                    goto free_and_set_false;
+                }
             }
 #if SHORT_OPCODES
         CASE(OP_is_undefined):
@@ -30936,10 +30989,12 @@ fail:
 /* TimeTravelJS: the exact-undefined probe of the default-value protocols
    (parameter defaults, destructuring defaults). This is NOT a user
    comparison and must stay a concrete tag test: a tagged value is a
-   wrapper object -- never `undefined`, whatever its payload -- so it
-   must not trigger a default, and no Combine note derives from the
-   probe. Emitting the probe opcode directly keeps these sites out of
-   js_strict_eq_slow, whose tagged operands now unwrap like loose eq. */
+   wrapper -- never `undefined`, whatever its payload -- so it must not
+   trigger a default (routing it through js_strict_eq_slow would make a
+   tagged-undefined ARGUMENT compare payload-equal to `undefined` and
+   take the default), and no Combine or cond observation derives from
+   the probe. Emitting the probe opcode directly keeps these sites out
+   of js_strict_eq_slow, whose tagged operands unwrap like loose eq. */
 static void emit_undefined_probe(JSParseState *s)
 {
 #if SHORT_OPCODES
@@ -39764,12 +39819,10 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         case OP_null:
             /* TimeTravelJS: the null strict_eq/strict_neq -> is_null
                fusions are gone. A tagged operand must reach
-               js_strict_eq_slow's unwrap path (is_null is a plain tag
-               test that would neither unwrap nor Combine), and the
-               inverted strict_neq + branch form is unsound outright for
-               a result that is an always-truthy wrapper object: moving
-               the negation into the swapped branch flips the control
-               flow the unfused compare would take. */
+               js_strict_eq_slow's unwrap path: is_null is a plain tag
+               test that would neither unwrap nor Combine, and it hands
+               the branch a concrete boolean where the unfused compare
+               hands it the tagged result the cond hook observes. */
             /* fall thru */
         case OP_push_false:
         case OP_push_true:
@@ -48872,6 +48925,11 @@ void JS_TTSetNoteHooks(JSRuntime *rt, JSTTNoteCloneFn *clone_fn,
 void JS_TTSetCombineHook(JSRuntime *rt, JSTTCombineFn *combine)
 {
     rt->tt_combine = combine;
+}
+
+void JS_TTSetCondHook(JSRuntime *rt, JSTTCondFn *cond)
+{
+    rt->tt_cond = cond;
 }
 
 /* Make a tagged value. Takes ownership of 'payload' and of 'note' (the

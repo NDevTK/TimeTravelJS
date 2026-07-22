@@ -1165,6 +1165,21 @@ enum {
 typedef void *JSTTCombineFn(JSContext *ctx, int op, JSValueConst *args,
                             void **notes, int n);
 void JS_TTSetCombineHook(JSRuntime *rt, JSTTCombineFn *combine);
+
+/* Tagged-value truthiness and conditionals. A tagged value reports its
+   PAYLOAD's truthiness everywhere ToBool runs (nested tagged payloads
+   recurse): !tagged(0) is true, Boolean(tagged("")) is false. Internal
+   coercions never fire a hook. Separately, when a CONTROL-FLOW branch
+   tests a tagged value -- if / while / for / do conditions, ?:, the
+   &&, || (and &&=, ||=) short-circuits -- the cond hook observes it:
+   taken_true is the payload-truthiness branch about to be taken, note
+   is the tested value's note (borrowed; the OUTER note of a nested
+   tagged value). One conditional evaluated = one call; an untagged
+   operand never calls it. The ?? / ?. nullish probe is identity of the
+   payload (null-or-undefined), NOT truthiness: it unwraps but never
+   fires the cond hook. The hook must not call back into JS. */
+typedef void JSTTCondFn(JSContext *ctx, void *note, int taken_true);
+void JS_TTSetCondHook(JSRuntime *rt, JSTTCondFn *cond);
 /* select which debug info is stripped from the compiled code */
 #define JS_STRIP_SOURCE (1 << 0) /* strip source code */
 #define JS_STRIP_DEBUG  (1 << 1) /* strip all debug info including source code */

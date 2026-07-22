@@ -141,12 +141,18 @@
  *                               unwrapping exactly like loose-eq with
  *                               reflexive x === x staying concrete and
  *                               hook-free, the parameter/destructuring
- *                               default probes never unwrapping, typeof /
- *                               truthiness / property-key coercion
- *                               staying exactly as today, and propagated
- *                               results (including a strict-eq boolean)
- *                               round-tripping through problem 1's fork +
- *                               serialize paths.
+ *                               default probes never unwrapping, payload
+ *                               truthiness everywhere ToBool runs (with
+ *                               the cond hook observing exactly the
+ *                               control-flow branches -- if / ?: / && /
+ *                               || / ||= / loops / switch -- while ?? and
+ *                               ?. stay payload-nullish and silent, and
+ *                               ! / Boolean() coerce silently), typeof /
+ *                               property-key coercion staying exactly as
+ *                               today, and propagated results (including
+ *                               a strict-eq boolean and a cond
+ *                               observation stream) riding problem 1's
+ *                               fork + serialize paths.
  */
 #include "quickjs.h"
 #include "cutils.h"     /* DynBuf, for the tagged-value note hooks */
@@ -2550,6 +2556,27 @@ static void *tg_combine(JSContext *ctx, int op, JSValueConst *args,
     return out;
 }
 
+/* the Cond hook: record each control-flow observation of a tagged value
+   (note string + payload-truthiness branch), and append to a log so two
+   timelines' observation streams can be compared byte-for-byte */
+static int cnd_calls, cnd_last_taken;
+static char cnd_last_note[128];
+static char cnd_log[1024];
+
+static void tg_cond(JSContext *ctx, void *note, int taken_true)
+{
+    size_t off;
+    (void)ctx;
+    cnd_calls++;
+    cnd_last_taken = taken_true;
+    snprintf(cnd_last_note, sizeof(cnd_last_note), "%s",
+             note ? (char *)note : "-");
+    off = strlen(cnd_log);
+    if (off + strlen(cnd_last_note) + 8 < sizeof(cnd_log))
+        snprintf(cnd_log + off, sizeof(cnd_log) - off, "%s:%d;",
+                 cnd_last_note, taken_true);
+}
+
 /* install tagged(payload, strdup(note_str)) as a global */
 static void ct_set_tagged(JSContext *ctx, const char *name, JSValue payload,
                           const char *note_str)
@@ -2741,8 +2768,11 @@ static int cmd_combinetest(void)
 
     tg_clones = tg_serializes = tg_deserializes = tg_frees = tg_live = 0;
     cb_calls = 0;
+    cnd_calls = 0;
+    cnd_log[0] = 0;
     tg_set_hooks(rt);
     JS_TTSetCombineHook(rt, tg_combine);
+    JS_TTSetCondHook(rt, tg_cond);
     at_t = JS_NewAtom(ctx, "t");
 
     ct_set_tagged(ctx, "T5", JS_NewInt32(ctx, 5), "H5");
@@ -2750,6 +2780,23 @@ static int cmd_combinetest(void)
     ct_set_tagged(ctx, "TNULL", JS_NULL, "HN");
     ct_set_tagged(ctx, "TUND", JS_UNDEFINED, "HU");
     ct_set_tagged(ctx, "T6", JS_NewInt32(ctx, 6), "H6");
+    ct_set_tagged(ctx, "T0", JS_NewInt32(ctx, 0), "H0");
+    ct_set_tagged(ctx, "TES", eval_val(ctx, "''"), "HES");
+    {
+        /* TNEST = tagged(tagged(0)): nested payloads recurse for
+           truthiness; a conditional observes only the OUTER note */
+        char *n_in = strdup("HIN"), *n_out = strdup("HOUT");
+        JSValue t_in, glob;
+        assert(n_in && n_out);
+        tg_live += 2;
+        t_in = JS_TTMakeTagged(ctx, JS_NewInt32(ctx, 0), n_in);
+        assert(!JS_IsException(t_in));
+        glob = JS_GetGlobalObject(ctx);
+        if (JS_SetPropertyStr(ctx, glob, "TNEST",
+                              JS_TTMakeTagged(ctx, t_in, n_out)) < 0)
+            die(ctx, "set TNEST");
+        JS_FreeValue(ctx, glob);
+    }
     ct_set_tagged(ctx, "T2", JS_NewInt32(ctx, 2), "H2");
     ct_set_tagged(ctx, "T3", JS_NewInt32(ctx, 3), "H3");
     ct_set_tagged(ctx, "T9", JS_NewInt32(ctx, 9), "H9");
@@ -2866,16 +2913,21 @@ static int cmd_combinetest(void)
     ct_expect_bool(ctx, "TNULL === null", 1, JS_TT_OP_STRICT_EQ, 1);
     ct_expect_bool(ctx, "TUND === undefined", 1, JS_TT_OP_STRICT_EQ, 1);
     ct_expect_bool(ctx, "T5 !== null", 1, JS_TT_OP_STRICT_NEQ, 1);
-    /* with a branch: identical control flow to != -- the inverted
-       is_null fusion is gone and the wrapper result is truthy */
+    /* with a branch: identical control flow to != -- the compare yields
+       a tagged boolean, the branch takes its payload's side and the
+       cond hook observes it (combined note, taken=1) */
     cb_calls = 0;
+    cnd_calls = 0;
     ct_expect_concrete(ctx,
         "(function(){ if (T5 !== null) return 'A'; return 'B'; })()", "A");
     assert(cb_calls == 1 && cb_last_op == JS_TT_OP_STRICT_NEQ);
+    assert(cnd_calls == 1 && cnd_last_taken == 1);
     cb_calls = 0;
+    cnd_calls = 0;
     ct_expect_concrete(ctx,
         "(function(){ if (T5 != null) return 'A'; return 'B'; })()", "A");
     assert(cb_calls == 1 && cb_last_op == JS_TT_OP_NEQ);
+    assert(cnd_calls == 1 && cnd_last_taken == 1);
     printf("COMBINE:strict-eq null/undefined literals ok\n");
 
     /* --- reflexive: the same tagged object stays concrete, no hook ----- */
@@ -2886,26 +2938,32 @@ static int cmd_combinetest(void)
     assert(cb_calls == 0);
     printf("COMBINE:strict-eq reflexive concrete ok\n");
 
-    /* --- switch: each case-compare is the same tagged strict-eq -------- */
+    /* --- switch: each case-compare is the same tagged strict-eq, and
+       the branch takes the compare PAYLOAD's side (one cond observation
+       per case-compare) --- */
     cb_calls = 0;
+    cnd_calls = 0;
     ct_expect_concrete(ctx,
         "(function(){ switch (TY) { case 'y': return 'hit'; "
         "case 'z': return 'z'; default: return 'd'; } })()", "hit");
     assert(cb_calls == 1 && cb_last_op == JS_TT_OP_STRICT_EQ);
-    /* the compare result is a truthy WRAPPER (truthiness is problem 3),
-       so -- exactly like an if over == or === -- the first case-compare
-       selects even on a false payload */
+    assert(cnd_calls == 1 && cnd_last_taken == 1);
+    /* a false-payload compare now correctly falls through to the next
+       case: the switch selects by PAYLOAD, exactly like concrete code */
     cb_calls = 0;
+    cnd_calls = 0;
     ct_expect_concrete(ctx,
         "(function(){ switch (TY) { case 'z': return 'first'; "
-        "case 'y': return 'second'; default: return 'd'; } })()", "first");
-    assert(cb_calls == 1 && cb_last_op == JS_TT_OP_STRICT_EQ);
+        "case 'y': return 'second'; default: return 'd'; } })()", "second");
+    assert(cb_calls == 2 && cb_last_op == JS_TT_OP_STRICT_EQ);
+    assert(cnd_calls == 2 && cnd_last_taken == 1);
     printf("COMBINE:switch case-compare ok\n");
 
     /* --- the default-value probes never unwrap ------------------------- */
     {
         JSValue p;
         cb_calls = 0;
+        cnd_calls = 0;
         /* a tagged argument is not `undefined`: the default must not
            fire, the tagged value must ride through, no Combine */
         p = ct_eval_payload(ctx, "(function(a = 99){ return a; })(T5)");
@@ -2925,10 +2983,124 @@ static int cmd_combinetest(void)
         assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT && JS_VALUE_GET_INT(p) == 5);
         JS_FreeValue(ctx, p);
         assert(cb_calls == 0);
+        assert(cnd_calls == 0);   /* the probe branch is concrete: no
+                                     cond observation from a tagged arg */
         /* an absent argument still takes the default */
         ct_expect_concrete(ctx, "(function(a = 99){ return a; })()", "99");
     }
     printf("COMBINE:default probes stay exact ok\n");
+
+    /* --- truthiness is the payload's, everywhere ToBool runs (and only
+       branches observe it: ! and Boolean() fire no hook) --- */
+    cnd_calls = 0;
+    ct_expect_concrete(ctx, "!T0", "true");
+    ct_expect_concrete(ctx, "!T5", "false");
+    ct_expect_concrete(ctx, "Boolean(TES)", "false");
+    ct_expect_concrete(ctx, "Boolean(T5)", "true");
+    ct_expect_concrete(ctx, "!!TNULL", "false");
+    ct_expect_concrete(ctx, "!!TUND", "false");
+    assert(cnd_calls == 0);
+    printf("COMBINE:payload truthiness (no hook) ok\n");
+
+    /* --- the cond hook observes control-flow branches ------------------ */
+    {
+        char want[64];
+        /* ?: is a branch */
+        cnd_calls = 0;
+        ct_expect_concrete(ctx, "T5 ? 'y' : 'n'", "y");
+        assert(cnd_calls == 1 && cnd_last_taken == 1 &&
+               strcmp(cnd_last_note, "H5") == 0);
+        cnd_calls = 0;
+        ct_expect_concrete(ctx, "T0 ? 'y' : 'n'", "n");
+        assert(cnd_calls == 1 && cnd_last_taken == 0 &&
+               strcmp(cnd_last_note, "H0") == 0);
+        /* if/else over a plain tagged value */
+        cnd_calls = 0;
+        ct_expect_concrete(ctx,
+            "(function(){ if (T0) return 'A'; return 'B'; })()", "B");
+        assert(cnd_calls == 1 && cnd_last_taken == 0);
+        /* if over a compare result: the branch observes the COMBINED
+           note of the tagged boolean the compare produced */
+        cnd_calls = 0;
+        cb_calls = 0;
+        snprintf(want, sizeof(want), "C%d(HY,-)", JS_TT_OP_STRICT_EQ);
+        ct_expect_concrete(ctx,
+            "(function(){ if (TY === 'y') return 'A'; return 'B'; })()",
+            "A");
+        assert(cb_calls == 1);
+        assert(cnd_calls == 1 && cnd_last_taken == 1 &&
+               strcmp(cnd_last_note, want) == 0);
+        /* nested tagged: truthiness recurses, ONE observation, OUTER
+           note */
+        cnd_calls = 0;
+        ct_expect_concrete(ctx, "TNEST ? 'y' : 'n'", "n");
+        assert(cnd_calls == 1 && cnd_last_taken == 0 &&
+               strcmp(cnd_last_note, "HOUT") == 0);
+        /* untagged conditionals never fire */
+        cnd_calls = 0;
+        ct_expect_concrete(ctx,
+            "(function(){ if (5 > 3) return 'A'; return 'B'; })()", "A");
+        ct_expect_concrete(ctx, "1 ? 'y' : 'n'", "y");
+        assert(cnd_calls == 0);
+    }
+    printf("COMBINE:cond hook at branches ok\n");
+
+    /* --- short-circuits + the nullish probe ---------------------------- */
+    {
+        JSValue p;
+        /* && short-circuits on the falsy tagged lhs: the RESULT is the
+           tagged value itself, and the test was one observation */
+        cnd_calls = 0;
+        p = ct_eval_payload(ctx, "T0 && 'x'");
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT &&
+               JS_VALUE_GET_INT(p) == 0);
+        JS_FreeValue(ctx, p);
+        assert(cnd_calls == 1 && cnd_last_taken == 0 &&
+               strcmp(cnd_last_note, "H0") == 0);
+        cnd_calls = 0;
+        ct_expect_concrete(ctx, "T5 && 'x'", "x");
+        assert(cnd_calls == 1 && cnd_last_taken == 1);
+        /* || falls through to the rhs on a falsy payload */
+        cnd_calls = 0;
+        ct_expect_concrete(ctx, "TES || 'y'", "y");
+        assert(cnd_calls == 1 && cnd_last_taken == 0 &&
+               strcmp(cnd_last_note, "HES") == 0);
+        /* ||= branches on the tagged current value too */
+        cnd_calls = 0;
+        ct_expect_concrete(ctx,
+            "(function(){ var v = T0; v ||= 9; return v; })()", "9");
+        assert(cnd_calls == 1 && cnd_last_taken == 0);
+        /* ?? / ?. are the nullish probe: identity of the PAYLOAD, not
+           truthiness -- unwrapped, but never a cond observation */
+        cnd_calls = 0;
+        ct_expect_concrete(ctx, "TNULL ?? 'z'", "z");
+        ct_expect_concrete(ctx, "TUND ?? 'z'", "z");
+        p = ct_eval_payload(ctx, "T0 ?? 'z'");   /* 0 is not nullish */
+        assert(JS_VALUE_GET_TAG(p) == JS_TAG_INT &&
+               JS_VALUE_GET_INT(p) == 0);
+        JS_FreeValue(ctx, p);
+        ct_expect_concrete(ctx, "TNULL?.x ?? 'm'", "m");
+        assert(cnd_calls == 0);
+    }
+    printf("COMBINE:short-circuits + nullish ok\n");
+
+    /* --- loops: one observation per condition evaluation --------------- */
+    cnd_calls = 0;
+    ct_expect_concrete(ctx,
+        "(function(){ var i = 0; while (T5) { if (++i >= 3) break; } "
+        "return i; })()", "3");
+    assert(cnd_calls == 3 && cnd_last_taken == 1);
+    cnd_calls = 0;
+    ct_expect_concrete(ctx,
+        "(function(){ for (; T0 ;) return 'body'; return 'skip'; })()",
+        "skip");
+    assert(cnd_calls == 1 && cnd_last_taken == 0);
+    cnd_calls = 0;
+    ct_expect_concrete(ctx,
+        "(function(){ var i = 0; do { i++; } while (TES); return i; })()",
+        "1");
+    assert(cnd_calls == 1 && cnd_last_taken == 0);
+    printf("COMBINE:loop conditions ok\n");
 
     /* --- a throwing concrete op propagates the real error -------------- */
     cb_calls = 0;
@@ -2938,7 +3110,6 @@ static int cmd_combinetest(void)
 
     /* --- out-of-scope behavior is EXACTLY today's ----------------------- */
     ct_expect_concrete(ctx, "typeof T5", "object");
-    ct_expect_concrete(ctx, "T5 ? 1 : 2", "1");     /* truthiness: problem 3 */
     ct_expect_throws(ctx, "({})[TKEY]", NULL);      /* key coercion throws */
     ct_expect_throws(ctx, "var ko = {}; ko[TKEY] = 1", NULL);
     ct_expect_throws(ctx, "String.prototype.charAt.call(TAB, 0)", NULL);
@@ -3045,6 +3216,67 @@ static int cmd_combinetest(void)
         JS_FreeValue(ctx, arm);
     }
     printf("COMBINE:strict-eq result round-trips ok\n");
+
+    /* --- a cond observation is deterministic across fork + hydrate ------
+       tflow's t1 probe (t ? typeof t : "null") is one conditional over
+       the injected tagged local; resume the original, a forked arm and
+       a serialize->hydrate copy, and the three observation streams must
+       be byte-identical (the note travels with the value) */
+    {
+        JSValue R, g, arm, g2;
+        uint8_t *bytes;
+        size_t blen;
+        char obs_direct[sizeof(cnd_log)], obs_arm[sizeof(cnd_log)];
+        char obs_hydrated[sizeof(cnd_log)], tr[512];
+
+        R = eval_val(ctx, "T5");
+        g = tg_start_tflow(ctx);
+        if (!JS_TTFlowSetLocal(ctx, g, 0, at_t, R)) {
+            fprintf(stderr, "FAIL: inject tagged local for cond\n");
+            return 1;
+        }
+        arm = JS_TTFlowFork(ctx, g);
+        if (JS_IsException(arm))
+            die(ctx, "fork for cond determinism");
+        bytes = JS_TTFlowSerialize(ctx, g, &blen);
+        if (!bytes)
+            die(ctx, "serialize for cond determinism");
+        g2 = JS_TTFlowDeserialize(ctx, bytes, blen);
+        if (JS_IsException(g2))
+            die(ctx, "hydrate for cond determinism");
+        js_free(ctx, bytes);
+
+        cnd_calls = 0;
+        cnd_log[0] = 0;
+        collect_flow(ctx, g, 0, tr, sizeof(tr));
+        assert(strstr(tr, "t1:object:0"));
+        assert(cnd_calls == 1 && cnd_last_taken == 1);
+        snprintf(obs_direct, sizeof(obs_direct), "%s", cnd_log);
+
+        cnd_calls = 0;
+        cnd_log[0] = 0;
+        collect_flow(ctx, arm, 0, tr, sizeof(tr));
+        assert(strstr(tr, "t1:object:0"));
+        assert(cnd_calls == 1);
+        snprintf(obs_arm, sizeof(obs_arm), "%s", cnd_log);
+
+        cnd_calls = 0;
+        cnd_log[0] = 0;
+        collect_flow(ctx, g2, 0, tr, sizeof(tr));
+        assert(strstr(tr, "t1:object:0"));
+        assert(cnd_calls == 1);
+        snprintf(obs_hydrated, sizeof(obs_hydrated), "%s", cnd_log);
+
+        assert(strcmp(obs_direct, "H5:1;") == 0);
+        assert(strcmp(obs_direct, obs_arm) == 0);
+        assert(strcmp(obs_direct, obs_hydrated) == 0);
+
+        JS_FreeValue(ctx, R);
+        JS_FreeValue(ctx, g);
+        JS_FreeValue(ctx, arm);
+        JS_FreeValue(ctx, g2);
+    }
+    printf("COMBINE:cond observation rides fork/hydrate ok\n");
 
     /* --- teardown -------------------------------------------------------- */
     JS_FreeAtom(ctx, at_t);

@@ -523,19 +523,40 @@ tagged value against **itself** (`x === x`, the same object) keeps its
 concrete identity answer — `true`, no hook call. Two compile-time
 consequences keep every spelling of the operator on that one path: the
 peephole fusions of `=== null`/`=== undefined` into the `is_null`/
-`is_undefined` short opcodes are gone (the plain ones would skip the
-unwrap; the inverted `!==`-plus-branch ones are unsound outright for an
-always-truthy wrapper result), and the parameter/destructuring
-**default-value probes** — which are exact-`undefined` tag tests, not
-comparisons — now emit `OP_is_undefined` directly, so a tagged argument
-(even one whose payload *is* `undefined`) never triggers a default and
-never fires the hook.
+`is_undefined` short opcodes are gone (they would skip the unwrap and
+hand the branch a concrete boolean where the unfused compare hands it
+the tagged result the cond hook observes), and the parameter/
+destructuring **default-value probes** — which are exact-`undefined`
+tag tests, not comparisons — now emit `OP_is_undefined` directly, so a
+tagged argument (even one whose payload *is* `undefined`) never
+triggers a default and never fires a hook.
 
-One deliberate boundary remains: truthiness/branching on a tagged value
-is untouched (a tagged boolean is an object and stays truthy —
-conditional behavior is the next problem). Relational and equality
-results are therefore tagged *values* (`tagged(true)`), faithful to the
-rule but only meaningful to hosts until branches learn about them.
+## Tagged truthiness and conditionals
+
+A tagged value reports its **payload's truthiness** everywhere `ToBool`
+runs (nested tagged payloads recurse): `!tagged(0)` is `true`,
+`Boolean(tagged(""))` is `false`, and an `if`/`while` branch takes the
+payload's side. Value coercion and observation are strictly separate:
+
+```c
+typedef void JSTTCondFn(JSContext*, void *note, int taken_true);
+void JS_TTSetCondHook(JSRuntime *rt, JSTTCondFn *cond);
+```
+
+Only the **control-flow branch opcodes** fire the hook — `if_true`/
+`if_false` and their 8-bit shrunk forms, which is where every branching
+spelling lands: `if`/`else`, `?:`, `&&`/`||` (and `&&=`/`||=`), and the
+`for`/`while`/`do` condition tests, plus a `switch` whose case-compare
+produced a tagged boolean (the observed note is then the Combine-derived
+note of that compare). One conditional evaluated = one observation, with
+the tested value's outer note and the payload-truthiness branch taken;
+an untagged operand never calls the hook, and plain coercions (`!`,
+`Boolean()`, internal protocol checks like an iterator's `done`) stay
+silent. The `??`/`?.` nullish probe is **identity of the payload**, not
+truthiness: `tagged(null) ?? z` evaluates `z`, but no cond observation
+fires. The hook is per-runtime state, so an observation stream is
+deterministic across fork and serialize→hydrate — the note travels with
+the value.
 
 The combinetest harness drives the oracle: exact payloads for
 arithmetic/bitwise/shift (`tagged(5)+1 → 6`, `tagged(6)&3 → 2`), concat
@@ -550,11 +571,16 @@ zero Combine calls, strict equality unwrapping in every spelling
 kept distinct, `=== null`/`=== undefined` literal forms, the `switch`
 case-compare, reflexive `x === x` staying concrete and hook-free),
 default-value probes never unwrapping (a tagged argument — even
-`tagged(undefined)` — rides through with zero Combine calls), unchanged
-out-of-scope behavior (typeof, truthiness, tagged property keys,
-`new String(tagged)`), and propagated results (an arithmetic int and a
-strict-eq boolean) riding problem 1's fork and serialize→hydrate paths
-with their combined notes intact.
+`tagged(undefined)` — rides through with zero Combine and zero cond
+calls), payload truthiness with the cond hook firing at exactly the
+branch sites (`?:`, `if`, `&&`/`||`/`||=`, loop conditions once per
+evaluation, switch case-compares payload-selecting their case) and
+nowhere else (`!`, `Boolean()`, `??`/`?.` all silent, `??` unwrapping
+the payload for its nullish test), unchanged out-of-scope behavior
+(typeof, tagged property keys, `new String(tagged)`), and propagated
+results riding problem 1's fork and serialize→hydrate paths with their
+notes intact — including a cond observation stream that is
+byte-identical across the original, a forked arm, and a hydrated copy.
 
 ## Wire format (`TTFL05`)
 
