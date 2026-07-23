@@ -45,13 +45,18 @@ for (const mod of ["core", "dom", "html", "css", "selectors", "style", "tag", "n
   lexborWalk(join(lexborRoot, "lexbor", mod))
 lexborWalk(join(lexborRoot, "lexbor/ports/posix"))
 
+// wasi-libc install root (Debian wasi-libc package layout by default;
+// point WASI_SYSROOT at a source-built sysroot to override)
+const SYSROOT = process.env.WASI_SYSROOT ?? "/usr"
+const CLANG_INC = process.env.CLANG_INCLUDE ?? "/usr/lib/llvm-18/lib/clang/18/include"
+
 const args = [
   "--target=wasm32-wasi",
-  "--sysroot=/usr",
+  `--sysroot=${SYSROOT}`,
   "-nostdinc",
   "-isystem", join(root, "native/shims"),
-  "-isystem", "/usr/include/wasm32-wasi",
-  "-isystem", "/usr/lib/llvm-18/lib/clang/18/include",
+  "-isystem", `${SYSROOT}/include/wasm32-wasi`,
+  "-isystem", CLANG_INC,
   "-O2",
   debug ? "-g" : "-g0",
   "-DCONFIG_VERSION=\"2026-06-04\"",

@@ -1,0 +1,10 @@
+test262
+build/
+run-test262
+run-test262-*
+*.csv
+*.log
+*.txt.sorted
+baseline-errors.txt
+expected-errors.sorted
+baseline-full.log

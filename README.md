@@ -135,7 +135,12 @@ is honestly a fork, not a patch):
   already ran on heap-allocated frames — the rewrite generalizes their
   frame model to every call. Recursion depth becomes an exact,
   snapshot-stable limit (an ordinary catchable `stack overflow` ~18 000
-  frames deep) instead of a C-stack accident;
+  frames deep) instead of a C-stack accident. `npm run test:stackless`
+  proves the property mechanically: an 8 000-deep JS recursion observes
+  ONE C frame address at every step (the C stack does not track JS
+  depth), parks and resumes at all 24 004 of its steps, and completes
+  inside a 256 KB C stack — where pristine QuickJS segfaults at that
+  budget and throws `stack overflow` even at its defaults;
 - a **step hook in the dispatch loop** that fires per source line — or,
   at opcode granularity, between every two VM instructions — with a
   per-frame pc→line range cache so the check is cheap;
@@ -395,8 +400,12 @@ site nor the tests require a C toolchain.
   recording as `suppressedSteps` (0 for the entire probe corpus and the
   engine test suite's full-surface gate program).
 - Inlined tail calls keep the caller's frame: proper-tail-call space
-  guarantees are traded for park-anywhere (depth is bounded by the 2 MB
-  frame arena, ~18 000 frames).
+  guarantees are traded for park-anywhere (execution depth is bounded by
+  the fixed 2 MB frame arena, ~18 000 frames — exact and
+  snapshot-stable). Suspended flow machines have no such cap: their
+  segmented arenas grow to the runtime memory limit, and the flow
+  harness proves a 46 000-frame machine (5× the old bound) serializing,
+  evicting and resuming byte-identically.
 - `eval`'d / `new Function` code steps only if its filename matches the user
   program (it doesn't), and `setInterval` is not provided (`setTimeout`
   chains are).
@@ -453,11 +462,47 @@ site nor the tests require a C toolchain.
 
 The rewritten core is checked against the full conformance suite with the
 official `run-test262` harness compiled natively against this repo's
-`quickjs.c`: **49 / 43 790 errors — the failing-test list is byte-identical
-to pristine QuickJS 2026-06-04**, before and after every stage of the
-stackless migration (inlined calls, arena frames, constructor/generator/
-async conversion, job pumps). The rewrite is semantics-preserving across
-the language surface.
+`quickjs.c` (`tools/test262/`, upstream QuickJS 2026-06-04's runner with
+quickjs-libc trimmed to three inlined helpers): **58 / 83 558 errors over
+the full corpus in both sloppy and strict variants — the failing-test
+list is byte-identical to pristine QuickJS 2026-06-04**, before and after
+every stage of the stackless migration (inlined calls, arena frames,
+constructor/generator/async conversion, job pumps, stackless module
+evaluation). The rewrite is semantics-preserving across the language
+surface.
+
+**Forced preemption is a first-class oracle, not a sample.** `run.sh
+preempt` drives every test through the exact stackless path the debugger
+uses: a step handler parks the machine at EVERY parkable step — each
+source line and each loop back-edge — the host resumes it from the heap
+frame chain, promise jobs pump through `JS_TTPumpJob`, and module bodies
+evaluate through the stackless InnerModuleEvaluation machine, so a test
+run is tens of thousands of park/resume round trips. The result is the
+**same 58 / 83 558, byte-identical to the classic list**, with
+engagement measured rather than assumed: **97.2% of 192 M park requests
+fired** (the rest are counted suppressed steps inside the documented
+reflective C residue), **every test that executes user code fired real
+parks — zero tests passed with preemption silently unengaged** — and
+per-test counters land in a CSV (`-M`). `run.sh opcode` repeats the
+whole corpus parking **between every two VM instructions**.
+
+```
+sh tools/test262/run.sh            # classic drive: must match test262_errors.txt
+sh tools/test262/run.sh preempt    # park at every step + engagement metric
+sh tools/test262/run.sh opcode     # park between every two VM instructions
+```
+
+**Sanitizer- and aliasing-clean over the same corpus.** The full suite —
+both the classic drive and the forced-preemption drive — runs under
+AddressSanitizer + UndefinedBehaviorSanitizer with **zero reports** (the
+sweep flushed out three latent upstream UBs, all fixed: `ToInt32`/
+`ToInt64` negating `INT_MIN`, `memcpy(NULL, 0)` on zero-length
+typed-array slices, and `size * 3 / 2` growth arithmetic overflowing
+`int` on gigabyte strings), and the native flow-serialization suite is
+sanitizer-clean too. A strict-aliasing differential — the corpus at
+`-O2` under default aliasing vs `-fno-strict-aliasing`, per-test reports
+compared — is outcome-identical, so no behavior anywhere depends on
+type-punning the optimizer is entitled to break.
 
 On top of that, `tools/test262-stepped.mjs` runs a corpus sample through
 the ENGINE with per-step snapshotting enabled and lets each test's own

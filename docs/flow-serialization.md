@@ -270,8 +270,44 @@ it reaches. Machine-parked flows fork **in place**: the parked TrampFrame
 chain rebuilds inside the sibling's own arena (next section) with
 identical geometry, so every parent-relative offset — argument windows,
 method receivers, open-cell storage slots — transfers verbatim, and the
-sibling arrives as an independently suspended machine. Async functions
-and exotic private classes refuse with the serializer's errors.
+sibling arrives as an independently suspended machine.
+
+## Exotic flow-private state travels as structure, not slots
+
+Copying visible properties is the wrong model for most built-ins, so each
+exotic class serializes (and forks) through its actual internal shape:
+
+- **Map / Set** — the live record list in insertion order (iterator
+  tombstones skipped); the reader re-inserts through `map_add_record`, so
+  both iteration order and a hash table valid for the *destination*
+  process's pointer values are reproduced. `WeakMap`/`WeakSet` refuse by
+  name: weak collections hold liveness, not structure.
+- **ArrayBuffer** — the byte image plus the detached flag and, for
+  resizable buffers, `maxByteLength`; `SharedArrayBuffer` refuses by name
+  (its memory belongs to other agents).
+- **TypedArray / DataView** — class, byte offset, byte length and the
+  length-tracking flag over a *reference* to their buffer's record, so
+  two views over one buffer keep sharing after any number of
+  serialize/fork hops — a write through one view reads back through its
+  twin (the harness asserts exactly that).
+- **RegExp** — pattern and flags only; the reader **recompiles**, so the
+  wire format never couples to the regexp engine's bytecode. `lastIndex`
+  is an ordinary own property and travels with the props.
+- **Proxy** — target + handler references plus the callable/revoked bits;
+  a rebuilt proxy is a real proxy over the same (transplanted) pair, so
+  every `[[Get]]`/`[[Set]]`/`[[Define]]` invariant is enforced by the
+  ordinary proxy machinery, and a revoked proxy stays revoked. The
+  revocable pair's `revoke` closure — identified C-function state —
+  travels too, still wired to its own proxy record. (Other C closures
+  keep refusing: an arbitrary function pointer cannot travel.)
+
+The `exotictest` harness command holds all of this to a byte oracle: a
+flow parked over one of each class re-serializes byte-identically,
+hydrates and forks into copies whose in-flow interrogation (iteration
+order, twin-view aliasing, `exec` + `lastIndex`, trap dispatch, revoked
+refusal) equals the statically known answer, arms diverge independently,
+and the weak refusal leaves the refused flow unharmed. Remaining
+refusals stay loud and named — nothing silently corrupts.
 
 ## The suspended machine as a first-class value
 
@@ -333,11 +369,18 @@ realloc-that-moves — live frames carry parent-relative aliases and
 open-cell storage pointers, so a block's address is forever. A block
 never straddles segments: when the current segment cannot hold a push,
 allocation continues in a fresh segment sized to the demand (first
-segment ≥ 1 KB, then doubling to a 64 KB ceiling, total capped at the
-same 2 MB the fixed arena enforces, so the recursion limit keeps its
-order of magnitude). The runtime's own execution arena is the degenerate
-case — one fixed 2 MB segment whose exhaustion *is* the engine's
-snapshot-stable recursion limit — so normal execution is unchanged.
+segment ≥ 1 KB, then doubling to a 64 KB ceiling that scales
+geometrically once a chain outgrows it — at most ~12.5% slack). A
+machine's total is **unbounded**: its depth stops at the runtime memory
+limit — ultimately the RAM floor — not at a cap, surfaced as the same
+catchable stack overflow. The runtime's own execution arena is the
+degenerate case — one fixed 2 MB segment whose exhaustion *is* the
+engine's snapshot-stable recursion limit — so normal execution is
+unchanged. The `unbounded` harness command holds the claim to bytes: a
+machine parked 46 000 frames deep (a ~10 MB, ~40-segment chain, five
+times the old cap) re-serializes byte-identically, round-trips through
+evict → hydrate to the same bytes, and two independent hydrations
+resume across every segment boundary to identical completions.
 
 The hot paths stay hot: push is the same bump-and-compare with a slow
 path that enters the next segment; pop is LIFO release to a mark, with a

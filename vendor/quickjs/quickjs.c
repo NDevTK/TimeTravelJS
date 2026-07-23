@@ -434,6 +434,10 @@ struct JSRuntime {
     JSValue tt_job_vals[4];
     void *tt_job_aux;         /* kind 2: JSAsyncFunctionState* */
     JSContext *tt_job_realm;  /* held ref while parked */
+    /* stackless module evaluation (JS_TTCallStart on a module): the
+       InnerModuleEvaluation DFS as heap state so a module body can park
+       with the dispatch loop as the only C frame */
+    struct TTModEval *tt_modeval;
     /* one-shot defer slot: when set, a BYTECODE getter/setter reached by
        the property machinery is handed back (dup'd into the slot, slot
        cleared) instead of being invoked from C — the dispatch loop then
@@ -537,6 +541,11 @@ typedef struct JSStackFrame {
     uint32_t tt_pc_lo;
     uint32_t tt_pc_hi;
     uint32_t tt_prev_off;
+    /* 1-based chain depth, maintained at link time (parent + 1) so the
+       per-step hook reports depth in O(1) — a chain walk there is
+       quadratic over deep recursions. Not serialized: rebuilt by the
+       hydrator/fork the same way. */
+    int tt_depth;
     /* TimeTravelJS stackless interpreter: frames live in a linear-memory
        arena and a JS→JS call continues the SAME dispatch loop, so the
        former C parameters become per-frame state. frame_kind records how
@@ -1605,6 +1614,13 @@ static no_inline int tt_cow_abuf(JSContext *ctx, JSObject *p);
 static no_inline int tt_cow_odata(JSContext *ctx, JSObject *p);
 static no_inline int tt_cow_ta(JSContext *ctx, JSObject *p);
 static uint32_t map_hash_key(JSValueConst key, int hash_bits);
+/* flow serialization rebuilds exotic flow-private state through the same
+   internal constructors the language uses */
+static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s,
+                                   JSValueConst key);
+static JSValue js_proxy_revoke(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv, int magic,
+                               JSValue *func_data);
 static void tt_flow_jobs_mark(JSRuntime *rt, struct TTFlowJobs *q,
                               JS_MarkFunc *mark_func);
 static void tt_async_flow_link(JSContext *ctx, JSValueConst promise,
@@ -2202,7 +2218,7 @@ static no_inline int js_realloc_array(JSContext *ctx, void **parray,
     size_t slack;
     void *new_array;
     /* XXX: potential arithmetic overflow */
-    new_size = max_int(req_size, *psize * 3 / 2);
+    new_size = max_int(req_size, *psize + *psize / 2);
     new_array = js_realloc2(ctx, *parray, new_size * elem_size, &slack);
     if (!new_array)
         return -1;
@@ -3544,7 +3560,7 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
            4 6 9 13 19 28 42 63 94 141 211 316 474 711 1066 1599 2398 3597 5395 8092
            preallocating space for predefined atoms (at least 504).
          */
-        new_size = max_int(711, rt->atom_size * 3 / 2);
+        new_size = max_int(711, rt->atom_size + rt->atom_size / 2);
         if (new_size > JS_ATOM_MAX)
             goto fail;
         /* XXX: should use realloc2 to use slack space */
@@ -4181,7 +4197,7 @@ static int JS_NewClass1(JSRuntime *rt, JSClassID class_id,
 
     if (class_id >= rt->class_count) {
         new_size = max_int(JS_CLASS_INIT_COUNT,
-                           max_int(class_id + 1, rt->class_count * 3 / 2));
+                           max_int(class_id + 1, rt->class_count + rt->class_count / 2));
 
         /* reallocate the context class prototype array, if any */
         list_for_each(el, &rt->context_list) {
@@ -4390,7 +4406,9 @@ static no_inline int string_buffer_realloc(StringBuffer *s, int new_len, int c)
         JS_ThrowInternalError(s->ctx, "string too long");
         return string_buffer_set_error(s);
     }
-    new_size = min_int(max_int(new_len, s->size * 3 / 2), JS_STRING_LEN_MAX);
+    /* s->size + s->size / 2 == s->size * 3 / 2 in floor arithmetic, but
+       cannot overflow int for sizes up to JS_STRING_LEN_MAX */
+    new_size = min_int(max_int(new_len, s->size + s->size / 2), JS_STRING_LEN_MAX);
     if (!s->is_wide_char && c >= 0x100) {
         return string_buffer_widen(s, new_size);
     }
@@ -5694,7 +5712,7 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
     JSShape *old_sh;
 
     sh = *psh;
-    new_size = max_int(count, sh->prop_size * 3 / 2);
+    new_size = max_int(count, sh->prop_size + sh->prop_size / 2);
     /* Reallocate prop array first to avoid crash or size inconsistency
        in case of memory allocation failure */
     if (p) {
@@ -8123,7 +8141,6 @@ static no_inline int js_tt_step_check(JSContext *ctx, JSStackFrame *sf,
     JSRuntime *rt = ctx->rt;
     uint32_t off = (uint32_t)(pc - b->byte_code_buf);
     int col, line, depth, parkable;
-    JSStackFrame *f;
 
     if (rt->tt_skip_once) {
         /* first check after a parked resume re-tests the pc that parked */
@@ -8170,9 +8187,9 @@ static no_inline int js_tt_step_check(JSContext *ctx, JSStackFrame *sf,
     sf->tt_last_line = line;
     sf->cur_pc = pc; /* keep backtraces honest while paused here */
 
-    depth = 0;
-    for (f = rt->current_stack_frame; f; f = f->prev_frame)
-        depth++;
+    /* frames carry their chain depth (set at link time): a walk here is
+       O(depth) per step and turns deep recursions quadratic */
+    depth = sf->tt_depth;
     if (tt_vtime_enabled)
         tt_vtime += 1;
     parkable = rt->tt_park_ok && rt->tt_loop_depth == 1;
@@ -10350,7 +10367,7 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
     size_t slack;
     JSValue *new_array_prop;
     /* XXX: potential arithmetic overflow */
-    new_size = max_int(new_len, p->u.array.u1.size * 3 / 2);
+    new_size = max_int(new_len, p->u.array.u1.size + p->u.array.u1.size / 2);
     new_array_prop = js_realloc2(ctx, p->u.array.u.values, sizeof(JSValue) * new_size, &slack);
     if (!new_array_prop)
         return -1;
@@ -14205,9 +14222,10 @@ static int JS_ToInt64Free(JSContext *ctx, int64_t *pres, JSValue val)
                 /* remainder modulo 2^64 */
                 v = (u.u64 & (((uint64_t)1 << 52) - 1)) | ((uint64_t)1 << 52);
                 ret = v << ((e - 1023) - 52);
-                /* take the sign into account */
+                /* take the sign into account (negation modulo 2^64:
+                   INT64_MIN negates to itself) */
                 if (u.u64 >> 63)
-                    ret = -ret;
+                    ret = (int64_t)(0 - (uint64_t)ret);
             } else {
                 ret = 0; /* also handles NaN and +inf */
             }
@@ -14271,9 +14289,10 @@ static int JS_ToInt32Free(JSContext *ctx, int32_t *pres, JSValue val)
                 v = (u.u64 & (((uint64_t)1 << 52) - 1)) | ((uint64_t)1 << 52);
                 v = v << ((e - 1023) - 52 + 32);
                 ret = v >> 32;
-                /* take the sign into account */
+                /* take the sign into account (negation modulo 2^32:
+                   INT32_MIN negates to itself) */
                 if (u.u64 >> 63)
-                    ret = -ret;
+                    ret = (int32_t)(0 - (uint32_t)ret);
             } else {
                 ret = 0; /* also handles NaN and +inf */
             }
@@ -18828,10 +18847,12 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
    never straddles segments -- when the current segment cannot hold a
    request, allocation continues in a fresh (or kept-for-reuse) successor
    segment. The runtime's own execution arena is one fixed 2 MB segment
-   (exhaustion IS the engine's recursion limit); per-machine arenas start
-   at a demand-sized sliver and double up to TT_ARENA_SEG_MAX, capped at
-   the same 2 MB total, so N suspended machines cost the sum of their
-   actual chain depths, not N slabs. */
+   (exhaustion IS the engine's recursion limit, exact and
+   snapshot-stable); per-machine arenas start at a demand-sized sliver,
+   double up to TT_ARENA_SEG_MAX (then scale geometrically for deep
+   chains) and are UNBOUNDED in total -- a machine's depth stops at the
+   runtime memory limit, not at a cap -- so N suspended machines cost the
+   sum of their actual chain depths, not N slabs. */
 #define TT_FRAME_ARENA_SIZE (2 * 1024 * 1024)
 #define TT_ARENA_SEG_MIN    1024
 #define TT_ARENA_SEG_MAX    (64 * 1024)
@@ -18905,13 +18926,21 @@ static void tt_arena_flush_graveyard(JSRuntime *rt)
 
 /* enter the segment after 'cur' that can hold an aligned block of 'need'
    bytes: reuse a kept successor when it fits, else append a fresh
-   demand-sized one (dropping a too-small stale tail). Returns NULL at the
-   total growth cap or OOM. */
+   demand-sized one (dropping a too-small stale tail). Growable (machine)
+   arenas have NO total cap — the runtime memory limit (ultimately the
+   RAM floor) is the bound, surfaced as a catchable stack overflow at the
+   push site. Small chains keep the historical 1 KB→64 KB doubling so N
+   suspended machines still cost the sum of their actual depths; once a
+   chain outgrows eight max segments the per-segment ceiling scales to
+   total/8, keeping deep machines at O(log + constant) segments with at
+   most ~12.5% slack. Segments never move, so growth cannot disturb live
+   frames or the wire format's parent-relative offsets. Returns NULL on
+   OOM. */
 static TTArenaSeg *tt_arena_seg_append(JSRuntime *rt, TTArenaSeg *cur,
                                        size_t need, size_t *ptotal)
 {
     TTArenaSeg *seg;
-    size_t want, cap_left;
+    size_t want, seg_cap;
     uint8_t *storage;
 
     if (cur && cur->next) {
@@ -18919,18 +18948,14 @@ static TTArenaSeg *tt_arena_seg_append(JSRuntime *rt, TTArenaSeg *cur,
             return cur->next;
         tt_arena_seg_free_tail(rt, cur, ptotal);
     }
-    if (*ptotal >= TT_FRAME_ARENA_SIZE)
-        return NULL;
-    cap_left = TT_FRAME_ARENA_SIZE - *ptotal;
+    seg_cap = TT_ARENA_SEG_MAX;
+    if (*ptotal / 8 > seg_cap)
+        seg_cap = *ptotal / 8;
     want = cur ? cur->size * 2 : TT_ARENA_SEG_MIN;
-    if (want > TT_ARENA_SEG_MAX)
-        want = TT_ARENA_SEG_MAX;
+    if (want > seg_cap)
+        want = seg_cap;
     if (want < need)
         want = need;
-    if (want > cap_left)
-        want = cap_left;
-    if (want < need)
-        return NULL;
     seg = js_malloc_rt(rt, sizeof(*seg) + want + 16);
     if (!seg)
         return NULL;
@@ -19650,6 +19675,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
 
     prev_sf = rt->current_stack_frame;
     sf->prev_frame = prev_sf;
+    sf->tt_depth = prev_sf ? (prev_sf)->tt_depth + 1 : 1;
     rt->current_stack_frame = sf;
     ctx = p->u.cfunc.realm; /* change the current realm */
     sf->js_mode = 0;
@@ -20192,6 +20218,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
             pc = sf->cur_pc;
             sf->prev_frame = rt->current_stack_frame;
+            sf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
             rt->current_stack_frame = sf;
             if (s->throw_flag)
                 goto exception;
@@ -20238,7 +20265,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         JSValue *vals;
         JSStackFrame *nsf;
 
-        if (unlikely(pf_argc < fb->arg_count || (pf_flags & JS_CALL_FLAG_COPY_ARGV)))
+        if (unlikely(pf_flags & JS_CALL_FLAG_COPY_ARGV))
+            /* copy EVERY argument, not just the declared ones: the caller's
+               argv may be C stack that dies when the machine parks by
+               return, and tt_orig_argv (the `arguments` view) must stay
+               valid for the frame's whole life */
+            arg_allocated_size = max_int(fb->arg_count, pf_argc);
+        else if (unlikely(pf_argc < fb->arg_count))
             arg_allocated_size = fb->arg_count;
         else
             arg_allocated_size = 0;
@@ -20273,13 +20306,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         nsf->arg_buf = pf_argv;
         nsf->arg_count = pf_argc;
         if (unlikely(arg_allocated_size)) {
-            int n = min_int(pf_argc, fb->arg_count);
+            int n = min_int(pf_argc, arg_allocated_size);
             nsf->arg_buf = vals;
             for(i = 0; i < n; i++)
                 nsf->arg_buf[i] = JS_DupValue(caller_ctx, pf_argv[i]);
-            for(; i < fb->arg_count; i++)
+            for(; i < arg_allocated_size; i++)
                 nsf->arg_buf[i] = JS_UNDEFINED;
-            nsf->arg_count = fb->arg_count;
+            nsf->arg_count = arg_allocated_size;
+            if (pf_flags & JS_CALL_FLAG_COPY_ARGV)
+                nsf->tt_orig_argv = nsf->arg_buf;
         }
         nsf->var_buf = vals + arg_allocated_size;
         for(i = 0; i < fb->var_count; i++)
@@ -20288,6 +20323,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         for(i = 0; i < fb->var_ref_count; i++)
             nsf->var_refs[i] = NULL;
         nsf->prev_frame = rt->current_stack_frame;
+        nsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
         rt->current_stack_frame = nsf;
         sf = nsf;
         TT_LOAD_FRAME();
@@ -20911,6 +20947,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gsf->tt_aux_i = gmagic;
                         gsf->tt_call_argc = (uint16_t)call_argc;
                         gsf->prev_frame = rt->current_stack_frame;
+                        gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                         rt->current_stack_frame = gsf;
                         sf = gsf;
                         TT_LOAD_FRAME();
@@ -20956,6 +20993,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         gsf->tt_aux = ags;
                         gsf->tt_ctor_this = agobj; /* the drive's ref */
                         gsf->prev_frame = rt->current_stack_frame;
+                        gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                         rt->current_stack_frame = gsf;
                         sf = gsf;
                         TT_LOAD_FRAME();
@@ -21881,6 +21919,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     pf_kind = TT_FRAME_GETTER;
                     pf_ctor_this = tt_dfn;
                     pf_aux_i = 4; /* push value + catch offset */
+                    pf_cargc = 0;
+                    pf_aux = NULL;
                     if (unlikely(rt->tt_defer_aux != NULL)) {
                         pf_argv = (JSValue *)rt->tt_defer_aux;
                         pf_this = pf_argv[3];
@@ -21935,6 +21975,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 (TT_GENSHAPE_FOROF << 8) | (offbyte << 16);
                             gsf->tt_call_argc = 0;
                             gsf->prev_frame = rt->current_stack_frame;
+                            gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                             rt->current_stack_frame = gsf;
                             sf = gsf;
                             TT_LOAD_FRAME();
@@ -22063,6 +22104,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             ic_gsf->tt_aux_i = ic_magic | (TT_GENSHAPE_CLOSE << 8);
                             ic_gsf->tt_call_argc = 0;
                             ic_gsf->prev_frame = rt->current_stack_frame;
+                            ic_gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                             rt->current_stack_frame = ic_gsf;
                             sf = ic_gsf;
                             TT_LOAD_FRAME();
@@ -22150,6 +22192,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             gsf->tt_aux_i = GEN_MAGIC_NEXT | (TT_GENSHAPE_ITERNEXT << 8);
                             gsf->tt_call_argc = 0;
                             gsf->prev_frame = rt->current_stack_frame;
+                            gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                             rt->current_stack_frame = gsf;
                             sf = gsf;
                             TT_LOAD_FRAME();
@@ -22188,6 +22231,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             gsf->tt_aux = ags;
                             gsf->tt_ctor_this = JS_DupValue(ctx, sp[-4]);
                             gsf->prev_frame = rt->current_stack_frame;
+                            gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                             rt->current_stack_frame = gsf;
                             sf = gsf;
                             TT_LOAD_FRAME();
@@ -22283,6 +22327,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 gsf->tt_aux_i = gmagic | (TT_GENSHAPE_ITERCALL << 8);
                                 gsf->tt_call_argc = 0;
                                 gsf->prev_frame = rt->current_stack_frame;
+                                gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                                 rt->current_stack_frame = gsf;
                                 sf = gsf;
                                 TT_LOAD_FRAME();
@@ -22414,6 +22459,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pf_kind = TT_FRAME_GETTER;                      \
                         pf_ctor_this = tt_dfn;                          \
                         pf_aux_i = keep;                                \
+                        pf_cargc = 0;                                   \
+                        pf_aux = NULL;                                  \
                         if (unlikely(rt->tt_defer_aux != NULL)) {       \
                             pf_argv = (JSValue *)rt->tt_defer_aux;      \
                             pf_this = pf_argv[3];                       \
@@ -22507,6 +22554,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pf_kind = TT_FRAME_SETTER;
                         pf_ctor_this = tt_dfn;
                         pf_aux_i = 0;
+                        pf_cargc = 0;
+                        pf_aux = NULL;
                         if (unlikely(rt->tt_defer_aux != NULL)) {
                             /* proxy set trap: value consumed on -2 exit */
                             pf_argv = (JSValue *)rt->tt_defer_aux;
@@ -22781,6 +22830,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pf_kind = TT_FRAME_GETTER;                      \
                         pf_ctor_this = tt_dfn;                          \
                         pf_aux_i = 2 + keep;                            \
+                        pf_cargc = 0;                                   \
+                        pf_aux = NULL;                                  \
                         if (unlikely(rt->tt_defer_aux != NULL)) {       \
                             pf_argv = (JSValue *)rt->tt_defer_aux;      \
                             pf_this = pf_argv[3];                       \
@@ -22982,6 +23033,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         pf_kind = TT_FRAME_SETTER;
                         pf_ctor_this = tt_dfn;
                         pf_aux_i = 1;
+                        pf_cargc = 0;
+                        pf_aux = NULL;
                         if (unlikely(rt->tt_defer_aux != NULL)) {
                             /* proxy set trap: value consumed on -2 exit */
                             pf_argv = (JSValue *)rt->tt_defer_aux;
@@ -23964,6 +24017,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 pf_kind = TT_FRAME_GETTER;
                                 pf_ctor_this = tt_dfn;
                                 pf_aux_i = 0; /* replace sp[-1] */
+                                pf_cargc = 0;
+                                pf_aux = NULL;
                                 if (unlikely(rt->tt_defer_aux != NULL)) {
                                     pf_argv = (JSValue *)rt->tt_defer_aux;
                                     pf_this = pf_argv[3];
@@ -24006,6 +24061,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             pf_kind = TT_FRAME_SETTER;
                             pf_ctor_this = tt_dfn;
                             pf_aux_i = 0; /* free both slots, pop 2 */
+                            pf_cargc = 0;
+                            pf_aux = NULL;
                             if (unlikely(rt->tt_defer_aux != NULL)) {
                                 /* proxy set trap: value consumed on -2 exit */
                                 pf_argv = (JSValue *)rt->tt_defer_aux;
@@ -24061,6 +24118,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 pf_kind = TT_FRAME_GETTER;
                                 pf_ctor_this = tt_dfn;
                                 pf_aux_i = 1; /* push the value */
+                                pf_cargc = 0;
+                                pf_aux = NULL;
                                 if (unlikely(rt->tt_defer_aux != NULL)) {
                                     pf_argv = (JSValue *)rt->tt_defer_aux;
                                     pf_this = pf_argv[3];
@@ -24223,6 +24282,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gsf->tt_aux = ags;
                 gsf->tt_ctor_this = agref; /* carry the drive's ref */
                 gsf->prev_frame = rt->current_stack_frame;
+                gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                 rt->current_stack_frame = gsf;
                 sf = gsf;
                 TT_LOAD_FRAME();
@@ -24587,6 +24647,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pf_kind = TT_FRAME_GETTER;
                 pf_ctor_this = tt_dfn;
                 pf_aux_i = 4; /* push value + catch offset */
+                pf_cargc = 0;
+                pf_aux = NULL;
                 if (unlikely(rt->tt_defer_aux != NULL)) {
                     pf_argv = (JSValue *)rt->tt_defer_aux;
                     pf_this = pf_argv[3];
@@ -25149,6 +25211,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ap_gsf->tt_call_argc = 0;
                     ap_gsf->tt_ctor_this = JS_MKPTR(JS_TAG_INT, ap_blk);
                     ap_gsf->prev_frame = rt->current_stack_frame;
+                    ap_gsf->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
                     rt->current_stack_frame = ap_gsf;
                     sf = ap_gsf;
                     TT_LOAD_FRAME();
@@ -25201,6 +25264,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         agsf2->tt_aux_i = gi_base;
         agsf2->tt_call_argc = (uint16_t)pf_argc;
         agsf2->prev_frame = rt->current_stack_frame;
+        agsf2->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
         rt->current_stack_frame = agsf2;
         sf = agsf2;
         TT_LOAD_FRAME();
@@ -25227,6 +25291,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         gsf2->tt_aux_i = gi_base;
         gsf2->tt_call_argc = (uint16_t)pf_argc;
         gsf2->prev_frame = rt->current_stack_frame;
+        gsf2->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
         rt->current_stack_frame = gsf2;
         sf = gsf2;
         TT_LOAD_FRAME();
@@ -25338,6 +25403,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         asf2->tt_call_argc = (uint16_t)pf_argc;
         asf2->tt_ctor_this = apromise; /* owned: the call's result */
         asf2->prev_frame = rt->current_stack_frame;
+        asf2->tt_depth = rt->current_stack_frame ? (rt->current_stack_frame)->tt_depth + 1 : 1;
         rt->current_stack_frame = asf2;
         sf = asf2;
         TT_LOAD_FRAME();
@@ -28948,7 +29014,7 @@ static int push_scope(JSParseState *s) {
             size_t slack;
             JSVarScope *new_buf;
             /* XXX: potential arithmetic overflow */
-            new_size = max_int(fd->scope_count + 1, fd->scope_size * 3 / 2);
+            new_size = max_int(fd->scope_count + 1, fd->scope_size + fd->scope_size / 2);
             if (fd->scopes == fd->def_scope_array) {
                 new_buf = js_realloc2(s->ctx, NULL, new_size * sizeof(*fd->scopes), &slack);
                 if (!new_buf)
@@ -35642,8 +35708,16 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
             }
         }
 
-        /* initialize the global variables */
-        ret_val = JS_Call(ctx, m->func_obj, JS_TRUE, 0, NULL);
+        /* initialize the global variables. This runs the module bytecode's
+           hoisting prologue only (InitializeEnvironment: declarations, no
+           user statements) — linking, not program execution, so it is not
+           a step the debugger could ever park on: mask the step hook. */
+        {
+            BOOL saved_step = ctx->rt->tt_step_enabled;
+            ctx->rt->tt_step_enabled = FALSE;
+            ret_val = JS_Call(ctx, m->func_obj, JS_TRUE, 0, NULL);
+            ctx->rt->tt_step_enabled = saved_step;
+        }
         if (JS_IsException(ret_val))
             goto fail;
         JS_FreeValue(ctx, ret_val);
@@ -36212,16 +36286,14 @@ static JSValue js_async_module_execution_fulfilled(JSContext *ctx, JSValueConst 
     return JS_UNDEFINED;
 }
 
-static int js_execute_async_module(JSContext *ctx, JSModuleDef *m)
+/* The .then wiring tail of js_execute_async_module, over the body's
+   already-created result promise (consumed). Split out so the stackless
+   module evaluator can run the body in-loop and then wire identically. */
+static int js_execute_async_module_tail(JSContext *ctx, JSModuleDef *m,
+                                        JSValue promise)
 {
-    JSValue promise, m_obj;
-    JSValue resolve_funcs[2], ret_val;
-#ifdef DUMP_MODULE_EXEC
-    js_dump_module(ctx, __func__, m);
-#endif
-    promise = js_async_function_call(ctx, m->func_obj, JS_UNDEFINED, 0, NULL, 0);
-    if (JS_IsException(promise))
-        return -1;
+    JSValue m_obj, resolve_funcs[2], ret_val;
+
     m_obj = JS_NewModuleValue(ctx, m);
     resolve_funcs[0] = JS_NewCFunctionData(ctx, js_async_module_execution_fulfilled, 0, 0, 1, (JSValueConst *)&m_obj);
     resolve_funcs[1] = JS_NewCFunctionData(ctx, js_async_module_execution_rejected, 0, 0, 1, (JSValueConst *)&m_obj);
@@ -36232,6 +36304,18 @@ static int js_execute_async_module(JSContext *ctx, JSModuleDef *m)
     JS_FreeValue(ctx, resolve_funcs[1]);
     JS_FreeValue(ctx, promise);
     return 0;
+}
+
+static int js_execute_async_module(JSContext *ctx, JSModuleDef *m)
+{
+    JSValue promise;
+#ifdef DUMP_MODULE_EXEC
+    js_dump_module(ctx, __func__, m);
+#endif
+    promise = js_async_function_call(ctx, m->func_obj, JS_UNDEFINED, 0, NULL, 0);
+    if (JS_IsException(promise))
+        return -1;
+    return js_execute_async_module_tail(ctx, m, promise);
 }
 
 /* return < 0 in case of exception. *pvalue contains the exception. */
@@ -36442,6 +36526,508 @@ static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
         assert(stack_top == NULL);
     }
     return JS_DupValue(ctx, m->promise);
+}
+
+/* TimeTravelJS stackless module evaluation ------------------------------
+
+   InnerModuleEvaluation with its recursion converted to an explicit heap
+   stack, so each synchronous module body runs with the dispatch loop as
+   the ONLY C frame below the host entry: a step can park the machine by
+   return in the middle of module top-level code, and JS_TTCallResume
+   rebuilds the frame and continues the DFS where it left off. Used by
+   JS_TTCallStart on a JS_TAG_MODULE value; js_evaluate_module (above)
+   stays for the classic embedder path and dynamic import jobs.
+
+   Bodies with top-level await and C module inits keep the classic C-driven
+   halves (their await continuations already run under the parkable job
+   pump); everything they execute inline is counted by the host as
+   suppressed, never skipped. */
+
+typedef struct TTModEvalFrame {
+    JSModuleDef *m;
+    int child_i;   /* next req_module_entry to visit */
+} TTModEvalFrame;
+
+typedef struct TTModEval {
+    JSContext *ctx;        /* realm evaluation started in (held ref) */
+    JSModuleDef *root;     /* cycle root the promise belongs to */
+    TTModEvalFrame *stack; /* explicit DFS stack */
+    int sp, size;
+    JSModuleDef *scc_top;  /* SCC chain through m->stack_prev */
+    int index;             /* [[DFSIndex]] counter */
+    /* the in-flight module body (set while it runs / is parked) */
+    JSAsyncFunctionState *body;
+    JSModuleDef *body_m;
+    JSValue body_promise;
+    int body_is_async;     /* a top-level-await body: first segment ran
+                              in-loop; completion wires the async-module
+                              then-handlers instead of checking the
+                              promise synchronously */
+} TTModEval;
+
+static void tt_modeval_free(JSRuntime *rt, TTModEval *me)
+{
+    JSContext *ctx = me->ctx;
+    js_free_rt(rt, me->stack);
+    JS_FreeValueRT(rt, me->body_promise);
+    js_free_rt(rt, me);
+    JS_FreeContext(ctx);
+    rt->tt_modeval = NULL;
+}
+
+static int tt_modeval_push(JSContext *ctx, TTModEval *me, JSModuleDef *m)
+{
+    if (me->sp >= me->size) {
+        int nsize = max_int(me->size * 2, 16);
+        TTModEvalFrame *ns = js_realloc(ctx, me->stack,
+                                        sizeof(*ns) * nsize);
+        if (!ns)
+            return -1;
+        me->stack = ns;
+        me->size = nsize;
+    }
+    me->stack[me->sp].m = m;
+    me->stack[me->sp].child_i = 0;
+    me->sp++;
+    return 0;
+}
+
+/* The post-recursion child processing of js_inner_module_evaluation:
+   parent m absorbing completed child m1. Returns -1 with *perr set. */
+static int tt_modeval_post_child(JSContext *ctx, JSModuleDef *m,
+                                 JSModuleDef *m1, JSValue *perr)
+{
+    assert(m1->status == JS_MODULE_STATUS_EVALUATING ||
+           m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+           m1->status == JS_MODULE_STATUS_EVALUATED);
+    if (m1->status == JS_MODULE_STATUS_EVALUATING) {
+        m->dfs_ancestor_index = min_int(m->dfs_ancestor_index,
+                                        m1->dfs_ancestor_index);
+    } else {
+        m1 = m1->cycle_root;
+        assert(m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+               m1->status == JS_MODULE_STATUS_EVALUATED);
+        if (m1->eval_has_exception) {
+            *perr = JS_DupValue(ctx, m1->eval_exception);
+            return -1;
+        }
+    }
+    if (m1->async_evaluation) {
+        m->pending_async_dependencies++;
+        if (js_resize_array(ctx, (void **)&m1->async_parent_modules,
+                            sizeof(m1->async_parent_modules[0]),
+                            &m1->async_parent_modules_size,
+                            m1->async_parent_modules_count + 1)) {
+            *perr = JS_GetException(ctx);
+            return -1;
+        }
+        m1->async_parent_modules[m1->async_parent_modules_count++] = m;
+    }
+    return 0;
+}
+
+/* Pop the completed top frame and feed its module into the parent's
+   post-child half (the code after the recursive call returns). */
+static int tt_modeval_pop(JSContext *ctx, TTModEval *me, JSValue *perr)
+{
+    JSModuleDef *m1 = me->stack[me->sp - 1].m;
+    me->sp--;
+    if (me->sp > 0)
+        return tt_modeval_post_child(ctx, me->stack[me->sp - 1].m, m1, perr);
+    return 0;
+}
+
+/* Start a synchronous module body as an in-loop activation. Returns 1 when
+   the body parked (me->body armed; resume completes it), 0 when it ran to
+   completion and its bookkeeping is done, -1 with *perr set. */
+static int tt_modeval_body_start(JSContext *ctx, TTModEval *me,
+                                 JSModuleDef *m, JSValue *perr)
+{
+    JSRuntime *rt = ctx->rt;
+    JSAsyncFunctionState *s;
+    JSValue promise, raw;
+
+    s = async_func_init(ctx, m->func_obj, JS_UNDEFINED, 0, NULL);
+    if (!s) {
+        *perr = JS_GetException(ctx);
+        return -1;
+    }
+    promise = JS_NewPromiseCapability(ctx, s->resolving_funcs);
+    if (JS_IsException(promise)) {
+        async_func_free(rt, s);
+        *perr = JS_GetException(ctx);
+        return -1;
+    }
+    tt_async_flow_link(ctx, promise, s);
+    rt->tt_park_ok = TRUE;
+    raw = JS_CallInternal(ctx, JS_MKPTR(JS_TAG_INT, s), s->this_val,
+                          JS_UNDEFINED, s->argc, s->frame.arg_buf,
+                          JS_CALL_FLAG_GENERATOR);
+    if (rt->tt_parked_frame) {
+        me->body = s;
+        me->body_m = m;
+        me->body_promise = promise;
+        me->body_is_async = 0;
+        return 1;
+    }
+    raw = async_func_finish(ctx, s, raw);
+    js_async_function_post(ctx, s, raw);
+    async_func_free(rt, s);
+    {
+        JSPromiseStateEnum state = JS_PromiseState(ctx, promise);
+        if (state == JS_PROMISE_FULFILLED) {
+            JS_FreeValue(ctx, promise);
+        } else if (state == JS_PROMISE_REJECTED) {
+            *perr = JS_PromiseResult(ctx, promise);
+            JS_FreeValue(ctx, promise);
+            return -1;
+        } else {
+            JS_FreeValue(ctx, promise);
+            JS_ThrowTypeError(ctx, "promise is pending");
+            *perr = JS_GetException(ctx);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Start a top-level-await module body in-loop (the ExecuteAsyncModule
+   half): its first segment runs parkable; the await continuations resume
+   under the job pump as before. Returns 1 when parked, 0 otherwise.
+   Failures mirror the classic caller, which ignores
+   js_execute_async_module's result. */
+static int tt_modeval_body_start_async(JSContext *ctx, TTModEval *me,
+                                       JSModuleDef *m)
+{
+    JSRuntime *rt = ctx->rt;
+    JSAsyncFunctionState *s;
+    JSValue promise, raw;
+
+    s = async_func_init(ctx, m->func_obj, JS_UNDEFINED, 0, NULL);
+    if (!s)
+        return 0;
+    promise = JS_NewPromiseCapability(ctx, s->resolving_funcs);
+    if (JS_IsException(promise)) {
+        async_func_free(rt, s);
+        return 0;
+    }
+    tt_async_flow_link(ctx, promise, s);
+    rt->tt_park_ok = TRUE;
+    raw = JS_CallInternal(ctx, JS_MKPTR(JS_TAG_INT, s), s->this_val,
+                          JS_UNDEFINED, s->argc, s->frame.arg_buf,
+                          JS_CALL_FLAG_GENERATOR);
+    if (rt->tt_parked_frame) {
+        me->body = s;
+        me->body_m = m;
+        me->body_promise = promise;
+        me->body_is_async = 1;
+        return 1;
+    }
+    raw = async_func_finish(ctx, s, raw);
+    js_async_function_post(ctx, s, raw);
+    async_func_free(rt, s);
+    js_execute_async_module_tail(ctx, m, promise);
+    return 0;
+}
+
+/* Drive the DFS until it parks inside a body, fails, or completes the
+   graph. On entry the top frame's pre-order bookkeeping is already done
+   and its next action is visiting child child_i (or, children exhausted,
+   running its body). Returns the root promise (or JS_UNDEFINED while
+   parked with *pparked = 1). */
+static JSValue tt_modeval_run(JSContext *ctx, int *pparked)
+{
+    JSRuntime *rt = ctx->rt;
+    TTModEval *me = rt->tt_modeval;
+    JSValue err;
+    JSModuleDef *m, *m1;
+    TTModEvalFrame *f;
+    int r;
+
+    while (me->sp > 0) {
+        f = &me->stack[me->sp - 1];
+        m = f->m;
+
+        if (f->child_i < m->req_module_entries_count) {
+            m1 = m->req_module_entries[f->child_i].module;
+            f->child_i++;
+            /* the child's pre-order half (the top of the recursive
+               function): early-outs feed post-child directly */
+            if (m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+                m1->status == JS_MODULE_STATUS_EVALUATED) {
+                if (m1->eval_has_exception) {
+                    err = JS_DupValue(ctx, m1->eval_exception);
+                    goto fail;
+                }
+            } else if (m1->status == JS_MODULE_STATUS_EVALUATING) {
+                /* cycle back-edge */
+            } else {
+                assert(m1->status == JS_MODULE_STATUS_LINKED);
+                m1->status = JS_MODULE_STATUS_EVALUATING;
+                m1->dfs_index = me->index;
+                m1->dfs_ancestor_index = me->index;
+                m1->pending_async_dependencies = 0;
+                me->index++;
+                m1->stack_prev = me->scc_top;
+                me->scc_top = m1;
+                if (tt_modeval_push(ctx, me, m1)) {
+                    err = JS_GetException(ctx);
+                    goto fail;
+                }
+                continue;
+            }
+            if (tt_modeval_post_child(ctx, m, m1, &err))
+                goto fail;
+            continue;
+        }
+
+        /* children done: body half */
+        if (m->pending_async_dependencies > 0) {
+            assert(!m->async_evaluation);
+            m->async_evaluation = TRUE;
+            m->async_evaluation_timestamp =
+                rt->module_async_evaluation_next_timestamp++;
+        } else if (m->has_tla) {
+            assert(!m->async_evaluation);
+            m->async_evaluation = TRUE;
+            m->async_evaluation_timestamp =
+                rt->module_async_evaluation_next_timestamp++;
+            if (tt_modeval_body_start_async(ctx, me, m)) {
+                *pparked = 1;
+                return JS_UNDEFINED;
+            }
+        } else if (m->init_func) {
+            /* C module init: no JS runs */
+            if (m->init_func(ctx, m) < 0) {
+                err = JS_GetException(ctx);
+                goto fail;
+            }
+        } else {
+            r = tt_modeval_body_start(ctx, me, m, &err);
+            if (r < 0)
+                goto fail;
+            if (r > 0) {
+                *pparked = 1;
+                return JS_UNDEFINED;
+            }
+        }
+
+        assert(m->dfs_ancestor_index <= m->dfs_index);
+        if (m->dfs_index == m->dfs_ancestor_index) {
+            for (;;) {
+                m1 = me->scc_top;
+                assert(m1 != NULL);
+                me->scc_top = m1->stack_prev;
+                if (!m1->async_evaluation) {
+                    m1->status = JS_MODULE_STATUS_EVALUATED;
+                } else {
+                    m1->status = JS_MODULE_STATUS_EVALUATING_ASYNC;
+                }
+                /* spec bug: cycle_root must be assigned before the test */
+                m1->cycle_root = m;
+                if (m1 == m)
+                    break;
+            }
+        }
+        if (tt_modeval_pop(ctx, me, &err))
+            goto fail;
+        continue;
+    }
+
+    /* DFS complete: mirror js_evaluate_module's success tail */
+    {
+        JSModuleDef *root = me->root;
+        JSValue promise;
+        assert(me->scc_top == NULL);
+        assert(!root->eval_has_exception);
+        assert(root->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+               root->status == JS_MODULE_STATUS_EVALUATED);
+        if (!root->async_evaluation) {
+            JSValue value, ret_val;
+            assert(root->status == JS_MODULE_STATUS_EVALUATED);
+            value = JS_UNDEFINED;
+            ret_val = JS_Call(ctx, root->resolving_funcs[0], JS_UNDEFINED,
+                              1, (JSValueConst *)&value);
+            JS_FreeValue(ctx, ret_val);
+        }
+        promise = JS_DupValue(ctx, root->promise);
+        tt_modeval_free(rt, me);
+        return promise;
+    }
+
+ fail:
+    /* mirror js_evaluate_module's failure unwind over the SCC chain */
+    {
+        JSModuleDef *root = me->root;
+        JSValue promise, ret_val;
+        while (me->scc_top != NULL) {
+            m1 = me->scc_top;
+            assert(m1->status == JS_MODULE_STATUS_EVALUATING);
+            m1->status = JS_MODULE_STATUS_EVALUATED;
+            m1->eval_has_exception = TRUE;
+            m1->eval_exception = JS_DupValue(ctx, err);
+            m1->cycle_root = root;
+            me->scc_top = m1->stack_prev;
+        }
+        JS_FreeValue(ctx, err);
+        assert(root->status == JS_MODULE_STATUS_EVALUATED);
+        assert(root->eval_has_exception);
+        ret_val = JS_Call(ctx, root->resolving_funcs[1], JS_UNDEFINED,
+                          1, (JSValueConst *)&root->eval_exception);
+        JS_FreeValue(ctx, ret_val);
+        promise = JS_DupValue(ctx, root->promise);
+        tt_modeval_free(rt, me);
+        return promise;
+    }
+}
+
+/* Body-run completion fed back from JS_TTCallResume: finish the parked
+   module body with its raw completion, then keep driving the DFS. */
+static JSValue tt_modeval_body_resumed(JSContext *ctx, JSValue raw,
+                                       int *pparked)
+{
+    JSRuntime *rt = ctx->rt;
+    TTModEval *me = rt->tt_modeval;
+    JSAsyncFunctionState *s = me->body;
+    JSModuleDef *m = me->body_m;
+    JSValue promise = me->body_promise;
+    JSValue err;
+    JSPromiseStateEnum state;
+
+    me->body = NULL;
+    me->body_m = NULL;
+    me->body_promise = JS_UNDEFINED;
+
+    raw = async_func_finish(ctx, s, raw);
+    js_async_function_post(ctx, s, raw);
+    async_func_free(rt, s);
+    if (me->body_is_async) {
+        /* top-level-await body: wire the async-module then-handlers;
+           completion/rejection flows through the job queue */
+        me->body_is_async = 0;
+        js_execute_async_module_tail(ctx, m, promise);
+        goto post_body;
+    }
+    state = JS_PromiseState(ctx, promise);
+    if (state == JS_PROMISE_FULFILLED) {
+        JS_FreeValue(ctx, promise);
+    } else if (state == JS_PROMISE_REJECTED) {
+        err = JS_PromiseResult(ctx, promise);
+        JS_FreeValue(ctx, promise);
+        goto fail;
+    } else {
+        JS_FreeValue(ctx, promise);
+        JS_ThrowTypeError(ctx, "promise is pending");
+        err = JS_GetException(ctx);
+        goto fail;
+    }
+
+ post_body:
+
+    /* the body belonged to the top DFS frame: run its post-body half
+       (SCC pop + frame pop with parent notification), then continue */
+    assert(me->sp > 0 && me->stack[me->sp - 1].m == m);
+    assert(m->dfs_ancestor_index <= m->dfs_index);
+    if (m->dfs_index == m->dfs_ancestor_index) {
+        JSModuleDef *m1;
+        for (;;) {
+            m1 = me->scc_top;
+            assert(m1 != NULL);
+            me->scc_top = m1->stack_prev;
+            if (!m1->async_evaluation) {
+                m1->status = JS_MODULE_STATUS_EVALUATED;
+            } else {
+                m1->status = JS_MODULE_STATUS_EVALUATING_ASYNC;
+            }
+            m1->cycle_root = m;
+            if (m1 == m)
+                break;
+        }
+    }
+    if (tt_modeval_pop(ctx, me, &err))
+        goto fail;
+    return tt_modeval_run(ctx, pparked);
+
+ fail:
+    {
+        JSModuleDef *root = me->root;
+        JSModuleDef *m1;
+        JSValue promise2, ret_val;
+        while (me->scc_top != NULL) {
+            m1 = me->scc_top;
+            assert(m1->status == JS_MODULE_STATUS_EVALUATING);
+            m1->status = JS_MODULE_STATUS_EVALUATED;
+            m1->eval_has_exception = TRUE;
+            m1->eval_exception = JS_DupValue(ctx, err);
+            m1->cycle_root = root;
+            me->scc_top = m1->stack_prev;
+        }
+        JS_FreeValue(ctx, err);
+        assert(root->status == JS_MODULE_STATUS_EVALUATED);
+        assert(root->eval_has_exception);
+        ret_val = JS_Call(ctx, root->resolving_funcs[1], JS_UNDEFINED,
+                          1, (JSValueConst *)&root->eval_exception);
+        JS_FreeValue(ctx, ret_val);
+        promise2 = JS_DupValue(ctx, root->promise);
+        tt_modeval_free(rt, me);
+        return promise2;
+    }
+}
+
+/* Entry: evaluate a linked module graph under park-by-return. Mirrors
+   js_evaluate_module's prologue, then hands off to the machine. */
+static JSValue js_tt_evaluate_module_start(JSContext *ctx, JSModuleDef *m,
+                                           int *pparked)
+{
+    JSRuntime *rt = ctx->rt;
+    TTModEval *me;
+
+    assert(m->status == JS_MODULE_STATUS_LINKED ||
+           m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+           m->status == JS_MODULE_STATUS_EVALUATED);
+    if (m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+        m->status == JS_MODULE_STATUS_EVALUATED) {
+        m = m->cycle_root;
+    }
+    if (!JS_IsUndefined(m->promise))
+        return JS_DupValue(ctx, m->promise);
+    m->promise = JS_NewPromiseCapability(ctx, m->resolving_funcs);
+    if (JS_IsException(m->promise))
+        return JS_EXCEPTION;
+
+    me = js_mallocz(ctx, sizeof(*me));
+    if (!me)
+        return JS_EXCEPTION;
+    me->ctx = JS_DupContext(ctx);
+    me->root = m;
+    me->body_promise = JS_UNDEFINED;
+    rt->tt_modeval = me;
+
+    /* the root's own pre-order half (the recursion's first activation) */
+    m->status = JS_MODULE_STATUS_EVALUATING;
+    m->dfs_index = 0;
+    m->dfs_ancestor_index = 0;
+    m->pending_async_dependencies = 0;
+    me->index = 1;
+    m->stack_prev = NULL;
+    me->scc_top = m;
+    if (tt_modeval_push(ctx, me, m)) {
+        JSValue err = JS_GetException(ctx);
+        JSValue promise, ret_val;
+        m->status = JS_MODULE_STATUS_EVALUATED;
+        m->eval_has_exception = TRUE;
+        m->eval_exception = JS_DupValue(ctx, err);
+        m->cycle_root = m;
+        JS_FreeValue(ctx, err);
+        ret_val = JS_Call(ctx, m->resolving_funcs[1], JS_UNDEFINED,
+                          1, (JSValueConst *)&m->eval_exception);
+        JS_FreeValue(ctx, ret_val);
+        promise = JS_DupValue(ctx, m->promise);
+        me->scc_top = NULL;
+        tt_modeval_free(rt, me);
+        return promise;
+    }
+    return tt_modeval_run(ctx, pparked);
 }
 
 static __exception int js_parse_with_clause(JSParseState *s, JSReqModuleEntry *rme)
@@ -42439,7 +43025,13 @@ enum {                        /* private record kinds */
     TT_REC_PRESOLVED,         /* the capability pair's shared resolved flag  */
     TT_REC_ASYNC_RESOLVE,     /* async-function await continuation handler   */
     TT_REC_TAGGED,            /* JS_CLASS_TT_TAGGED: payload + host note     */
-    TT_REC_LAST = TT_REC_TAGGED
+    TT_REC_MAP,               /* Map/Set: live records in insertion order    */
+    TT_REC_ARRAY_BUFFER,      /* ArrayBuffer: byte image (+resizable bound)  */
+    TT_REC_TYPED_ARRAY,       /* TypedArray/DataView: view over a buffer rec */
+    TT_REC_REGEXP,            /* RegExp: pattern + flags, recompiled         */
+    TT_REC_PROXY,             /* Proxy: target + handler + func/revoked bits */
+    TT_REC_PROXY_REVOKE,      /* the revocable pair's revoke closure         */
+    TT_REC_LAST = TT_REC_PROXY_REVOKE
 };
 
 enum {                        /* vref inline subtags */
@@ -44314,8 +44906,10 @@ static size_t tt_chain_frame_size(JSStackFrame *f)
 {
     JSObject *fo = JS_VALUE_GET_OBJ(f->cur_func);
     JSFunctionBytecode *fb = fo->u.func.function_bytecode;
+    /* copied-arg frames own f->arg_count slots (>= fb->arg_count when a
+       COPY_ARGV caller passed extra arguments) */
     size_t val_count =
-        (f->arg_buf == f->tt_frame_base ? (size_t)fb->arg_count : 0) +
+        (f->arg_buf == f->tt_frame_base ? (size_t)f->arg_count : 0) +
         fb->var_count + fb->stack_size;
     size_t size = sizeof(JSStackFrame) + sizeof(JSValue) * val_count +
         sizeof(JSVarRef *) * fb->var_ref_count;
@@ -44535,9 +45129,9 @@ static int wr_enum_state(TTFlowWr *w, JSAsyncFunctionState *st)
 static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
 {
     JSRuntime *rt = w->ctx->rt;
-    JSStackFrame *chain[256];
+    JSStackFrame **chain;
     int n = 0, i;
-    JSStackFrame *sf;
+    JSStackFrame *sf, *walk_from;
     uint8_t *chain_top;
     TTArenaSeg *chain_seg;
 
@@ -44558,13 +45152,11 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
         chain_seg = rt->tt_arena_seg;
     }
 
+    /* the chain is as deep as the machine's arena is — unbounded. Count,
+       then collect into an exact heap array. */
+    walk_from = sf;
     while (sf && sf != &base->frame) {
-        if (n >= (int)countof(chain)) {
-            JS_ThrowTypeError(w->ctx, "flow serialization: parked chain too "
-                              "deep");
-            return -1;
-        }
-        chain[n++] = sf;
+        n++;
         sf = sf->prev_frame;
     }
     if (sf != &base->frame) {
@@ -44572,7 +45164,13 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
                           "is not the parked machine");
         return -1;
     }
-    chain[n++] = sf;
+    n++;
+    chain = js_malloc(w->ctx, sizeof(*chain) * n);
+    if (!chain)
+        goto fail_chain;
+    for (sf = walk_from, i = 0; i < n - 1; i++, sf = sf->prev_frame)
+        chain[i] = sf;
+    chain[n - 1] = sf;
     /* base first */
     for (i = n - 1; i >= 0; i--) {
         JSStackFrame *f = chain[i];
@@ -44588,7 +45186,7 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
                     JS_ThrowTypeError(w->ctx, "flow serialization: "
                                       "unsupported chained state frame kind "
                                       "%d", kind);
-                    return -1;
+                    goto fail_chain;
                 }
                 gshape = (f->tt_aux_i >> 8) & 0xff;
                 if (gshape != TT_GENSHAPE_METHOD &&
@@ -44598,22 +45196,22 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
                     JS_ThrowTypeError(w->ctx, "flow serialization: "
                                       "unsupported generator splice shape %d",
                                       gshape);
-                    return -1;
+                    goto fail_chain;
                 }
                 if (!JS_IsUndefined(f->tt_ctor_this)) {
                     JS_ThrowTypeError(w->ctx, "flow serialization: chained "
                                       "frame carries a side block");
-                    return -1;
+                    goto fail_chain;
                 }
             } else if (kind != TT_FRAME_GEN && kind != TT_FRAME_ENTRY) {
                 JS_ThrowTypeError(w->ctx, "flow serialization: base frame "
                                   "kind %d is not transplantable", kind);
-                return -1;
+                goto fail_chain;
             }
             if (wr_add_frame(w, f, 0, 1))
-                return -1;
+                goto fail_chain;
             if (wr_enum_state(w, st))
-                return -1;
+                goto fail_chain;
         } else {
             int kind = f->tt_frame_kind;
             if (kind != TT_FRAME_CALL && kind != TT_FRAME_CALL_METHOD &&
@@ -44621,23 +45219,23 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
                 JS_ThrowTypeError(w->ctx, "flow serialization: arena frame "
                                   "kind %d is not transplantable (reflective "
                                   "machinery in the chain)", kind);
-                return -1;
+                goto fail_chain;
             }
             if (f->tt_aux != NULL || !JS_IsUndefined(f->tt_ctor_this) ||
                 !JS_IsUndefined(f->tt_new_target)) {
                 JS_ThrowTypeError(w->ctx, "flow serialization: arena frame "
                                   "carries continuation state");
-                return -1;
+                goto fail_chain;
             }
             if (f->cur_sp == NULL) {
                 JS_ThrowInternalError(w->ctx, "flow serialization: parked "
                                       "frame without a saved sp");
-                return -1;
+                goto fail_chain;
             }
             if (wr_add_frame(w, f, 1, 1))
-                return -1;
+                goto fail_chain;
             if (wr_enum_value(w, f->cur_func))
-                return -1;
+                goto fail_chain;
         }
     }
     /* contiguity: the arena extent must hold exactly the chain's arena
@@ -44666,7 +45264,7 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
             if (!seg) {
                 JS_ThrowTypeError(w->ctx, "flow serialization: chain frame "
                                   "outside the machine's arena");
-                return -1;
+                goto fail_chain;
             }
             if (expect &&
                 !((seg == cs && (uint8_t *)f == expect) ||
@@ -44674,7 +45272,7 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
                    size > (size_t)(cs->limit - expect)))) {
                 JS_ThrowTypeError(w->ctx, "flow serialization: foreign arena "
                                   "blocks inside the parked chain");
-                return -1;
+                goto fail_chain;
             }
             cs = seg;
             expect = (uint8_t *)f + size;
@@ -44682,11 +45280,15 @@ static int wr_register_chain(TTFlowWr *w, JSAsyncFunctionState *base)
         if (expect && (expect != chain_top || cs != chain_seg)) {
             JS_ThrowTypeError(w->ctx, "flow serialization: arena extent does "
                               "not end at the parked top");
-            return -1;
+            goto fail_chain;
         }
     }
     w->machine = TRUE;
+    js_free(w->ctx, chain);
     return 0;
+ fail_chain:
+    js_free(w->ctx, chain);
+    return -1;
 }
 
 static int wr_enum_varref(TTFlowWr *w, JSVarRef *vr)
@@ -44738,6 +45340,57 @@ static int wr_enum_object(TTFlowWr *w, JSObject *p)
         return wr_add_rec(w, TT_REC_ASYNC_RESOLVE, p, NULL);
     case JS_CLASS_TT_TAGGED:
         return wr_add_rec(w, TT_REC_TAGGED, p, NULL);
+    case JS_CLASS_MAP:
+    case JS_CLASS_SET:
+        return wr_add_rec(w, TT_REC_MAP, p, NULL);
+    case JS_CLASS_WEAKMAP:
+    case JS_CLASS_WEAKSET:
+        JS_ThrowTypeError(w->ctx, "flow serialization: weak collections "
+                          "hold liveness, not structure; a transplanted "
+                          "%s cannot preserve reachability semantics",
+                          p->class_id == JS_CLASS_WEAKMAP ? "WeakMap"
+                                                          : "WeakSet");
+        return -1;
+    case JS_CLASS_ARRAY_BUFFER:
+        return wr_add_rec(w, TT_REC_ARRAY_BUFFER, p, NULL);
+    case JS_CLASS_SHARED_ARRAY_BUFFER:
+        JS_ThrowTypeError(w->ctx, "flow serialization: SharedArrayBuffer "
+                          "memory is shared with other agents and cannot "
+                          "travel with one flow");
+        return -1;
+    case JS_CLASS_UINT8C_ARRAY:
+    case JS_CLASS_INT8_ARRAY:
+    case JS_CLASS_UINT8_ARRAY:
+    case JS_CLASS_INT16_ARRAY:
+    case JS_CLASS_UINT16_ARRAY:
+    case JS_CLASS_INT32_ARRAY:
+    case JS_CLASS_UINT32_ARRAY:
+    case JS_CLASS_BIG_INT64_ARRAY:
+    case JS_CLASS_BIG_UINT64_ARRAY:
+    case JS_CLASS_FLOAT16_ARRAY:
+    case JS_CLASS_FLOAT32_ARRAY:
+    case JS_CLASS_FLOAT64_ARRAY:
+    case JS_CLASS_DATAVIEW:
+        if (!p->u.typed_array)
+            return wr_unsupported(w, p); /* mid-construction shell */
+        return wr_add_rec(w, TT_REC_TYPED_ARRAY, p, NULL);
+    case JS_CLASS_REGEXP:
+        return wr_add_rec(w, TT_REC_REGEXP, p, NULL);
+    case JS_CLASS_PROXY: {
+        JSProxyData *s = p->u.opaque;
+        if (!s)
+            return wr_unsupported(w, p);
+        return wr_add_rec(w, TT_REC_PROXY, p, NULL);
+    }
+    case JS_CLASS_C_FUNCTION_DATA: {
+        /* C closures cannot travel in general (arbitrary function
+           pointers), but the revocable pair's revoke closure is pure
+           identified state: js_proxy_revoke over its proxy slot */
+        JSCFunctionDataRecord *fdr = p->u.c_function_data_record;
+        if (fdr && fdr->func == js_proxy_revoke && fdr->data_len == 1)
+            return wr_add_rec(w, TT_REC_PROXY_REVOKE, p, NULL);
+        return wr_unsupported(w, p);
+    }
     default:
         return wr_unsupported(w, p);
     }
@@ -45005,6 +45658,72 @@ static int wr_scan_children(TTFlowWr *w, TTFlowWrRec *rec)
             wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
             return -1;
         if (wr_enum_value(w, p->u.tt_tagged.payload))
+            return -1;
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_MAP: {
+        JSObject *p = rec->ptr;
+        JSMapState *ms = p->u.map_state;
+        struct list_head *el;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        list_for_each(el, &ms->records) {
+            JSMapRecord *mr = list_entry(el, JSMapRecord, link);
+            if (mr->empty)
+                continue;     /* iterator tombstone: not an entry */
+            if (wr_enum_value(w, mr->key))
+                return -1;
+            if (p->class_id == JS_CLASS_MAP && wr_enum_value(w, mr->value))
+                return -1;
+        }
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_ARRAY_BUFFER: {
+        JSObject *p = rec->ptr;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_TYPED_ARRAY: {
+        JSObject *p = rec->ptr;
+        JSTypedArray *ta = p->u.typed_array;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        if (wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, ta->buffer)))
+            return -1;
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_REGEXP: {
+        /* pattern and flags ride the shell; the compiled bytecode never
+           travels -- the reader recompiles, so the wire format does not
+           couple to the regexp engine's internals */
+        JSObject *p = rec->ptr;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        return wr_scan_props(w, p, FALSE);
+    }
+    case TT_REC_PROXY: {
+        /* target + handler only. A proxy has no own shape state, and its
+           proto/props go through traps -- rebuilding wires the SAME
+           target/handler pair, so every [[Get]]/[[Set]]/[[Define]]
+           invariant is enforced by the ordinary proxy machinery */
+        JSObject *p = rec->ptr;
+        JSProxyData *s = p->u.opaque;
+        if (wr_enum_value(w, s->target))
+            return -1;
+        return wr_enum_value(w, s->handler);
+    }
+    case TT_REC_PROXY_REVOKE: {
+        JSObject *p = rec->ptr;
+        JSCFunctionDataRecord *fdr = p->u.c_function_data_record;
+        if (p->shape->proto &&
+            wr_enum_value(w, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)))
+            return -1;
+        if (wr_enum_value(w, fdr->data[0]))
             return -1;
         return wr_scan_props(w, p, FALSE);
     }
@@ -45476,6 +46195,52 @@ static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
         case TT_REC_DATAOBJ:
             dbuf_put_leb128(&db, ((JSObject *)rec->ptr)->class_id);
             break;
+        case TT_REC_MAP: {
+            JSObject *p = rec->ptr;
+            JSMapState *ms = p->u.map_state;
+            struct list_head *el;
+            uint32_t live = 0;
+            list_for_each(el, &ms->records)
+                if (!list_entry(el, JSMapRecord, link)->empty)
+                    live++;
+            dbuf_putc(&db, (uint8_t)(p->class_id - JS_CLASS_MAP));
+            dbuf_put_leb128(&db, live);
+            break;
+        }
+        case TT_REC_ARRAY_BUFFER: {
+            JSObject *p = rec->ptr;
+            JSArrayBuffer *abuf = p->u.array_buffer;
+            uint8_t fl = (abuf->detached ? 1 : 0) |
+                         (abuf->max_byte_length >= 0 ? 2 : 0);
+            dbuf_putc(&db, fl);
+            dbuf_put_leb128(&db, (uint32_t)abuf->byte_length);
+            if (abuf->max_byte_length >= 0)
+                dbuf_put_leb128(&db, (uint32_t)abuf->max_byte_length);
+            if (!abuf->detached && abuf->byte_length)
+                dbuf_put(&db, abuf->data, (size_t)abuf->byte_length);
+            break;
+        }
+        case TT_REC_TYPED_ARRAY: {
+            JSObject *p = rec->ptr;
+            JSTypedArray *ta = p->u.typed_array;
+            dbuf_put_leb128(&db, p->class_id);
+            dbuf_put_leb128(&db, ta->offset);
+            dbuf_put_leb128(&db, ta->length);
+            dbuf_putc(&db, ta->track_rab ? 1 : 0);
+            break;
+        }
+        case TT_REC_REGEXP: {
+            JSObject *p = rec->ptr;
+            JSRegExp *re = &p->u.regexp;
+            wr_put_string(&db, re->pattern);
+            dbuf_putc(&db, (uint8_t)lre_get_flags(re->bytecode->u.str8));
+            break;
+        }
+        case TT_REC_PROXY: {
+            JSProxyData *s = ((JSObject *)rec->ptr)->u.opaque;
+            dbuf_putc(&db, (s->is_func ? 1 : 0) | (s->is_revoked ? 2 : 0));
+            break;
+        }
         case TT_REC_TAGGED: {
             /* the host note rides the shell as an opaque blob: present flag,
                then NoteSerialize's bytes (the read side hands them to
@@ -45769,6 +46534,82 @@ static uint8_t *serialize_flow(JSContext *ctx, JSAsyncFunctionState *base,
                             : JS_NULL))
                 goto fail;
             if (wr_put_vref(w, &db, p->u.tt_tagged.payload))
+                goto fail;
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_MAP: {
+            JSObject *p = rec->ptr;
+            JSMapState *ms = p->u.map_state;
+            struct list_head *el;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            list_for_each(el, &ms->records) {
+                JSMapRecord *mr = list_entry(el, JSMapRecord, link);
+                if (mr->empty)
+                    continue;
+                if (wr_put_vref(w, &db, mr->key))
+                    goto fail;
+                if (p->class_id == JS_CLASS_MAP &&
+                    wr_put_vref(w, &db, mr->value))
+                    goto fail;
+            }
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_ARRAY_BUFFER: {
+            JSObject *p = rec->ptr;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_TYPED_ARRAY: {
+            JSObject *p = rec->ptr;
+            JSTypedArray *ta = p->u.typed_array;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            if (wr_put_vref(w, &db, JS_MKPTR(JS_TAG_OBJECT, ta->buffer)))
+                goto fail;
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_REGEXP: {
+            JSObject *p = rec->ptr;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            if (wr_put_props(w, &db, p, FALSE))
+                goto fail;
+            break;
+        }
+        case TT_REC_PROXY: {
+            JSProxyData *s = ((JSObject *)rec->ptr)->u.opaque;
+            if (wr_put_vref(w, &db, s->target))
+                goto fail;
+            if (wr_put_vref(w, &db, s->handler))
+                goto fail;
+            break;
+        }
+        case TT_REC_PROXY_REVOKE: {
+            JSObject *p = rec->ptr;
+            JSCFunctionDataRecord *fdr = p->u.c_function_data_record;
+            if (wr_put_vref(w, &db, p->shape->proto ?
+                            JS_MKPTR(JS_TAG_OBJECT, p->shape->proto)
+                            : JS_NULL))
+                goto fail;
+            if (wr_put_vref(w, &db, fdr->data[0]))
                 goto fail;
             if (wr_put_props(w, &db, p, FALSE))
                 goto fail;
@@ -46657,6 +47498,165 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
             }
             break;
         }
+        case TT_REC_MAP: {
+            uint32_t cls = tt_rd_u8(&r->rd);
+            uint32_t cnt = tt_rd_leb(&r->rd);
+            JSMapState *ms;
+            if (r->rd.err || cls > 1 || cnt > (uint32_t)len)
+                goto trunc;
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                            JS_CLASS_MAP + cls);
+            if (JS_IsException(rec->v))
+                goto fail;
+            ms = js_mallocz(ctx, sizeof(*ms));
+            if (!ms)
+                goto fail;
+            init_list_head(&ms->records);
+            ms->hash_bits = 1;
+            ms->hash_size = 1U << ms->hash_bits;
+            ms->hash_table = js_mallocz(ctx, sizeof(ms->hash_table[0]) *
+                                        ms->hash_size);
+            if (!ms->hash_table) {
+                js_free(ctx, ms);
+                goto fail;
+            }
+            ms->record_count_threshold = 4;
+            JS_SetOpaque(rec->v, ms);
+            rec->aux_a = cnt;
+            break;
+        }
+        case TT_REC_ARRAY_BUFFER: {
+            uint32_t fl = tt_rd_u8(&r->rd);
+            uint32_t blen = tt_rd_leb(&r->rd);
+            uint64_t mlen = 0;
+            const uint8_t *data = NULL;
+            if (fl & 2) {
+                mlen = tt_rd_leb(&r->rd);
+                if (mlen < blen)
+                    goto trunc;
+            }
+            if (r->rd.err || fl > 3)
+                goto trunc;
+            if (!(fl & 1) && blen) {
+                data = tt_rd_bytes(&r->rd, blen);
+                if (!data)
+                    goto trunc;
+            }
+            rec->v = js_array_buffer_constructor3(ctx, JS_UNDEFINED, blen,
+                                                  (fl & 2) ? &mlen : NULL,
+                                                  JS_CLASS_ARRAY_BUFFER,
+                                                  (uint8_t *)data,
+                                                  js_array_buffer_free,
+                                                  NULL, TRUE);
+            if (JS_IsException(rec->v))
+                goto fail;
+            if (fl & 1)
+                JS_DetachArrayBuffer(ctx, rec->v);
+            break;
+        }
+        case TT_REC_TYPED_ARRAY: {
+            uint32_t cls = tt_rd_leb(&r->rd);
+            rec->aux_a = tt_rd_leb(&r->rd);      /* byte offset */
+            rec->aux_b = tt_rd_leb(&r->rd);      /* byte length */
+            rec->u8a = (uint8_t)tt_rd_u8(&r->rd);/* track_rab */
+            if (r->rd.err || rec->u8a > 1 ||
+                !((cls >= JS_CLASS_UINT8C_ARRAY &&
+                   cls <= JS_CLASS_FLOAT64_ARRAY) ||
+                  cls == JS_CLASS_DATAVIEW))
+                goto trunc;
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL, cls);
+            if (JS_IsException(rec->v))
+                goto fail;
+            /* class init leaves the JSTypedArray slot indeterminate: a
+               NULL shell keeps the finalizer/mark safe until the fill */
+            JS_VALUE_GET_OBJ(rec->v)->u.typed_array = NULL;
+            break;
+        }
+        case TT_REC_REGEXP: {
+            JSValue pat, flstr, bc;
+            char fbuf[9];
+            int fn = 0;
+            uint32_t fl;
+            pat = rd_read_string(r);
+            if (JS_IsException(pat))
+                goto fail;
+            fl = tt_rd_u8(&r->rd);
+            if (r->rd.err) {
+                JS_FreeValue(ctx, pat);
+                goto trunc;
+            }
+            if (fl & LRE_FLAG_INDICES)      fbuf[fn++] = 'd';
+            if (fl & LRE_FLAG_GLOBAL)       fbuf[fn++] = 'g';
+            if (fl & LRE_FLAG_IGNORECASE)   fbuf[fn++] = 'i';
+            if (fl & LRE_FLAG_MULTILINE)    fbuf[fn++] = 'm';
+            if (fl & LRE_FLAG_DOTALL)       fbuf[fn++] = 's';
+            if (fl & LRE_FLAG_UNICODE)      fbuf[fn++] = 'u';
+            if (fl & LRE_FLAG_UNICODE_SETS) fbuf[fn++] = 'v';
+            if (fl & LRE_FLAG_STICKY)       fbuf[fn++] = 'y';
+            flstr = JS_NewStringLen(ctx, fbuf, fn);
+            if (JS_IsException(flstr)) {
+                JS_FreeValue(ctx, pat);
+                goto fail;
+            }
+            bc = js_compile_regexp(ctx, pat, flstr);
+            JS_FreeValue(ctx, flstr);
+            if (JS_IsException(bc)) {
+                JS_FreeValue(ctx, pat);
+                goto fail;
+            }
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_REGEXP);
+            if (JS_IsException(rec->v)) {
+                JS_FreeValue(ctx, pat);
+                JS_FreeValue(ctx, bc);
+                goto fail;
+            }
+            /* fields only -- lastIndex (and anything else) arrives with
+               the serialized own props, so the shell must not pre-create
+               shape entries */
+            JS_VALUE_GET_OBJ(rec->v)->u.regexp.pattern =
+                JS_VALUE_GET_STRING(pat);
+            JS_VALUE_GET_OBJ(rec->v)->u.regexp.bytecode =
+                JS_VALUE_GET_STRING(bc);
+            break;
+        }
+        case TT_REC_PROXY: {
+            uint32_t fl = tt_rd_u8(&r->rd);
+            JSProxyData *ps;
+            if (r->rd.err || fl > 3)
+                goto trunc;
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_PROXY);
+            if (JS_IsException(rec->v))
+                goto fail;
+            ps = js_malloc(ctx, sizeof(*ps));
+            if (!ps)
+                goto fail;
+            ps->target = JS_UNDEFINED;
+            ps->handler = JS_UNDEFINED;
+            ps->is_func = (fl & 1) != 0;
+            ps->is_revoked = (fl & 2) != 0;
+            JS_SetOpaque(rec->v, ps);
+            break;
+        }
+        case TT_REC_PROXY_REVOKE: {
+            JSObject *po;
+            JSCFunctionDataRecord *fdr;
+            rec->v = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                            JS_CLASS_C_FUNCTION_DATA);
+            if (JS_IsException(rec->v))
+                goto fail;
+            po = JS_VALUE_GET_OBJ(rec->v);
+            po->u.c_function_data_record = NULL; /* init leaves it garbage */
+            fdr = js_mallocz(ctx, sizeof(*fdr) + sizeof(JSValue));
+            if (!fdr)
+                goto fail;
+            fdr->func = js_proxy_revoke;
+            fdr->length = 0;
+            fdr->data_len = 1;
+            fdr->magic = 0;
+            fdr->data[0] = JS_NULL;
+            po->u.c_function_data_record = fdr;
+            break;
+        }
         case TT_REC_PROMISE: {
             JSPromiseData *pd;
             rec->v = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_PROMISE);
@@ -46884,6 +47884,7 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
             for (k = 0; k < val_count; k++)
                 vals[k] = JS_UNDEFINED;
             sf->prev_frame = pe->sf;
+            sf->tt_depth = pe->sf ? (pe->sf)->tt_depth + 1 : 1;
             fe->sf = sf;
             fe->b = b;
             fe->start = vals;
@@ -47114,6 +48115,146 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
             rec->vr->value = v;
             break;
         }
+        case TT_REC_MAP: {
+            JSObject *po = JS_VALUE_GET_OBJ(rec->v);
+            JSMapState *ms = po->u.map_state;
+            uint32_t k;
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            for (k = 0; k < rec->aux_a; k++) {
+                JSValue key = rd_get_vref(r);
+                JSValue val = JS_UNDEFINED;
+                JSMapRecord *mr;
+                if (JS_IsException(key))
+                    goto fail;
+                if (po->class_id == JS_CLASS_MAP) {
+                    val = rd_get_vref(r);
+                    if (JS_IsException(val)) {
+                        JS_FreeValue(ctx, key);
+                        goto fail;
+                    }
+                }
+                /* keys were normalized at their original insertion;
+                   re-adding in list order reproduces both the insertion
+                   order and a hash table valid for THIS process */
+                mr = map_add_record(ctx, ms, key);
+                if (!mr) {
+                    JS_FreeValue(ctx, key);
+                    JS_FreeValue(ctx, val);
+                    goto fail;
+                }
+                JS_FreeValue(ctx, key); /* map_add_record took its own ref */
+                mr->value = val;
+            }
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        }
+        case TT_REC_ARRAY_BUFFER:
+        case TT_REC_REGEXP:
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        case TT_REC_TYPED_ARRAY: {
+            JSObject *po = JS_VALUE_GET_OBJ(rec->v);
+            JSValue bufv;
+            JSObject *pbuf;
+            JSArrayBuffer *abuf;
+            JSTypedArray *ta;
+            uint32_t off = rec->aux_a, blen = rec->aux_b;
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            bufv = rd_get_vref(r);
+            if (JS_IsException(bufv))
+                goto fail;
+            if (JS_VALUE_GET_TAG(bufv) != JS_TAG_OBJECT ||
+                JS_VALUE_GET_OBJ(bufv)->class_id != JS_CLASS_ARRAY_BUFFER) {
+                JS_FreeValue(ctx, bufv);
+                JS_ThrowTypeError(ctx, "flow bytes: typed array over a "
+                                  "non-ArrayBuffer");
+                goto fail;
+            }
+            pbuf = JS_VALUE_GET_OBJ(bufv);
+            abuf = pbuf->u.array_buffer;
+            if (!abuf->detached &&
+                ((uint64_t)off + blen > (uint64_t)abuf->byte_length)) {
+                JS_FreeValue(ctx, bufv);
+                JS_ThrowTypeError(ctx, "flow bytes: typed array outside "
+                                  "its buffer");
+                goto fail;
+            }
+            if (po->class_id != JS_CLASS_DATAVIEW) {
+                int lg = typed_array_size_log2(po->class_id);
+                if ((off | blen) & ((1u << lg) - 1)) {
+                    JS_FreeValue(ctx, bufv);
+                    JS_ThrowTypeError(ctx, "flow bytes: misaligned typed "
+                                      "array view");
+                    goto fail;
+                }
+            }
+            ta = js_malloc(ctx, sizeof(*ta));
+            if (!ta) {
+                JS_FreeValue(ctx, bufv);
+                goto fail;
+            }
+            ta->obj = po;
+            ta->buffer = pbuf;   /* keeps bufv's reference */
+            ta->offset = off;
+            ta->length = blen;
+            ta->track_rab = rec->u8a != 0;
+            list_add_tail(&ta->link, &abuf->array_list);
+            po->u.typed_array = ta;
+            if (po->class_id != JS_CLASS_DATAVIEW) {
+                int lg = typed_array_size_log2(po->class_id);
+                po->u.array.count = abuf->detached ? 0 : (blen >> lg);
+                po->u.array.u.ptr = abuf->detached ? NULL
+                                                   : abuf->data + off;
+            }
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        }
+        case TT_REC_PROXY: {
+            JSProxyData *ps = JS_GetOpaque(rec->v, JS_CLASS_PROXY);
+            JSValue t = rd_get_vref(r);
+            JSValue h;
+            if (JS_IsException(t))
+                goto fail;
+            h = rd_get_vref(r);
+            if (JS_IsException(h)) {
+                JS_FreeValue(ctx, t);
+                goto fail;
+            }
+            if (JS_VALUE_GET_TAG(t) != JS_TAG_OBJECT ||
+                JS_VALUE_GET_TAG(h) != JS_TAG_OBJECT) {
+                JS_FreeValue(ctx, t);
+                JS_FreeValue(ctx, h);
+                JS_ThrowTypeError(ctx, "flow bytes: proxy target/handler "
+                                  "must be objects");
+                goto fail;
+            }
+            ps->target = t;
+            ps->handler = h;
+            JS_SetConstructorBit(ctx, rec->v, JS_IsConstructor(ctx, t));
+            break;
+        }
+        case TT_REC_PROXY_REVOKE: {
+            JSObject *po = JS_VALUE_GET_OBJ(rec->v);
+            JSCFunctionDataRecord *fdr = po->u.c_function_data_record;
+            JSValue slot;
+            if (rd_set_proto(r, rec->v))
+                goto fail;
+            slot = rd_get_vref(r);
+            if (JS_IsException(slot))
+                goto fail;
+            JS_FreeValue(ctx, fdr->data[0]);
+            fdr->data[0] = slot;
+            if (rd_read_props(r, rec->v))
+                goto fail;
+            break;
+        }
         case TT_REC_PROMISE: {
             JSPromiseData *pd = JS_GetOpaque(rec->v, JS_CLASS_PROMISE);
             uint32_t st8, hd8, k;
@@ -47314,6 +48455,7 @@ static JSAsyncFunctionState *deserialize_flow(JSRuntime *rt,
             sf->tt_aux_i = (int)fe->aux_i;
             sf->tt_call_argc = (uint16_t)fe->cargc;
             sf->prev_frame = pe->sf;
+            sf->tt_depth = pe->sf ? (pe->sf)->tt_depth + 1 : 1;
         } else if (fe->chained) {
             /* the base frame of a machine-parked flow: rebuilt as a C
                entry so its yields/returns come back to the host */
@@ -48046,6 +49188,109 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
                 rec->kind == TT_REC_STRING ? JS_TAG_STRING : JS_TAG_SYMBOL,
                 rec->ptr));
             break;
+        case TT_REC_MAP: {
+            JSObject *src = rec->ptr;
+            JSMapState *ms;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    src->class_id);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            ms = js_mallocz(ctx, sizeof(*ms));
+            if (!ms)
+                goto out;
+            init_list_head(&ms->records);
+            ms->hash_bits = 1;
+            ms->hash_size = 1U << ms->hash_bits;
+            ms->hash_table = js_mallocz(ctx, sizeof(ms->hash_table[0]) *
+                                        ms->hash_size);
+            if (!ms->hash_table) {
+                js_free(ctx, ms);
+                goto out;
+            }
+            ms->record_count_threshold = 4;
+            JS_SetOpaque(fk->clone_v[i], ms);
+            break;
+        }
+        case TT_REC_ARRAY_BUFFER: {
+            JSObject *src = rec->ptr;
+            JSArrayBuffer *abuf = src->u.array_buffer;
+            uint64_t mlen = abuf->max_byte_length >= 0 ?
+                (uint64_t)abuf->max_byte_length : 0;
+            fk->clone_v[i] = js_array_buffer_constructor3(
+                ctx, JS_UNDEFINED, abuf->detached ? 0 : abuf->byte_length,
+                abuf->max_byte_length >= 0 ? &mlen : NULL,
+                JS_CLASS_ARRAY_BUFFER, abuf->detached ? NULL : abuf->data,
+                js_array_buffer_free, NULL, TRUE);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            if (abuf->detached)
+                JS_DetachArrayBuffer(ctx, fk->clone_v[i]);
+            break;
+        }
+        case TT_REC_TYPED_ARRAY: {
+            JSObject *src = rec->ptr;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    src->class_id);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            JS_VALUE_GET_OBJ(fk->clone_v[i])->u.typed_array = NULL;
+            break;
+        }
+        case TT_REC_REGEXP: {
+            JSObject *src = rec->ptr;
+            JSRegExp *re = &src->u.regexp;
+            JSObject *dp;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    JS_CLASS_REGEXP);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            /* same process: siblings share the immutable pattern and
+               compiled bytecode strings; own props (lastIndex) travel
+               through the ordinary prop pass */
+            dp = JS_VALUE_GET_OBJ(fk->clone_v[i]);
+            dp->u.regexp.pattern = re->pattern;
+            dp->u.regexp.bytecode = re->bytecode;
+            JS_DupValue(ctx, JS_MKPTR(JS_TAG_STRING, re->pattern));
+            JS_DupValue(ctx, JS_MKPTR(JS_TAG_STRING, re->bytecode));
+            break;
+        }
+        case TT_REC_PROXY: {
+            JSProxyData *ss = ((JSObject *)rec->ptr)->u.opaque;
+            JSProxyData *ps;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    JS_CLASS_PROXY);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            ps = js_malloc(ctx, sizeof(*ps));
+            if (!ps)
+                goto out;
+            ps->target = JS_UNDEFINED;
+            ps->handler = JS_UNDEFINED;
+            ps->is_func = ss->is_func;
+            ps->is_revoked = ss->is_revoked;
+            JS_SetOpaque(fk->clone_v[i], ps);
+            break;
+        }
+        case TT_REC_PROXY_REVOKE: {
+            JSObject *po;
+            JSCFunctionDataRecord *fdr;
+            fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                    JS_CLASS_C_FUNCTION_DATA);
+            if (JS_IsException(fk->clone_v[i]))
+                goto out;
+            po = JS_VALUE_GET_OBJ(fk->clone_v[i]);
+            po->u.c_function_data_record = NULL; /* init leaves it garbage */
+            fdr = js_mallocz(ctx, sizeof(*fdr) + sizeof(JSValue));
+            if (!fdr)
+                goto out;
+            fdr->func = js_proxy_revoke;
+            fdr->length = 0;
+            fdr->data_len = 1;
+            fdr->magic = 0;
+            fdr->data[0] = JS_NULL;
+            po->u.c_function_data_record = fdr;
+            break;
+        }
         case TT_REC_PROMISE: {
             JSPromiseData *pd;
             fk->clone_v[i] = JS_NewObjectProtoClass(ctx, JS_NULL,
@@ -48116,7 +49361,7 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
             JSValue *vals;
             JSValue *pstart, *cstart;
             size_t val_count =
-                (size_t)(src->arg_buf == src->tt_frame_base ? b->arg_count
+                (size_t)(src->arg_buf == src->tt_frame_base ? src->arg_count
                                                             : 0) +
                 b->var_count + b->stack_size;
             uint32_t k;
@@ -48164,6 +49409,7 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
             nsf->arg_buf = (src->arg_buf == src->tt_frame_base)
                 ? vals : cstart + (src->arg_buf - pstart);
             nsf->prev_frame = fk->clone_frame[i - 1];
+            nsf->tt_depth = fk->clone_frame[i - 1] ? (fk->clone_frame[i - 1])->tt_depth + 1 : 1;
             nsf->tt_last_line = src->tt_last_line;
             nsf->tt_pc_lo = src->tt_pc_lo;
             nsf->tt_pc_hi = src->tt_pc_hi;
@@ -48269,6 +49515,118 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
             if (JS_IsException(v))
                 goto out;
             JS_VALUE_GET_OBJ(fk->clone_v[i])->u.tt_tagged.payload = v;
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        }
+        case TT_REC_MAP: {
+            JSObject *src = rec->ptr;
+            JSMapState *sms = src->u.map_state;
+            JSMapState *dms = JS_VALUE_GET_OBJ(fk->clone_v[i])->u.map_state;
+            struct list_head *el;
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            list_for_each(el, &sms->records) {
+                JSMapRecord *smr = list_entry(el, JSMapRecord, link);
+                JSMapRecord *dmr;
+                JSValue k, v2 = JS_UNDEFINED;
+                if (smr->empty)
+                    continue;
+                k = fork_map_value(fk, smr->key);
+                if (JS_IsException(k))
+                    goto out;
+                if (src->class_id == JS_CLASS_MAP) {
+                    v2 = fork_map_value(fk, smr->value);
+                    if (JS_IsException(v2)) {
+                        JS_FreeValue(ctx, k);
+                        goto out;
+                    }
+                }
+                dmr = map_add_record(ctx, dms, k);
+                if (!dmr) {
+                    JS_FreeValue(ctx, k);
+                    JS_FreeValue(ctx, v2);
+                    goto out;
+                }
+                JS_FreeValue(ctx, k);
+                dmr->value = v2;
+            }
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        }
+        case TT_REC_ARRAY_BUFFER:
+        case TT_REC_REGEXP:
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        case TT_REC_TYPED_ARRAY: {
+            JSObject *src = rec->ptr;
+            JSTypedArray *sta = src->u.typed_array;
+            JSObject *dst = JS_VALUE_GET_OBJ(fk->clone_v[i]);
+            JSValue bufv;
+            JSObject *pbuf;
+            JSArrayBuffer *abuf;
+            JSTypedArray *ta;
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            bufv = fork_map_value(fk, JS_MKPTR(JS_TAG_OBJECT, sta->buffer));
+            if (JS_IsException(bufv))
+                goto out;
+            pbuf = JS_VALUE_GET_OBJ(bufv);
+            abuf = pbuf->u.array_buffer;
+            ta = js_malloc(ctx, sizeof(*ta));
+            if (!ta) {
+                JS_FreeValue(ctx, bufv);
+                goto out;
+            }
+            ta->obj = dst;
+            ta->buffer = pbuf;   /* keeps bufv's reference */
+            ta->offset = sta->offset;
+            ta->length = sta->length;
+            ta->track_rab = sta->track_rab;
+            list_add_tail(&ta->link, &abuf->array_list);
+            dst->u.typed_array = ta;
+            if (dst->class_id != JS_CLASS_DATAVIEW) {
+                dst->u.array.count = src->u.array.count;
+                dst->u.array.u.ptr = abuf->detached ? NULL
+                                                    : abuf->data + ta->offset;
+            }
+            if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
+                goto out;
+            break;
+        }
+        case TT_REC_PROXY: {
+            JSProxyData *ss = ((JSObject *)rec->ptr)->u.opaque;
+            JSProxyData *ps = JS_GetOpaque(fk->clone_v[i], JS_CLASS_PROXY);
+            JSValue t, h;
+            t = fork_map_value(fk, ss->target);
+            if (JS_IsException(t))
+                goto out;
+            ps->target = t;
+            h = fork_map_value(fk, ss->handler);
+            if (JS_IsException(h))
+                goto out;
+            ps->handler = h;
+            JS_SetConstructorBit(ctx, fk->clone_v[i],
+                                 JS_IsConstructor(ctx, t));
+            break;
+        }
+        case TT_REC_PROXY_REVOKE: {
+            JSObject *src = rec->ptr;
+            JSCFunctionDataRecord *sfd = src->u.c_function_data_record;
+            JSCFunctionDataRecord *dfd =
+                JS_VALUE_GET_OBJ(fk->clone_v[i])->u.c_function_data_record;
+            JSValue slot;
+            if (fork_set_proto(fk, rec->ptr, fk->clone_v[i]))
+                goto out;
+            slot = fork_map_value(fk, sfd->data[0]);
+            if (JS_IsException(slot))
+                goto out;
+            JS_FreeValue(ctx, dfd->data[0]);
+            dfd->data[0] = slot;
             if (fork_copy_props(fk, rec->ptr, fk->clone_v[i], FALSE))
                 goto out;
             break;
@@ -48690,6 +50048,7 @@ static JSValue fork_flow(JSContext *ctx, JSAsyncFunctionState *base,
         nsf->tt_aux_i = srcf->tt_aux_i;
         nsf->tt_call_argc = srcf->tt_call_argc;
         nsf->prev_frame = fk->clone_frame[i - 1];
+        nsf->tt_depth = fk->clone_frame[i - 1] ? (fk->clone_frame[i - 1])->tt_depth + 1 : 1;
     }
 
     /* the sibling adopts its machine: an independently suspended,
@@ -70858,6 +72217,8 @@ static JSValue js_typed_array_toReversed(JSContext *ctx, JSValueConst this_val,
 
 static void slice_memcpy(uint8_t *dst, const uint8_t *src, size_t len)
 {
+    if (len == 0)
+        return; /* dst/src may be NULL (zero-length views) */
     if (dst + len <= src || dst >= src + len) {
         /* no overlap: can use memcpy */
         memcpy(dst, src, len);
@@ -74037,6 +75398,13 @@ void JS_TTResetExecState(JSContext *ctx)
     rt->tt_job_realm = NULL;
     rt->tt_job_vals[0] = rt->tt_job_vals[1] = JS_UNDEFINED;
     rt->tt_job_vals[2] = rt->tt_job_vals[3] = JS_UNDEFINED;
+    if (rt->tt_modeval) {
+        /* abandoned module DFS: drop the C bookkeeping; heap refs stay
+           (same mid-heal doctrine as tt_exec_fn) */
+        js_free_rt(rt, rt->tt_modeval->stack);
+        js_free_rt(rt, rt->tt_modeval);
+        rt->tt_modeval = NULL;
+    }
 }
 
 /* Step granularity: 0 = source line (+ loop back-jumps), 1 = every opcode. */
@@ -74062,6 +75430,21 @@ JSValue JS_TTCallStart(JSContext *ctx, JSValue fun_obj, int *pparked)
     JSValue fun, ret;
 
     *pparked = 0;
+    if (JS_VALUE_GET_TAG(fun_obj) == JS_TAG_MODULE) {
+        /* modules run through the stackless InnerModuleEvaluation machine:
+           bodies park like scripts, the DFS survives in heap state */
+        JSModuleDef *m = JS_VALUE_GET_PTR(fun_obj);
+        JS_FreeValue(ctx, fun_obj);
+        if (js_create_module_function(ctx, m) < 0)
+            return JS_EXCEPTION;
+        if (js_link_module(ctx, m) < 0)
+            return JS_EXCEPTION;
+        rt->tt_park_ok = TRUE;
+        ret = js_tt_evaluate_module_start(ctx, m, pparked);
+        if (!*pparked)
+            rt->tt_park_ok = FALSE;
+        return ret;
+    }
     if (JS_VALUE_GET_TAG(fun_obj) == JS_TAG_FUNCTION_BYTECODE) {
         fun = js_closure(ctx, fun_obj, NULL, NULL, TRUE);
         if (JS_IsException(fun))
@@ -74120,6 +75503,14 @@ JSValue JS_TTCallResume(JSContext *ctx, int cmd, int *pparked)
     if (rt->tt_parked_frame) {
         *pparked = 1;
         return JS_UNDEFINED;
+    }
+    if (rt->tt_modeval && rt->tt_modeval->body) {
+        /* the parked activation was a module body: finish it and keep
+           driving the module DFS; later bodies may park again */
+        ret = tt_modeval_body_resumed(ctx, ret, pparked);
+        if (!*pparked)
+            rt->tt_park_ok = FALSE;
+        return ret;
     }
     rt->tt_park_ok = FALSE;
     if (rt->tt_job_kind) {
